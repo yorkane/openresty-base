@@ -26,7 +26,7 @@ ARG RESTY_PCRE_OPTIONS="--with-pcre-jit"
 ARG RESTY_J="4"
 
 # Versions for extra modules (overridden by workflow to pin exact commits/tags)
-ARG LUA_NGINX_MODULE_VERSION="main"
+ARG LUA_NGINX_MODULE_VERSION="master"
 ARG NGX_FANCYINDEX_VERSION="master"
 ARG NGX_DAV_EXT_VERSION="master"
 
@@ -123,10 +123,14 @@ RUN cd /tmp \
 # --------------------------------------------------------------------------
 # Clone extra modules
 # --------------------------------------------------------------------------
-# 1. lua-nginx-module (main branch — replaces OpenResty's bundled version)
+# 1. lua-nginx-module (latest master — will replace OpenResty's bundled ngx_lua)
+#    Clone separately; the actual bundle replacement happens after OpenResty is extracted.
 RUN git clone --depth=1 --branch "${LUA_NGINX_MODULE_VERSION}" \
         https://github.com/openresty/lua-nginx-module.git \
-        /tmp/lua-nginx-module
+        /tmp/lua-nginx-module \
+    && git clone --depth=1 \
+        https://github.com/openresty/stream-lua-nginx-module.git \
+        /tmp/stream-lua-nginx-module
 
 # 2. nginx-dav-ext-module
 RUN git clone --depth=1 --branch "${NGX_DAV_EXT_VERSION}" \
@@ -145,6 +149,21 @@ RUN cd /tmp \
     && curl -fSL "https://openresty.org/download/openresty-${RESTY_VERSION}.tar.gz" \
             -o "openresty-${RESTY_VERSION}.tar.gz" \
     && tar xzf "openresty-${RESTY_VERSION}.tar.gz" \
+    # ── Replace bundled ngx_lua with the latest master ───────────────────
+    # OpenResty bundles lua-nginx-module as ngx_lua-X.Y.ZRn in the bundle dir
+    && BUNDLED_NGX_LUA=$(ls -d /tmp/openresty-${RESTY_VERSION}/bundle/ngx_lua-* 2>/dev/null | head -1) \
+    && if [ -n "${BUNDLED_NGX_LUA}" ]; then \
+         echo "Replacing bundled $(basename ${BUNDLED_NGX_LUA}) with latest master"; \
+         rm -rf "${BUNDLED_NGX_LUA}"; \
+         cp -r /tmp/lua-nginx-module "${BUNDLED_NGX_LUA}"; \
+       fi \
+    # ── Replace bundled stream-lua-nginx-module ───────────────────────────
+    && BUNDLED_STREAM_LUA=$(ls -d /tmp/openresty-${RESTY_VERSION}/bundle/ngx_stream_lua-* 2>/dev/null | head -1) \
+    && if [ -n "${BUNDLED_STREAM_LUA}" ]; then \
+         echo "Replacing bundled $(basename ${BUNDLED_STREAM_LUA}) with latest master"; \
+         rm -rf "${BUNDLED_STREAM_LUA}"; \
+         cp -r /tmp/stream-lua-nginx-module "${BUNDLED_STREAM_LUA}"; \
+       fi \
     && cd "/tmp/openresty-${RESTY_VERSION}" \
     && eval ./configure \
         --prefix=/usr/local/openresty \
@@ -154,7 +173,6 @@ RUN cd /tmp \
         ${RESTY_PCRE_OPTIONS} \
         --with-pcre="/tmp/pcre2-src" \
         --with-openssl="/tmp/openssl-${RESTY_OPENSSL_VERSION}" \
-        --add-module=/tmp/lua-nginx-module \
         --add-module=/tmp/nginx-dav-ext-module \
         --add-module=/tmp/ngx-fancyindex \
     && make -j${RESTY_J} \
@@ -167,6 +185,7 @@ RUN cd /tmp \
         "openssl-${RESTY_OPENSSL_VERSION}.tar.gz" \
         /tmp/pcre2-src \
         /tmp/lua-nginx-module \
+        /tmp/stream-lua-nginx-module \
         /tmp/nginx-dav-ext-module \
         /tmp/ngx-fancyindex \
     && apk del .build-deps \
