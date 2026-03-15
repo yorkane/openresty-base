@@ -106,6 +106,7 @@ RUN apk add --no-cache --virtual .build-deps \
         libxslt \
         libxml2 \
         tzdata \
+        wget \
         zlib \
         ${RESTY_ADD_PACKAGE_RUNDEPS} \
     \
@@ -203,8 +204,8 @@ RUN apk add --no-cache --virtual .build-deps \
        fi \
     \
     # ── Remove dev headers / static libs left by OpenResty install ────────
+    # NOTE: keep luajit/include so downstream images can compile luarocks C extensions (e.g. lua-vips)
     && rm -rf \
-        /usr/local/openresty/luajit/include \
         /usr/local/openresty/luajit/lib/libluajit-5.1.a \
         /usr/local/openresty/luajit/lib/libluajit-5.1.la \
         /usr/local/openresty/pod \
