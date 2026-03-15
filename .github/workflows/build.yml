@@ -1,0 +1,347 @@
+name: Build and Publish
+
+on:
+  # 每周一 UTC 02:00 定时触发
+  schedule:
+    - cron: '0 2 * * 1'
+
+  # 推送到 main 分支时触发
+  push:
+    branches:
+      - main
+    paths:
+      - 'Dockerfile'
+      - '.github/workflows/build.yml'
+
+  # 支持手动触发（可覆盖版本参数）
+  workflow_dispatch:
+    inputs:
+      resty_version:
+        description: 'OpenResty version (leave empty to auto-detect latest)'
+        required: false
+        default: ''
+      force_rebuild:
+        description: 'Force rebuild even if version unchanged'
+        required: false
+        type: boolean
+        default: false
+
+# 显式声明权限
+permissions:
+  contents: write      # 创建 Release / tag
+  packages: write      # 推送到 GHCR
+  actions: read
+
+env:
+  REGISTRY_GHCR: ghcr.io
+  REGISTRY_DOCKERHUB: docker.io
+  IMAGE_NAME: openresty-base
+  GHCR_IMAGE: ghcr.io/yorkane/openresty-base
+  DOCKERHUB_IMAGE: yorkane/openresty-base
+
+jobs:
+  # ──────────────────────────────────────────────────────────────────────────
+  # Job 1: 获取最新版本信息
+  # ──────────────────────────────────────────────────────────────────────────
+  get-versions:
+    name: Get Latest Versions
+    runs-on: ubuntu-latest
+    outputs:
+      resty_version: ${{ steps.versions.outputs.resty_version }}
+      lua_nginx_sha: ${{ steps.versions.outputs.lua_nginx_sha }}
+      lua_nginx_short: ${{ steps.versions.outputs.lua_nginx_short }}
+      fancyindex_version: ${{ steps.versions.outputs.fancyindex_version }}
+      dav_ext_sha: ${{ steps.versions.outputs.dav_ext_sha }}
+      dav_ext_short: ${{ steps.versions.outputs.dav_ext_short }}
+      image_tag: ${{ steps.versions.outputs.image_tag }}
+      build_date: ${{ steps.versions.outputs.build_date }}
+      should_build: ${{ steps.check.outputs.should_build }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Fetch latest upstream versions
+        id: versions
+        run: |
+          set -euo pipefail
+
+          # ── OpenResty 版本 ──────────────────────────────────────────────
+          if [[ -n "${{ github.event.inputs.resty_version }}" ]]; then
+            RESTY_VERSION="${{ github.event.inputs.resty_version }}"
+            echo "Using manually specified OpenResty version: ${RESTY_VERSION}"
+          else
+            # 从官方 download 页面抓取最新稳定版版本号
+            RESTY_VERSION=$(curl -sSfL "https://openresty.org/en/download.html" \
+              | grep -oP 'openresty-\K[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' \
+              | head -1)
+            echo "Auto-detected OpenResty version: ${RESTY_VERSION}"
+          fi
+
+          # ── lua-nginx-module main 最新 commit ─────────────────────────
+          LUA_NGINX_SHA=$(curl -sSfL \
+            "https://api.github.com/repos/openresty/lua-nginx-module/commits/main" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            | jq -r '.sha')
+          LUA_NGINX_SHORT="${LUA_NGINX_SHA:0:7}"
+
+          # ── ngx-fancyindex 最新 release tag ───────────────────────────
+          FANCYINDEX_VERSION=$(curl -sSfL \
+            "https://api.github.com/repos/aperezdc/ngx-fancyindex/releases/latest" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            | jq -r '.tag_name')
+          # 如果没有 release，回退到 master
+          if [[ -z "${FANCYINDEX_VERSION}" || "${FANCYINDEX_VERSION}" == "null" ]]; then
+            FANCYINDEX_VERSION="master"
+          fi
+
+          # ── nginx-dav-ext-module 最新 commit ──────────────────────────
+          DAV_EXT_SHA=$(curl -sSfL \
+            "https://api.github.com/repos/mid1221213/nginx-dav-ext-module/commits/master" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            | jq -r '.sha')
+          DAV_EXT_SHORT="${DAV_EXT_SHA:0:7}"
+
+          BUILD_DATE=$(date -u +"%Y%m%d")
+          IMAGE_TAG="${RESTY_VERSION}-${BUILD_DATE}"
+
+          # 输出到 GitHub outputs
+          echo "resty_version=${RESTY_VERSION}"          >> "$GITHUB_OUTPUT"
+          echo "lua_nginx_sha=${LUA_NGINX_SHA}"          >> "$GITHUB_OUTPUT"
+          echo "lua_nginx_short=${LUA_NGINX_SHORT}"      >> "$GITHUB_OUTPUT"
+          echo "fancyindex_version=${FANCYINDEX_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "dav_ext_sha=${DAV_EXT_SHA}"              >> "$GITHUB_OUTPUT"
+          echo "dav_ext_short=${DAV_EXT_SHORT}"          >> "$GITHUB_OUTPUT"
+          echo "image_tag=${IMAGE_TAG}"                  >> "$GITHUB_OUTPUT"
+          echo "build_date=${BUILD_DATE}"                >> "$GITHUB_OUTPUT"
+
+          echo "### Version Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Component | Version |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-----------|---------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| OpenResty | \`${RESTY_VERSION}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| lua-nginx-module | \`${LUA_NGINX_SHORT}\` (main) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| ngx-fancyindex | \`${FANCYINDEX_VERSION}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| nginx-dav-ext-module | \`${DAV_EXT_SHORT}\` |" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check if rebuild needed
+        id: check
+        run: |
+          IMAGE_TAG="${{ steps.versions.outputs.image_tag }}"
+          FORCE="${{ github.event.inputs.force_rebuild }}"
+
+          # 检查 GHCR 是否已存在相同 tag（避免重复构建）
+          EXISTING=$(curl -sSf \
+            "https://ghcr.io/v2/yorkane/openresty-base/tags/list" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            2>/dev/null | jq -r '.tags[]? | select(. == "'"${IMAGE_TAG}"'")' || true)
+
+          if [[ -n "${EXISTING}" && "${FORCE}" != "true" ]]; then
+            echo "Image ${IMAGE_TAG} already exists in GHCR, skipping build."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Job 2: 构建并推送多架构镜像
+  # ──────────────────────────────────────────────────────────────────────────
+  build-and-push:
+    name: Build & Push (${{ matrix.platform }})
+    runs-on: ubuntu-latest
+    needs: get-versions
+    if: needs.get-versions.outputs.should_build == 'true'
+
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - linux/amd64
+          - linux/arm64
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU (for cross-arch builds)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY_GHCR }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY_DOCKERHUB }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Prepare platform tag suffix
+        id: prep
+        run: |
+          PLATFORM_PAIR="${{ matrix.platform }}"
+          echo "platform_tag=${PLATFORM_PAIR//\//-}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: true
+          provenance: false
+          build-args: |
+            RESTY_VERSION=${{ needs.get-versions.outputs.resty_version }}
+            LUA_NGINX_MODULE_VERSION=${{ needs.get-versions.outputs.lua_nginx_sha }}
+            NGX_FANCYINDEX_VERSION=${{ needs.get-versions.outputs.fancyindex_version }}
+            NGX_DAV_EXT_VERSION=${{ needs.get-versions.outputs.dav_ext_sha }}
+          labels: |
+            org.opencontainers.image.title=openresty-base
+            org.opencontainers.image.description=Custom OpenResty Alpine with lua-nginx-module/dav-ext/fancyindex
+            org.opencontainers.image.version=${{ needs.get-versions.outputs.resty_version }}
+            org.opencontainers.image.created=${{ needs.get-versions.outputs.build_date }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          # 推送到 GHCR（按 digest）
+          outputs: type=image,name=${{ env.GHCR_IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          DIGEST="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
+      - name: Upload digest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ steps.prep.outputs.platform_tag }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Job 3: 合并多架构 manifest 并推送 tag
+  # ──────────────────────────────────────────────────────────────────────────
+  merge-manifest:
+    name: Merge Manifest & Tag
+    runs-on: ubuntu-latest
+    needs:
+      - get-versions
+      - build-and-push
+    if: needs.get-versions.outputs.should_build == 'true'
+
+    steps:
+      - name: Download all digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY_GHCR }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY_DOCKERHUB }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Create and push multi-arch manifest
+        env:
+          IMAGE_TAG: ${{ needs.get-versions.outputs.image_tag }}
+          RESTY_VERSION: ${{ needs.get-versions.outputs.resty_version }}
+        run: |
+          # 收集所有 digest 参数
+          DIGESTS=$(ls /tmp/digests | awk '{print "${{ env.GHCR_IMAGE }}@sha256:" $0}' | tr '\n' ' ')
+
+          # 推送到 GHCR
+          docker buildx imagetools create \
+            --tag "${{ env.GHCR_IMAGE }}:${IMAGE_TAG}" \
+            --tag "${{ env.GHCR_IMAGE }}:${RESTY_VERSION}" \
+            --tag "${{ env.GHCR_IMAGE }}:latest" \
+            ${DIGESTS}
+
+          # 推送到 Docker Hub（复用同一组 digest）
+          docker buildx imagetools create \
+            --tag "${{ env.DOCKERHUB_IMAGE }}:${IMAGE_TAG}" \
+            --tag "${{ env.DOCKERHUB_IMAGE }}:${RESTY_VERSION}" \
+            --tag "${{ env.DOCKERHUB_IMAGE }}:latest" \
+            ${DIGESTS}
+
+          echo "### Published Images" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Registry | Tags |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|----------|------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| GHCR | \`latest\`, \`${RESTY_VERSION}\`, \`${IMAGE_TAG}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Docker Hub | \`latest\`, \`${RESTY_VERSION}\`, \`${IMAGE_TAG}\` |" >> "$GITHUB_STEP_SUMMARY"
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Job 4: 创建 GitHub Release
+  # ──────────────────────────────────────────────────────────────────────────
+  create-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs:
+      - get-versions
+      - merge-manifest
+    if: needs.get-versions.outputs.should_build == 'true'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.get-versions.outputs.image_tag }}
+          name: "OpenResty ${{ needs.get-versions.outputs.resty_version }} (${{ needs.get-versions.outputs.build_date }})"
+          draft: false
+          prerelease: false
+          generate_release_notes: false
+          body: |
+            ## openresty-base ${{ needs.get-versions.outputs.image_tag }}
+
+            ### Component Versions
+
+            | Component | Version |
+            |-----------|---------|
+            | OpenResty | `${{ needs.get-versions.outputs.resty_version }}` |
+            | lua-nginx-module | `${{ needs.get-versions.outputs.lua_nginx_short }}` (main branch) |
+            | ngx-fancyindex | `${{ needs.get-versions.outputs.fancyindex_version }}` |
+            | nginx-dav-ext-module | `${{ needs.get-versions.outputs.dav_ext_short }}` |
+
+            ### Pull
+
+            ```bash
+            # GitHub Container Registry
+            docker pull ghcr.io/yorkane/openresty-base:${{ needs.get-versions.outputs.image_tag }}
+            docker pull ghcr.io/yorkane/openresty-base:latest
+
+            # Docker Hub
+            docker pull yorkane/openresty-base:${{ needs.get-versions.outputs.image_tag }}
+            docker pull yorkane/openresty-base:latest
+            ```
+
+            ### Supported Platforms
+            - `linux/amd64`
+            - `linux/arm64`
