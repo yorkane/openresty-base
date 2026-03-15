@@ -1,8 +1,8 @@
 # Dockerfile - openresty-base (alpine)
 # Custom OpenResty build with extra modules:
-#   - lua-nginx-module (main branch)
-#   - nginx-dav-ext-module (WebDAV PROPFIND/OPTIONS/LOCK/UNLOCK)
-#   - ngx-fancyindex (fancy directory listing)
+#   - lua-nginx-module  (latest master, replaces bundled version)
+#   - nginx-dav-ext-module  (WebDAV PROPFIND/OPTIONS/LOCK/UNLOCK)
+#   - ngx-fancyindex    (fancy directory listing)
 #
 # Reference: https://github.com/openresty/docker-openresty/blob/master/alpine/Dockerfile
 #            https://github.com/openresty/docker-openresty/blob/master/alpine/Dockerfile.fat
@@ -13,16 +13,13 @@
 ARG RESTY_IMAGE_BASE="alpine"
 ARG RESTY_IMAGE_TAG="3.22"
 
-FROM ${RESTY_IMAGE_BASE}:${RESTY_IMAGE_TAG} AS builder
+FROM ${RESTY_IMAGE_BASE}:${RESTY_IMAGE_TAG}
 
-# Keep ARGs available after FROM
 ARG RESTY_VERSION="1.29.2.1"
 ARG RESTY_OPENSSL_VERSION="3.5.5"
-ARG RESTY_OPENSSL_PATCH_VERSION="3.5.5"
 ARG RESTY_OPENSSL_URL_BASE="https://github.com/openssl/openssl/releases/download/openssl-${RESTY_OPENSSL_VERSION}"
 ARG RESTY_PCRE_VERSION="10.47"
-ARG RESTY_PCRE_BUILD_OPTIONS="--enable-jit"
-ARG RESTY_PCRE_OPTIONS="--with-pcre-jit"
+ARG RESTY_LUAROCKS_VERSION="3.13.0"
 ARG RESTY_J="4"
 
 # Versions for extra modules (overridden by workflow to pin exact commits/tags)
@@ -69,16 +66,23 @@ ARG RESTY_PCRE_OPTIONS="--with-pcre-jit"
 ARG RESTY_ADD_PACKAGE_BUILDDEPS=""
 ARG RESTY_ADD_PACKAGE_RUNDEPS=""
 
+# Strip debug symbols from binaries to reduce image size (set to "" to disable)
+ARG RESTY_STRIP_BINARIES="1"
+
 LABEL maintainer="yorkane"
 LABEL resty_version="${RESTY_VERSION}"
 LABEL resty_openssl_version="${RESTY_OPENSSL_VERSION}"
 LABEL resty_pcre_version="${RESTY_PCRE_VERSION}"
 LABEL lua_nginx_module_version="${LUA_NGINX_MODULE_VERSION}"
 LABEL ngx_fancyindex_version="${NGX_FANCYINDEX_VERSION}"
-LABEL ngx_dav_ext_version="${NGX_DAV_EXT_VERSION}"
+LABEL ngx_dav_ext_module_version="${NGX_DAV_EXT_VERSION}"
 
-# Install build deps
+# --------------------------------------------------------------------------
+# Single RUN: install build deps → download sources → clone modules →
+#             compile OpenResty → install LuaRocks → strip → cleanup
+# --------------------------------------------------------------------------
 RUN apk add --no-cache --virtual .build-deps \
+        binutils \
         build-base \
         coreutils \
         curl \
@@ -93,76 +97,68 @@ RUN apk add --no-cache --virtual .build-deps \
         readline-dev \
         zlib-dev \
         ${RESTY_ADD_PACKAGE_BUILDDEPS} \
+    # Runtime libs that must survive after .build-deps removal
     && apk add --no-cache \
         gd \
         geoip \
         libgcc \
+        libintl \
         libxslt \
         libxml2 \
+        tzdata \
         zlib \
-        ${RESTY_ADD_PACKAGE_RUNDEPS}
-
-# --------------------------------------------------------------------------
-# Download & verify OpenSSL
-# --------------------------------------------------------------------------
-RUN cd /tmp \
+        ${RESTY_ADD_PACKAGE_RUNDEPS} \
+    \
+    # ── Download OpenSSL source ───────────────────────────────────────────
+    && cd /tmp \
     && curl -fSL "${RESTY_OPENSSL_URL_BASE}/openssl-${RESTY_OPENSSL_VERSION}.tar.gz" \
             -o "openssl-${RESTY_OPENSSL_VERSION}.tar.gz" \
-    && tar xzf "openssl-${RESTY_OPENSSL_VERSION}.tar.gz"
-
-# --------------------------------------------------------------------------
-# Download PCRE2 (source kept for OpenResty --with-pcre reference)
-# --------------------------------------------------------------------------
-RUN cd /tmp \
+    && tar xzf "openssl-${RESTY_OPENSSL_VERSION}.tar.gz" \
+    && rm  -f  "openssl-${RESTY_OPENSSL_VERSION}.tar.gz" \
+    \
+    # ── Download PCRE2 source (passed as --with-pcre to OpenResty) ────────
     && curl -fSL "https://github.com/PCRE2Project/pcre2/releases/download/pcre2-${RESTY_PCRE_VERSION}/pcre2-${RESTY_PCRE_VERSION}.tar.gz" \
             -o "pcre2-${RESTY_PCRE_VERSION}.tar.gz" \
     && tar xzf "pcre2-${RESTY_PCRE_VERSION}.tar.gz" \
-    && mv "/tmp/pcre2-${RESTY_PCRE_VERSION}" /tmp/pcre2-src \
-    && rm -f "pcre2-${RESTY_PCRE_VERSION}.tar.gz"
-
-# --------------------------------------------------------------------------
-# Clone extra modules
-# --------------------------------------------------------------------------
-# 1. lua-nginx-module (latest master — will replace OpenResty's bundled ngx_lua)
-#    Clone separately; the actual bundle replacement happens after OpenResty is extracted.
-RUN git clone --depth=1 --branch "${LUA_NGINX_MODULE_VERSION}" \
-        https://github.com/openresty/lua-nginx-module.git \
-        /tmp/lua-nginx-module \
+    && mv  "/tmp/pcre2-${RESTY_PCRE_VERSION}" /tmp/pcre2-src \
+    && rm  -f  "pcre2-${RESTY_PCRE_VERSION}.tar.gz" \
+    \
+    # ── Clone extra modules ───────────────────────────────────────────────
+    # lua-nginx-module master (will replace the bundled ngx_lua in OpenResty)
+    && git clone --depth=1 --branch "${LUA_NGINX_MODULE_VERSION}" \
+            https://github.com/openresty/lua-nginx-module.git \
+            /tmp/lua-nginx-module \
+    # stream-lua-nginx-module master (paired replacement)
     && git clone --depth=1 \
-        https://github.com/openresty/stream-lua-nginx-module.git \
-        /tmp/stream-lua-nginx-module
-
-# 2. nginx-dav-ext-module
-RUN git clone --depth=1 --branch "${NGX_DAV_EXT_VERSION}" \
-        https://github.com/mid1221213/nginx-dav-ext-module.git \
-        /tmp/nginx-dav-ext-module
-
-# 3. ngx-fancyindex
-RUN git clone --depth=1 --branch "${NGX_FANCYINDEX_VERSION}" \
-        https://github.com/aperezdc/ngx-fancyindex.git \
-        /tmp/ngx-fancyindex
-
-# --------------------------------------------------------------------------
-# Download & build OpenResty (with extra modules)
-# --------------------------------------------------------------------------
-RUN cd /tmp \
+            https://github.com/openresty/stream-lua-nginx-module.git \
+            /tmp/stream-lua-nginx-module \
+    # nginx-dav-ext-module (WebDAV PROPFIND/OPTIONS/LOCK/UNLOCK)
+    && git clone --depth=1 --branch "${NGX_DAV_EXT_VERSION}" \
+            https://github.com/mid1221213/nginx-dav-ext-module.git \
+            /tmp/nginx-dav-ext-module \
+    # ngx-fancyindex (fancy directory listing)
+    && git clone --depth=1 --branch "${NGX_FANCYINDEX_VERSION}" \
+            https://github.com/aperezdc/ngx-fancyindex.git \
+            /tmp/ngx-fancyindex \
+    \
+    # ── Download & build OpenResty ────────────────────────────────────────
     && curl -fSL "https://openresty.org/download/openresty-${RESTY_VERSION}.tar.gz" \
             -o "openresty-${RESTY_VERSION}.tar.gz" \
     && tar xzf "openresty-${RESTY_VERSION}.tar.gz" \
-    # ── Replace bundled ngx_lua with the latest master ───────────────────
-    # OpenResty bundles lua-nginx-module as ngx_lua-X.Y.ZRn in the bundle dir
+    && rm  -f  "openresty-${RESTY_VERSION}.tar.gz" \
+    # Replace bundled ngx_lua with the latest master clone
     && BUNDLED_NGX_LUA=$(ls -d /tmp/openresty-${RESTY_VERSION}/bundle/ngx_lua-* 2>/dev/null | head -1) \
     && if [ -n "${BUNDLED_NGX_LUA}" ]; then \
-         echo "Replacing bundled $(basename ${BUNDLED_NGX_LUA}) with latest master"; \
+         echo "==> Replacing $(basename ${BUNDLED_NGX_LUA}) with lua-nginx-module:${LUA_NGINX_MODULE_VERSION}"; \
          rm -rf "${BUNDLED_NGX_LUA}"; \
-         cp -r /tmp/lua-nginx-module "${BUNDLED_NGX_LUA}"; \
+         cp -r  /tmp/lua-nginx-module "${BUNDLED_NGX_LUA}"; \
        fi \
-    # ── Replace bundled stream-lua-nginx-module ───────────────────────────
+    # Replace bundled ngx_stream_lua with the latest master clone
     && BUNDLED_STREAM_LUA=$(ls -d /tmp/openresty-${RESTY_VERSION}/bundle/ngx_stream_lua-* 2>/dev/null | head -1) \
     && if [ -n "${BUNDLED_STREAM_LUA}" ]; then \
-         echo "Replacing bundled $(basename ${BUNDLED_STREAM_LUA}) with latest master"; \
+         echo "==> Replacing $(basename ${BUNDLED_STREAM_LUA}) with stream-lua-nginx-module:master"; \
          rm -rf "${BUNDLED_STREAM_LUA}"; \
-         cp -r /tmp/stream-lua-nginx-module "${BUNDLED_STREAM_LUA}"; \
+         cp -r  /tmp/stream-lua-nginx-module "${BUNDLED_STREAM_LUA}"; \
        fi \
     && cd "/tmp/openresty-${RESTY_VERSION}" \
     && eval ./configure \
@@ -171,46 +167,15 @@ RUN cd /tmp \
         ${RESTY_CONFIG_OPTIONS_MORE} \
         ${RESTY_LUAJIT_OPTIONS} \
         ${RESTY_PCRE_OPTIONS} \
-        --with-pcre="/tmp/pcre2-src" \
+        --with-pcre=/tmp/pcre2-src \
         --with-openssl="/tmp/openssl-${RESTY_OPENSSL_VERSION}" \
+        --with-openssl-opt=no-tests \
         --add-module=/tmp/nginx-dav-ext-module \
         --add-module=/tmp/ngx-fancyindex \
     && make -j${RESTY_J} \
     && make install \
-    && cd /tmp \
-    && rm -rf \
-        "openresty-${RESTY_VERSION}" \
-        "openresty-${RESTY_VERSION}.tar.gz" \
-        "openssl-${RESTY_OPENSSL_VERSION}" \
-        "openssl-${RESTY_OPENSSL_VERSION}.tar.gz" \
-        /tmp/pcre2-src \
-        /tmp/lua-nginx-module \
-        /tmp/stream-lua-nginx-module \
-        /tmp/nginx-dav-ext-module \
-        /tmp/ngx-fancyindex \
-    && apk del .build-deps \
-    && ln -sf /dev/stdout /usr/local/openresty/nginx/logs/access.log \
-    && ln -sf /dev/stderr /usr/local/openresty/nginx/logs/error.log
-
-# --------------------------------------------------------------------------
-# Install LuaRocks + envsubst (mirrors Dockerfile.fat)
-# --------------------------------------------------------------------------
-ARG RESTY_LUAROCKS_VERSION="3.13.0"
-
-RUN apk add --no-cache --virtual .build-deps \
-        perl-dev \
-    && apk add --no-cache \
-        bash \
-        build-base \
-        curl \
-        libintl \
-        linux-headers \
-        make \
-        musl \
-        outils-md5 \
-        perl \
-        unzip \
-        wget \
+    \
+    # ── Install LuaRocks ──────────────────────────────────────────────────
     && cd /tmp \
     && curl -fSL "https://luarocks.github.io/luarocks/releases/luarocks-${RESTY_LUAROCKS_VERSION}.tar.gz" \
             -o "luarocks-${RESTY_LUAROCKS_VERSION}.tar.gz" \
@@ -222,12 +187,50 @@ RUN apk add --no-cache --virtual .build-deps \
         --with-lua-include=/usr/local/openresty/luajit/include/luajit-2.1 \
     && make build \
     && make install \
-    && cd /tmp \
-    && rm -rf "luarocks-${RESTY_LUAROCKS_VERSION}" "luarocks-${RESTY_LUAROCKS_VERSION}.tar.gz" \
+    \
+    # ── Extract envsubst binary before removing gettext ───────────────────
     && apk add --no-cache --virtual .gettext gettext \
-    && mv /usr/bin/envsubst /tmp/ \
+    && mv /usr/bin/envsubst /tmp/envsubst \
+    \
+    # ── Strip debug symbols ───────────────────────────────────────────────
+    && if [ -n "${RESTY_STRIP_BINARIES}" ]; then \
+         echo "==> Stripping binaries ..."; \
+         strip /usr/local/openresty/nginx/sbin/nginx \
+               /usr/local/openresty/luajit/bin/luajit-* \
+               /usr/local/openresty/luajit/lib/libluajit-5.1.so.* \
+               2>/dev/null || true; \
+         find /usr/local/openresty -name "*.so" -exec strip --strip-unneeded {} + 2>/dev/null || true; \
+       fi \
+    \
+    # ── Remove dev headers / static libs left by OpenResty install ────────
+    && rm -rf \
+        /usr/local/openresty/luajit/include \
+        /usr/local/openresty/luajit/lib/libluajit-5.1.a \
+        /usr/local/openresty/luajit/lib/libluajit-5.1.la \
+        /usr/local/openresty/pod \
+        /usr/local/openresty/resty.index \
+    \
+    # ── Cleanup all build artifacts ───────────────────────────────────────
+    && cd /tmp \
+    && rm -rf \
+        "openresty-${RESTY_VERSION}" \
+        "openssl-${RESTY_OPENSSL_VERSION}" \
+        /tmp/pcre2-src \
+        /tmp/lua-nginx-module \
+        /tmp/stream-lua-nginx-module \
+        /tmp/nginx-dav-ext-module \
+        /tmp/ngx-fancyindex \
+        "luarocks-${RESTY_LUAROCKS_VERSION}" \
+        "luarocks-${RESTY_LUAROCKS_VERSION}.tar.gz" \
+    \
+    # ── Remove build toolchain ────────────────────────────────────────────
     && apk del .build-deps .gettext \
-    && mv /tmp/envsubst /usr/local/bin/
+    \
+    # ── Restore envsubst and setup log symlinks ───────────────────────────
+    && mv /tmp/envsubst /usr/local/bin/envsubst \
+    && mkdir -p /var/run/openresty \
+    && ln -sf /dev/stdout /usr/local/openresty/nginx/logs/access.log \
+    && ln -sf /dev/stderr /usr/local/openresty/nginx/logs/error.log
 
 # --------------------------------------------------------------------------
 # Runtime environment
@@ -239,5 +242,7 @@ ENV LUA_PATH="/usr/local/openresty/site/lualib/?.ljbc;/usr/local/openresty/site/
 ENV LUA_CPATH="/usr/local/openresty/site/lualib/?.so;/usr/local/openresty/lualib/?.so;./?.so;/usr/local/lib/lua/5.1/?.so;/usr/local/openresty/luajit/lib/lua/5.1/?.so;/usr/local/lib/lua/5.1/loadall.so;/usr/local/openresty/luajit/lib/lua/5.1/?.so"
 
 EXPOSE 80 443
+
+STOPSIGNAL SIGQUIT
 
 CMD ["/usr/local/openresty/bin/openresty", "-g", "daemon off;"]
