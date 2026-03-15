@@ -14,8 +14,8 @@ PASS=0; FAIL=0
 # ── 颜色 ──────────────────────────────────────────────────────────────
 GREEN='\033[0;32m'; RED='\033[0;31m'; CYAN='\033[0;36m'; NC='\033[0m'
 
-ok()   { echo -e "${GREEN}  ✓ PASS${NC}  $1"; ((PASS++)); }
-fail() { echo -e "${RED}  ✗ FAIL${NC}  $1"; ((FAIL++)); }
+ok()   { echo -e "${GREEN}  ✓ PASS${NC}  $1"; PASS=$((PASS+1)); }
+fail() { echo -e "${RED}  ✗ FAIL${NC}  $1"; FAIL=$((FAIL+1)); }
 info() { echo -e "${CYAN}▶ $1${NC}"; }
 
 # ── 启动容器 ──────────────────────────────────────────────────────────
@@ -96,19 +96,13 @@ assert_http_status "WebDAV OPTIONS 200"     OPTIONS "$BASE/dav/" 200
 
 echo ""
 info "=== 6. WebDAV — PUT 上传文件 ==="
-assert_http_status "WebDAV PUT 201/204" \
-    PUT "$BASE/dav/hello.txt" "201\|204" \
-    -H "Content-Type: text/plain" --data "hello webdav"
-# curl 的 -w 只能精确匹配，改用范围判断
 code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
     -H "Content-Type: text/plain" --data "hello webdav" \
     "$BASE/dav/hello.txt")
 if [[ "$code" == "201" || "$code" == "204" ]]; then
     ok "WebDAV PUT (HTTP $code)"
-    ((PASS++)); ((FAIL--))   # 修正上面 assert 的计数
 else
     fail "WebDAV PUT expected 201/204, got $code"
-    ((PASS--)); ((FAIL++))
 fi
 
 echo ""
