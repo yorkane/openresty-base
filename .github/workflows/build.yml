@@ -78,9 +78,15 @@ jobs:
             echo "Auto-detected OpenResty version: ${RESTY_VERSION}"
           fi
 
-          # ── lua-nginx-module main 最新 commit ─────────────────────────
+          # ── lua-nginx-module 默认分支最新 commit ──────────────────────
+          # 先查询默认分支名（兼容 master/main）
+          LNG_DEFAULT_BRANCH=$(curl -sSfL \
+            "https://api.github.com/repos/openresty/lua-nginx-module" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            | jq -r '.default_branch')
           LUA_NGINX_SHA=$(curl -sSfL \
-            "https://api.github.com/repos/openresty/lua-nginx-module/commits/main" \
+            "https://api.github.com/repos/openresty/lua-nginx-module/commits/${LNG_DEFAULT_BRANCH}" \
             -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
             -H "Accept: application/vnd.github.v3+json" \
             | jq -r '.sha')
@@ -97,9 +103,14 @@ jobs:
             FANCYINDEX_VERSION="master"
           fi
 
-          # ── nginx-dav-ext-module 最新 commit ──────────────────────────
+          # ── nginx-dav-ext-module 默认分支最新 commit ──────────────────
+          DAV_DEFAULT_BRANCH=$(curl -sSfL \
+            "https://api.github.com/repos/mid1221213/nginx-dav-ext-module" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            | jq -r '.default_branch')
           DAV_EXT_SHA=$(curl -sSfL \
-            "https://api.github.com/repos/mid1221213/nginx-dav-ext-module/commits/master" \
+            "https://api.github.com/repos/mid1221213/nginx-dav-ext-module/commits/${DAV_DEFAULT_BRANCH}" \
             -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
             -H "Accept: application/vnd.github.v3+json" \
             | jq -r '.sha')
@@ -191,8 +202,8 @@ jobs:
           PLATFORM_PAIR="${{ matrix.platform }}"
           echo "platform_tag=${PLATFORM_PAIR//\//-}" >> "$GITHUB_OUTPUT"
 
-      - name: Build and push by digest
-        id: build
+      - name: Build and push by digest (GHCR)
+        id: build-ghcr
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -212,22 +223,56 @@ jobs:
             org.opencontainers.image.created=${{ needs.get-versions.outputs.build_date }}
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
-          # 推送到 GHCR（按 digest）
           outputs: type=image,name=${{ env.GHCR_IMAGE }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=${{ matrix.platform }}
           cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
 
-      - name: Export digest
-        run: |
-          mkdir -p /tmp/digests
-          DIGEST="${{ steps.build.outputs.digest }}"
-          touch "/tmp/digests/${DIGEST#sha256:}"
+      - name: Build and push by digest (Docker Hub)
+        id: build-dockerhub
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: true
+          provenance: false
+          build-args: |
+            RESTY_VERSION=${{ needs.get-versions.outputs.resty_version }}
+            LUA_NGINX_MODULE_VERSION=${{ needs.get-versions.outputs.lua_nginx_sha }}
+            NGX_FANCYINDEX_VERSION=${{ needs.get-versions.outputs.fancyindex_version }}
+            NGX_DAV_EXT_VERSION=${{ needs.get-versions.outputs.dav_ext_sha }}
+          labels: |
+            org.opencontainers.image.title=openresty-base
+            org.opencontainers.image.description=Custom OpenResty Alpine with lua-nginx-module/dav-ext/fancyindex
+            org.opencontainers.image.version=${{ needs.get-versions.outputs.resty_version }}
+            org.opencontainers.image.created=${{ needs.get-versions.outputs.build_date }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          outputs: type=image,name=${{ env.DOCKERHUB_IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
 
-      - name: Upload digest artifact
+      - name: Export digests
+        run: |
+          mkdir -p /tmp/digests/ghcr /tmp/digests/dockerhub
+          GHCR_DIGEST="${{ steps.build-ghcr.outputs.digest }}"
+          DH_DIGEST="${{ steps.build-dockerhub.outputs.digest }}"
+          touch "/tmp/digests/ghcr/${GHCR_DIGEST#sha256:}"
+          touch "/tmp/digests/dockerhub/${DH_DIGEST#sha256:}"
+
+      - name: Upload GHCR digest artifact
         uses: actions/upload-artifact@v4
         with:
-          name: digests-${{ steps.prep.outputs.platform_tag }}
-          path: /tmp/digests/*
+          name: digests-ghcr-${{ steps.prep.outputs.platform_tag }}
+          path: /tmp/digests/ghcr/*
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload Docker Hub digest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-dockerhub-${{ steps.prep.outputs.platform_tag }}
+          path: /tmp/digests/dockerhub/*
           if-no-files-found: error
           retention-days: 1
 
@@ -243,11 +288,18 @@ jobs:
     if: needs.get-versions.outputs.should_build == 'true'
 
     steps:
-      - name: Download all digests
+      - name: Download GHCR digests
         uses: actions/download-artifact@v4
         with:
-          path: /tmp/digests
-          pattern: digests-*
+          path: /tmp/digests/ghcr
+          pattern: digests-ghcr-*
+          merge-multiple: true
+
+      - name: Download Docker Hub digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests/dockerhub
+          pattern: digests-dockerhub-*
           merge-multiple: true
 
       - name: Set up Docker Buildx
@@ -267,28 +319,35 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Create and push multi-arch manifest
+      - name: Create and push multi-arch manifest (GHCR)
         env:
           IMAGE_TAG: ${{ needs.get-versions.outputs.image_tag }}
           RESTY_VERSION: ${{ needs.get-versions.outputs.resty_version }}
         run: |
-          # 收集所有 digest 参数
-          DIGESTS=$(ls /tmp/digests | awk '{print "${{ env.GHCR_IMAGE }}@sha256:" $0}' | tr '\n' ' ')
-
-          # 推送到 GHCR
+          GHCR_DIGESTS=$(ls /tmp/digests/ghcr | awk '{print "${{ env.GHCR_IMAGE }}@sha256:" $0}' | tr '\n' ' ')
           docker buildx imagetools create \
             --tag "${{ env.GHCR_IMAGE }}:${IMAGE_TAG}" \
             --tag "${{ env.GHCR_IMAGE }}:${RESTY_VERSION}" \
             --tag "${{ env.GHCR_IMAGE }}:latest" \
-            ${DIGESTS}
+            ${GHCR_DIGESTS}
 
-          # 推送到 Docker Hub（复用同一组 digest）
+      - name: Create and push multi-arch manifest (Docker Hub)
+        env:
+          IMAGE_TAG: ${{ needs.get-versions.outputs.image_tag }}
+          RESTY_VERSION: ${{ needs.get-versions.outputs.resty_version }}
+        run: |
+          DH_DIGESTS=$(ls /tmp/digests/dockerhub | awk '{print "${{ env.DOCKERHUB_IMAGE }}@sha256:" $0}' | tr '\n' ' ')
           docker buildx imagetools create \
             --tag "${{ env.DOCKERHUB_IMAGE }}:${IMAGE_TAG}" \
             --tag "${{ env.DOCKERHUB_IMAGE }}:${RESTY_VERSION}" \
             --tag "${{ env.DOCKERHUB_IMAGE }}:latest" \
-            ${DIGESTS}
+            ${DH_DIGESTS}
 
+      - name: Summary
+        env:
+          IMAGE_TAG: ${{ needs.get-versions.outputs.image_tag }}
+          RESTY_VERSION: ${{ needs.get-versions.outputs.resty_version }}
+        run: |
           echo "### Published Images" >> "$GITHUB_STEP_SUMMARY"
           echo "| Registry | Tags |" >> "$GITHUB_STEP_SUMMARY"
           echo "|----------|------|" >> "$GITHUB_STEP_SUMMARY"
