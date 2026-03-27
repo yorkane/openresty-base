@@ -11,11 +11,11 @@
 # Build-time arguments (overridden by GitHub Actions workflow)
 # --------------------------------------------------------------------------
 ARG RESTY_IMAGE_BASE="alpine"
-ARG RESTY_IMAGE_TAG="3.22"
+ARG RESTY_IMAGE_TAG="3.22.3"
 
 FROM ${RESTY_IMAGE_BASE}:${RESTY_IMAGE_TAG}
 
-ARG RESTY_VERSION="1.29.2.1"
+ARG RESTY_VERSION="1.29.2.3"
 ARG RESTY_OPENSSL_VERSION="3.5.5"
 ARG RESTY_OPENSSL_URL_BASE="https://github.com/openssl/openssl/releases/download/openssl-${RESTY_OPENSSL_VERSION}"
 ARG RESTY_PCRE_VERSION="10.47"
@@ -47,6 +47,7 @@ ARG RESTY_CONFIG_OPTIONS="\
     --with-http_stub_status_module \
     --with-http_sub_module \
     --with-http_v2_module \
+    --with-http_v3_module \
     --with-http_xslt_module=dynamic \
     --with-ipv6 \
     --with-mail \
@@ -106,7 +107,6 @@ RUN apk add --no-cache --virtual .build-deps \
         libxslt \
         libxml2 \
         tzdata \
-        wget \
         zlib \
         ${RESTY_ADD_PACKAGE_RUNDEPS} \
     \
