@@ -2,6 +2,8 @@
 # Custom OpenResty build with extra modules:
 #   - lua-nginx-module        (latest master, replaces bundled version)
 #   - stream-lua-nginx-module (latest master, replaces bundled version)
+#   - lua-resty-core          (latest master, replaces bundled version
+#                              so resty.core ABI matches the master C modules)
 #   - nginx-dav-ext-module    (WebDAV PROPFIND/OPTIONS/LOCK/UNLOCK)
 #   - ngx-fancyindex          (fancy directory listing)
 #
@@ -41,6 +43,7 @@ ARG RESTY_J="1"
 
 # Versions for extra modules (overridden by workflow to pin exact commits/tags)
 ARG LUA_NGINX_MODULE_VERSION="master"
+ARG LUA_RESTY_CORE_VERSION="master"
 ARG NGX_FANCYINDEX_VERSION="master"
 ARG NGX_DAV_EXT_VERSION="master"
 
@@ -110,6 +113,7 @@ LABEL resty_openssl_version="${RESTY_OPENSSL_VERSION}"
 LABEL resty_openssl_patch_version="${RESTY_OPENSSL_PATCH_VERSION}"
 LABEL resty_pcre_version="${RESTY_PCRE_VERSION}"
 LABEL lua_nginx_module_version="${LUA_NGINX_MODULE_VERSION}"
+LABEL lua_resty_core_version="${LUA_RESTY_CORE_VERSION}"
 LABEL ngx_fancyindex_version="${NGX_FANCYINDEX_VERSION}"
 LABEL ngx_dav_ext_module_version="${NGX_DAV_EXT_VERSION}"
 
@@ -190,6 +194,11 @@ RUN apk add --no-cache --virtual .build-deps \
     && git clone --depth=1 \
             https://github.com/openresty/stream-lua-nginx-module.git \
             /tmp/stream-lua-nginx-module \
+    # lua-resty-core master (must match the master ngx_lua 0.10.32 ABI;
+    # bundled lua-resty-core in OpenResty 1.31.1.1 still expects 0.10.31)
+    && git clone --depth=1 --branch "${LUA_RESTY_CORE_VERSION}" \
+            https://github.com/openresty/lua-resty-core.git \
+            /tmp/lua-resty-core \
     # nginx-dav-ext-module (WebDAV PROPFIND/OPTIONS/LOCK/UNLOCK)
     && git clone --depth=1 --branch "${NGX_DAV_EXT_VERSION}" \
             https://github.com/arut/nginx-dav-ext-module.git \
@@ -218,6 +227,15 @@ RUN apk add --no-cache --virtual .build-deps \
          echo "==> Replacing $(basename ${BUNDLED_STREAM_LUA}) with stream-lua-nginx-module:master"; \
          rm -rf "${BUNDLED_STREAM_LUA}"; \
          cp -r  /tmp/stream-lua-nginx-module "${BUNDLED_STREAM_LUA}"; \
+       fi \
+    # Replace bundled lua-resty-core with the latest master clone so that
+    # resty.core's ABI check (which pins ngx_lua 10032 / ngx_stream_lua 20)
+    # matches our master-cloned C modules.
+    && BUNDLED_LUA_RESTY_CORE=$(ls -d /tmp/openresty-${RESTY_VERSION}/bundle/lua-resty-core-* 2>/dev/null | head -1) \
+    && if [ -n "${BUNDLED_LUA_RESTY_CORE}" ]; then \
+         echo "==> Replacing $(basename ${BUNDLED_LUA_RESTY_CORE}) with lua-resty-core:${LUA_RESTY_CORE_VERSION}"; \
+         rm -rf "${BUNDLED_LUA_RESTY_CORE}"; \
+         cp -r  /tmp/lua-resty-core "${BUNDLED_LUA_RESTY_CORE}"; \
        fi \
     && cd "/tmp/openresty-${RESTY_VERSION}" \
     && if [ -n "${RESTY_EVAL_POST_DOWNLOAD_PRE_CONFIGURE}" ]; then eval $(echo ${RESTY_EVAL_POST_DOWNLOAD_PRE_CONFIGURE}); fi \
@@ -277,6 +295,7 @@ RUN apk add --no-cache --virtual .build-deps \
         "openresty-${RESTY_VERSION}" \
         /tmp/lua-nginx-module \
         /tmp/stream-lua-nginx-module \
+        /tmp/lua-resty-core \
         /tmp/nginx-dav-ext-module \
         /tmp/ngx-fancyindex \
     \
