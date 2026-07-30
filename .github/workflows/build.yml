@@ -75,41 +75,56 @@ jobs:
             echo "Auto-detected OpenResty version: ${RESTY_VERSION}"
           fi
 
-          # ── lua-nginx-module 默认分支最新 commit（仅用于标签/标注，不作为 clone branch）
-          LNG_DEFAULT_BRANCH=$(curl -sSfL \
+          # ── 辅助函数：GitHub REST API（失败返回原样空字符串，不中断构建）
+          # GitHub API 偶发 anti-abuse 4xx，SHA 仅用于 label/summary，
+          # 不影响 Dockerfile 中的 clone（默认走 master 分支）。
+          gh_api() {
+            local url="$1" jq_filter="$2"
+            set +e +o pipefail
+            curl -sSfL "${url}" \
+              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Accept: application/vnd.github.v3+json" 2>/dev/null \
+              | jq -r "${jq_filter}" 2>/dev/null
+            set -e -o pipefail
+          }
+
+          # ── lua-nginx-module 默认分支最新 commit（仅用于标签/标注）
+          LNG_DEFAULT_BRANCH=$(gh_api \
             "https://api.github.com/repos/openresty/lua-nginx-module" \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Accept: application/vnd.github.v3+json" \
-            | jq -r '.default_branch')
-          LUA_NGINX_SHA=$(curl -sSfL \
+            '.default_branch')
+          [[ -z "${LNG_DEFAULT_BRANCH}" || "${LNG_DEFAULT_BRANCH}" == "null" ]] && LNG_DEFAULT_BRANCH="master"
+
+          LUA_NGINX_SHA=$(gh_api \
             "https://api.github.com/repos/openresty/lua-nginx-module/commits/${LNG_DEFAULT_BRANCH}" \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Accept: application/vnd.github.v3+json" \
-            | jq -r '.sha')
-          LUA_NGINX_SHORT="${LUA_NGINX_SHA:0:7}"
+            '.sha')
+          if [[ -z "${LUA_NGINX_SHA}" || "${LUA_NGINX_SHA}" == "null" ]]; then
+            LUA_NGINX_SHORT="unknown"
+          else
+            LUA_NGINX_SHORT="${LUA_NGINX_SHA:0:7}"
+          fi
 
           # ── ngx-fancyindex 最新 release tag ───────────────────────────
-          FANCYINDEX_VERSION=$(curl -sSfL \
+          FANCYINDEX_VERSION=$(gh_api \
             "https://api.github.com/repos/aperezdc/ngx-fancyindex/releases/latest" \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Accept: application/vnd.github.v3+json" \
-            | jq -r '.tag_name')
+            '.tag_name')
           if [[ -z "${FANCYINDEX_VERSION}" || "${FANCYINDEX_VERSION}" == "null" ]]; then
             FANCYINDEX_VERSION="master"
           fi
 
           # ── nginx-dav-ext-module 默认分支最新 commit（仅用于标注）
-          DAV_DEFAULT_BRANCH=$(curl -sSfL \
+          DAV_DEFAULT_BRANCH=$(gh_api \
             "https://api.github.com/repos/mid1221213/nginx-dav-ext-module" \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Accept: application/vnd.github.v3+json" \
-            | jq -r '.default_branch')
-          DAV_EXT_SHA=$(curl -sSfL \
+            '.default_branch')
+          [[ -z "${DAV_DEFAULT_BRANCH}" || "${DAV_DEFAULT_BRANCH}" == "null" ]] && DAV_DEFAULT_BRANCH="master"
+
+          DAV_EXT_SHA=$(gh_api \
             "https://api.github.com/repos/mid1221213/nginx-dav-ext-module/commits/${DAV_DEFAULT_BRANCH}" \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Accept: application/vnd.github.v3+json" \
-            | jq -r '.sha')
-          DAV_EXT_SHORT="${DAV_EXT_SHA:0:7}"
+            '.sha')
+          if [[ -z "${DAV_EXT_SHA}" || "${DAV_EXT_SHA}" == "null" ]]; then
+            DAV_EXT_SHORT="unknown"
+          else
+            DAV_EXT_SHORT="${DAV_EXT_SHA:0:7}"
+          fi
 
           BUILD_DATE=$(date -u +"%Y%m%d")
           IMAGE_TAG="${RESTY_VERSION}-${BUILD_DATE}"
