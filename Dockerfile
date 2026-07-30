@@ -192,7 +192,7 @@ RUN apk add --no-cache --virtual .build-deps \
             /tmp/stream-lua-nginx-module \
     # nginx-dav-ext-module (WebDAV PROPFIND/OPTIONS/LOCK/UNLOCK)
     && git clone --depth=1 --branch "${NGX_DAV_EXT_VERSION}" \
-            https://github.com/mid1221213/nginx-dav-ext-module.git \
+            https://github.com/arut/nginx-dav-ext-module.git \
             /tmp/nginx-dav-ext-module \
     # ngx-fancyindex (fancy directory listing)
     && git clone --depth=1 --branch "${NGX_FANCYINDEX_VERSION}" \
