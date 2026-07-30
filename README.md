@@ -26,29 +26,34 @@ docker pull yorkane/openresty-base:latest
 | Tag | 说明 |
 |-----|------|
 | `latest` | 最新构建 |
-| `1.29.2.1` | OpenResty 版本号 |
-| `1.29.2.1-20260315` | OpenResty 版本 + 构建日期 |
+| `1.31.1.1` | OpenResty 版本号 |
+| `1.31.1.1-20260315` | OpenResty 版本 + 构建日期 |
 
 ## 组件版本
 
 | 组件 | 版本策略 |
 |------|---------|
+| Alpine | 3.23.5 |
 | OpenResty | 自动检测官网最新稳定版 |
 | LuaJIT | OpenResty 捆绑版（2.1.ROLLING） |
 | lua-nginx-module | GitHub `master` 分支最新 commit |
+| stream-lua-nginx-module | GitHub `master` 分支最新 commit |
 | nginx-dav-ext-module | GitHub `master` 分支最新 commit |
 | ngx-fancyindex | 最新 Release tag |
 | LuaRocks | 3.13.0 |
-| OpenSSL | 3.5.5 |
+| OpenSSL | 3.5.7 (patch base 3.5.5) |
 | PCRE2 | 10.47 |
 
 ## 镜像特性
 
-- **基础镜像**：`alpine:3.22`，最终镜像约 **~75 MB**
+- **基础镜像**：`alpine:3.23`，最终镜像约 **~75 MB**
 - **单层构建**：所有编译步骤合并为一个 `RUN`，编译工具链在构建完成后完全清除
-- **二进制精简**：`strip` nginx / luajit / *.so，去掉调试符号
-- **运行时依赖最小化**：仅保留必要的 so 和 Alpine 包（~53 个）
+- **二进制精简**：`strip` nginx / luajit / openssl / pcre2 / *.so，去掉调试符号
+- **运行时依赖最小化**：仅保留必要的 so 和 Alpine 包
 - **动态模块**：geoip、image_filter、xslt 以动态 `.so` 形式保留
+- **OpenSSL 独立编译**：作为共享库安装到 `/usr/local/openresty/openssl3`，并应用 OpenResty 官方补丁（`sess_set_get_cb_yield`）
+- **PCRE2 独立编译**：作为共享库安装到 `/usr/local/openresty/pcre2`，启用 JIT
+- **去掉 RDS / Mail POP3/IMAP/SMTP**：与官方 alpine 镜像保持一致
 
 ## 本地构建
 
@@ -63,7 +68,7 @@ docker build -t openresty-base:local .
 bash test/run_tests.sh
 
 # 指定自定义镜像
-bash test/run_tests.sh ghcr.io/yorkane/openresty-base:1.29.2.1
+bash test/run_tests.sh ghcr.io/yorkane/openresty-base:1.31.1.1
 ```
 
 测试覆盖以下功能点：
