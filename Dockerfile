@@ -213,18 +213,6 @@ RUN apk add --no-cache --virtual .build-deps \
             https://github.com/aperezdc/ngx-fancyindex.git \
             /tmp/ngx-fancyindex \
     \
-    # ── Fetch lua-resty-jwt (api7 fork, APISIX jwt-auth compatible) ───
-    && curl -fSL "https://codeload.github.com/api7/lua-resty-jwt/tar.gz/refs/tags/v${LUA_RESTY_JWT_VERSION}" \
-            -o "lua-resty-jwt.tar.gz" \
-    && tar xzf "lua-resty-jwt.tar.gz" \
-    && cp "lua-resty-jwt-${LUA_RESTY_JWT_VERSION}/lib/resty/jwt.lua" \
-          /usr/local/openresty/lualib/resty/jwt.lua \
-    && cp "lua-resty-jwt-${LUA_RESTY_JWT_VERSION}/lib/resty/jwt-validators.lua" \
-          /usr/local/openresty/lualib/resty/jwt-validators.lua \
-    && cp "lua-resty-jwt-${LUA_RESTY_JWT_VERSION}/lib/resty/evp.lua" \
-          /usr/local/openresty/lualib/resty/evp.lua \
-    && rm -rf "lua-resty-jwt-${LUA_RESTY_JWT_VERSION}" "lua-resty-jwt.tar.gz" \
-    \
     # ── Download & build OpenResty ────────────────────────────────────────
     && if [ -n "${RESTY_EVAL_PRE_CONFIGURE}" ]; then eval $(echo ${RESTY_EVAL_PRE_CONFIGURE}); fi \
     && curl -fSL "https://openresty.org/download/openresty-${RESTY_VERSION}.tar.gz" \
@@ -267,6 +255,20 @@ RUN apk add --no-cache --virtual .build-deps \
     && if [ -n "${RESTY_EVAL_PRE_MAKE}" ]; then eval $(echo ${RESTY_EVAL_PRE_MAKE}); fi \
     && make -j${RESTY_J} \
     && make install \
+    \
+    # ── Fetch lua-resty-jwt (api7 fork, APISIX jwt-auth compatible) ───
+    # NOTE: must run AFTER `make install` because /usr/local/openresty/lualib
+    # does not exist before OpenResty is installed.
+    && curl -fSL "https://codeload.github.com/api7/lua-resty-jwt/tar.gz/refs/tags/v${LUA_RESTY_JWT_VERSION}" \
+            -o "lua-resty-jwt.tar.gz" \
+    && tar xzf "lua-resty-jwt.tar.gz" \
+    && cp "lua-resty-jwt-${LUA_RESTY_JWT_VERSION}/lib/resty/jwt.lua" \
+          /usr/local/openresty/lualib/resty/jwt.lua \
+    && cp "lua-resty-jwt-${LUA_RESTY_JWT_VERSION}/lib/resty/jwt-validators.lua" \
+          /usr/local/openresty/lualib/resty/jwt-validators.lua \
+    && cp "lua-resty-jwt-${LUA_RESTY_JWT_VERSION}/lib/resty/evp.lua" \
+          /usr/local/openresty/lualib/resty/evp.lua \
+    && rm -rf "lua-resty-jwt-${LUA_RESTY_JWT_VERSION}" "lua-resty-jwt.tar.gz" \
     \
     # ── Install LuaRocks ──────────────────────────────────────────────────
     && cd /tmp \
