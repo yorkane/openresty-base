@@ -47,6 +47,10 @@ ARG LUA_RESTY_CORE_VERSION="master"
 ARG NGX_FANCYINDEX_VERSION="master"
 ARG NGX_DAV_EXT_VERSION="master"
 
+# api7 fork of lua-resty-jwt (used by APISIX jwt-auth) - works with
+# OpenSSL 3.x via resty.openssl; no legacy HMAC_CTX_init dependency.
+ARG LUA_RESTY_JWT_VERSION="0.2.6"
+
 ARG RESTY_CONFIG_OPTIONS="\
     --with-compat \
     --without-http_rds_json_module \
@@ -114,6 +118,7 @@ LABEL resty_openssl_patch_version="${RESTY_OPENSSL_PATCH_VERSION}"
 LABEL resty_pcre_version="${RESTY_PCRE_VERSION}"
 LABEL lua_nginx_module_version="${LUA_NGINX_MODULE_VERSION}"
 LABEL lua_resty_core_version="${LUA_RESTY_CORE_VERSION}"
+LABEL lua_resty_jwt_version="${LUA_RESTY_JWT_VERSION}"
 LABEL ngx_fancyindex_version="${NGX_FANCYINDEX_VERSION}"
 LABEL ngx_dav_ext_module_version="${NGX_DAV_EXT_VERSION}"
 
@@ -207,6 +212,18 @@ RUN apk add --no-cache --virtual .build-deps \
     && git clone --depth=1 --branch "${NGX_FANCYINDEX_VERSION}" \
             https://github.com/aperezdc/ngx-fancyindex.git \
             /tmp/ngx-fancyindex \
+    \
+    # ── Fetch lua-resty-jwt (api7 fork, APISIX jwt-auth compatible) ───
+    && curl -fSL "https://codeload.github.com/api7/lua-resty-jwt/tar.gz/refs/tags/v${LUA_RESTY_JWT_VERSION}" \
+            -o "lua-resty-jwt.tar.gz" \
+    && tar xzf "lua-resty-jwt.tar.gz" \
+    && cp "lua-resty-jwt-${LUA_RESTY_JWT_VERSION}/lib/resty/jwt.lua" \
+          /usr/local/openresty/lualib/resty/jwt.lua \
+    && cp "lua-resty-jwt-${LUA_RESTY_JWT_VERSION}/lib/resty/jwt-validators.lua" \
+          /usr/local/openresty/lualib/resty/jwt-validators.lua \
+    && cp "lua-resty-jwt-${LUA_RESTY_JWT_VERSION}/lib/resty/evp.lua" \
+          /usr/local/openresty/lualib/resty/evp.lua \
+    && rm -rf "lua-resty-jwt-${LUA_RESTY_JWT_VERSION}" "lua-resty-jwt.tar.gz" \
     \
     # ── Download & build OpenResty ────────────────────────────────────────
     && if [ -n "${RESTY_EVAL_PRE_CONFIGURE}" ]; then eval $(echo ${RESTY_EVAL_PRE_CONFIGURE}); fi \
@@ -316,6 +333,12 @@ ENV PATH="/usr/local/openresty/luajit/bin:/usr/local/openresty/nginx/sbin:/usr/l
 ENV LUA_PATH="/usr/local/openresty/site/lualib/?.ljbc;/usr/local/openresty/site/lualib/?/init.ljbc;/usr/local/openresty/lualib/?.ljbc;/usr/local/openresty/lualib/?/init.ljbc;/usr/local/openresty/site/lualib/?.lua;/usr/local/openresty/site/lualib/?/init.lua;/usr/local/openresty/lualib/?.lua;/usr/local/openresty/lualib/?/init.lua;./?.lua;/usr/local/openresty/luajit/share/luajit-2.1/?.lua;/usr/local/share/lua/5.1/?.lua;/usr/local/share/lua/5.1/?/init.lua;/usr/local/openresty/luajit/share/lua/5.1/?.lua;/usr/local/openresty/luajit/share/lua/5.1/?/init.lua"
 
 ENV LUA_CPATH="/usr/local/openresty/site/lualib/?.so;/usr/local/openresty/lualib/?.so;./?.so;/usr/local/lib/lua/5.1/?.so;/usr/local/openresty/luajit/lib/lua/5.1/?.so;/usr/local/lib/lua/5.1/loadall.so;/usr/local/openresty/luajit/lib/lua/5.1/?.so"
+
+# ── JWT / SSO 公共库 ────────────────────────────────────────────────
+# 覆盖注入本项目维护的 resty.hmac 适配器（基于捆绑 resty.openssl.hmac）
+# 和 resty.noco_auth（对接 APISIX noco_sso_auth 的 sso_ck / noco_uid Cookie）
+COPY lualib/resty/hmac.lua /usr/local/openresty/lualib/resty/hmac.lua
+COPY lualib/resty/noco_auth.lua /usr/local/openresty/lualib/resty/noco_auth.lua
 
 EXPOSE 80 443
 

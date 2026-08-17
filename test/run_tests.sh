@@ -130,6 +130,15 @@ else
     ok "error.log not created (no warnings)"
 fi
 
+echo ""
+info "=== 8. JWT / SSO 公共库 (resty.jwt + resty.noco_auth) ==="
+assert_contains "resty.jwt 可用"            "$BASE/jwt"  "resty.jwt: OK"
+assert_contains "resty.noco_auth 可用"      "$BASE/jwt"  "resty.noco_auth: OK"
+assert_contains "HS256 签发并验证"          "$BASE/jwt"  "sign/verify: OK"
+assert_contains "错误密钥应拒绝"            "$BASE/jwt"  "bad secret: rejected"
+assert_contains "APISIX 格式 JWT 验证"      "$BASE/jwt"  "apisix-style token: OK"
+assert_contains "noco_uid 3段解析"          "$BASE/jwt"  "noco_uid: authed/kate"
+
 # ── 汇总 ──────────────────────────────────────────────────────────────
 echo ""
 echo "────────────────────────────────────────"

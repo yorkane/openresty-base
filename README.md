@@ -3,8 +3,29 @@
 定制 OpenResty Alpine Docker 镜像，在官方源码编译基础上额外集成：
 
 - [lua-nginx-module](https://github.com/openresty/lua-nginx-module) — master 分支最新版本（替换 OpenResty 内置捆绑版）
-- [nginx-dav-ext-module](https://github.com/mid1221213/nginx-dav-ext-module) — WebDAV PROPFIND / OPTIONS / LOCK / UNLOCK 支持
+- [nginx-dav-ext-module](https://github.com/arut/nginx-dav-ext-module) — WebDAV PROPFIND / OPTIONS / LOCK / UNLOCK 支持
 - [ngx-fancyindex](https://github.com/aperezdc/ngx-fancyindex) — 美化目录索引
+- [lua-resty-jwt](https://github.com/api7/lua-resty-jwt) — JWT 签发/验证（APISIX 同款 api7 fork，含 `resty.noco_auth` SSO 对接封装）
+
+## JWT / SSO 集成
+
+镜像内置 `resty.jwt`、`resty.hmac`（OpenSSL 3.x 兼容适配）与 `resty.noco_auth`，
+可直接验证 [APISIX noco_sso_auth](../../docs/noco_sso_auth.md) 签发的
+`sso_ck` JWT Cookie，实现 OpenResty 代理与 APISIX SSO 无缝对接。
+
+```nginx
+location / {
+    access_by_lua_block {
+        local noco = require "resty.noco_auth"
+        local user, err = noco.verify_request("sso_key")
+        if not user then return ngx.exit(ngx.HTTP_UNAUTHORIZED) end
+        ngx.ctx.sso_user = user
+    }
+    proxy_pass http://backend;
+}
+```
+
+完整指南见 [docs/sso-jwt-auth.md](docs/sso-jwt-auth.md)。
 
 ## 镜像地址
 
@@ -38,6 +59,8 @@ docker pull yorkane/openresty-base:latest
 | LuaJIT | OpenResty 捆绑版（2.1.ROLLING） |
 | lua-nginx-module | GitHub `master` 分支最新 commit |
 | stream-lua-nginx-module | GitHub `master` 分支最新 commit |
+| lua-resty-core | GitHub `master` 分支最新 commit |
+| lua-resty-jwt | api7 fork v0.2.6（APISIX 同款） |
 | nginx-dav-ext-module | GitHub `master` 分支最新 commit |
 | ngx-fancyindex | 最新 Release tag |
 | LuaRocks | 3.13.0 |
@@ -112,6 +135,12 @@ GHCR 推送使用内置 `GITHUB_TOKEN`，无需额外配置。
 .
 ├── Dockerfile                  # 单阶段 Alpine 构建
 ├── README.md
+├── docs/
+│   └── sso-jwt-auth.md         # NocoBase SSO (JWT) 集成指南
+├── lualib/
+│   └── resty/
+│       ├── hmac.lua            # resty.hmac 适配器（基于捆绑 resty.openssl.hmac）
+│       └── noco_auth.lua       # resty.noco_auth SSO Cookie 认证库
 └── test/
     ├── run_tests.sh            # 功能测试脚本
     ├── conf/
