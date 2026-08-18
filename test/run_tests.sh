@@ -178,7 +178,7 @@ fi
 
 # 9.3 有效 token → 200
 VALID_HDR=$(b64url '{"alg":"HS256","typ":"JWT"}')
-VALID_PAY=$(b64url "{\"uid\":7,\"uname\":\"bob\",\"exp\":$(date +%s)+3600}")
+VALID_PAY=$(b64url "{\"uid\":7,\"uname\":\"bob\",\"exp\":$(($(date +%s) + 3600))}")
 VALID_TOKEN="${VALID_HDR}.${VALID_PAY}.$(hs256 "${VALID_HDR}.${VALID_PAY}")"
 body=$(curl -s -H "Cookie: sso_ck=${VALID_TOKEN}" "$BASE/auth")
 if echo "$body" | grep -q "authorized uid=7"; then
