@@ -11,6 +11,7 @@ on:
       - main
     paths:
       - 'Dockerfile'
+      - 'lualib/**'
       - '.github/workflows/build.yml'
 
   # 支持手动触发（可覆盖版本参数）
