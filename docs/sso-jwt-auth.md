@@ -34,30 +34,31 @@ APISIX 登录流程签发的 Cookie：
 
 ## 快速使用
 
-### 1. 全站保护（access_by_lua）
+### 1. 全站保护（access_by_lua + 自动跳转，推荐）
 
 ```nginx
 http {
-    # 可选的共享密钥：从环境变量/文件读取更佳
-    lua_shared_dict sso_config 1m;
+    # init 阶段注入 SSO 配置（signin / sso_renew URL 等）
+    init_by_lua_block {
+        local noco = require "resty.noco_auth"
+        noco.setup({
+            sso_key       = "sso_key",                       -- APISIX 侧 sso_key
+            signin_url    = "https://noco.w.wtvdev.com/api/auth:signIn",  -- 登录端点
+            sso_renew_url = "https://noco.w.wtvdev.com/_sso_renew",       -- 续期端点
+        })
+    }
 
     server {
         listen 80;
         server_name app.example.com;
 
         location / {
-            # 在 access 阶段验证 sso_ck，失败直接 401
             access_by_lua_block {
                 local noco = require "resty.noco_auth"
-                local user, err = noco.verify_request("sso_key", {
-                    require_uid = true,   -- 必须含 uid
-                    leeway      = 60,     -- 时钟偏差容忍（秒）
-                })
+                local user = noco.authorize()   -- 内部自动处理跳转
                 if not user then
-                    ngx.log(ngx.WARN, "sso auth failed: ", err)
-                    return ngx.exit(ngx.HTTP_UNAUTHORIZED)
+                    return  -- 已 302 到 signin / sso_renew，无需再 exit
                 end
-                -- 将用户信息放入请求上下文，供后端逻辑使用
                 ngx.ctx.sso_user = user
             }
 
@@ -67,7 +68,36 @@ http {
 }
 ```
 
-### 2. 仅保护指定 location
+`authorize()` 自动鉴权流程：
+
+| 场景 | 行为 |
+|------|------|
+| `sso_ck` 有效 | 放行，返回 `payload {uid, uname, exp}` |
+| 无任何会话 Cookie | 302 → `signin_url`（登录） |
+| `sso_ck` 缺失/过期/失效，但存在 `noco_uid` 会话 | 302 → `sso_renew_url?url=<当前URI>`（续期后自动回跳） |
+| 过期/失效且无 `noco_uid` | 302 → `signin_url` |
+
+> `sso_renew_url` 会携带 `url=<当前请求URI>`（URL 编码）回跳参数，
+> 与 APISIX noco_sso_auth 的 `sso_renew?url=xxx → 302 redirect` 行为一致。
+
+### 2. 调用级配置（不经 setup，直接传参）
+
+```nginx
+location / {
+    access_by_lua_block {
+        local noco = require "resty.noco_auth"
+        local user = noco.authorize("sso_key", {
+            signin_url    = "/login",   -- 覆盖默认
+            sso_renew_url = "/renew",
+        })
+        if not user then return end
+        ngx.ctx.sso_user = user
+    }
+    proxy_pass http://backend;
+}
+```
+
+### 3. 仅保护指定 location（手动 401）
 
 ```nginx
 location /admin/ {
@@ -112,13 +142,30 @@ location /api/ {
 
 | 函数 | 说明 |
 |------|------|
-| `verify_request(secret, opts?)` | 读取当前请求的 `sso_ck` Cookie 并验证，返回 `payload` 或 `nil, err`。opts: `cookie_name`(默认 `sso_ck`)、`leeway`(默认 60)、`require_uid`、`require_exp`(默认 true) |
+| `setup(opts)` | 注入模块级配置（建议 `init_by_lua_block` 调用一次） |
+| `authorize(secret?, opts?)` | **推荐**：验证 `sso_ck`；失败时自动 302 跳转（无会话→`signin_url`，有会话但 cookie 失效→`sso_renew_url?url=`）。`secret` 可省略（用 setup 注入的 `sso_key`），也支持 `authorize({...})` 形式 |
+| `verify_request(secret, opts?)` | 读取当前请求的 `sso_ck` Cookie 并验证，返回 `payload` 或 `nil, err` |
 | `verify_token(secret, token, opts?)` | 验证给定 JWT 字符串（无需请求上下文） |
 | `authenticate(secret, opts?)` | 验证 `sso_ck` 并解析 `noco_uid`，返回 `payload, noco_info, err` |
 | `parse_noco_uid(cookie_value)` | 解析 `noco_uid`，返回 `{ req_id, ts, uname, state }`，state 为 `session`(2段)/`authed`(3段) |
 | `get_cookie(cookie_header, name)` | 从 Cookie 头字符串提取指定 cookie 值 |
 | `get_uid(secret, opts?)` / `get_uname(secret, opts?)` | 快速取当前用户 uid / uname |
+| `build_url(target, return_url, opts?)` | 拼接带 `url=` 回跳参数的跳转地址 |
+| `redirect(target, opts?)` | 302 跳转（`opts.redirect_code` 可覆盖状态码） |
 | `sign(secret, payload, opts?)` | 签发 HS256 JWT（可选，用于自建 sso_renew 服务） |
+
+**`setup()` / 调用级 `opts` 可配置项**（调用级优先）：
+
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `sso_key` | nil | sso_ck JWT 的 HMAC 密钥（对应 APISIX 侧 `sso_key`） |
+| `signin_url` | `/api/auth:signIn` | 无会话时 302 跳转的登录端点 |
+| `sso_renew_url` | `/_sso_renew` | cookie 失效时 302 跳转的续期端点 |
+| `cookie_name` | `sso_ck` | sso JWT cookie 名 |
+| `leeway` | 60 | exp 时钟偏差容忍（秒） |
+| `return_url_param` | `url` | sso_renew 回跳参数名 |
+| `signin_append_url` | false | 是否给 signin_url 也追加回跳参数 |
+| `redirect_code` | 302 | 跳转状态码 |
 
 ### `resty.jwt`（原汁原味）
 
