@@ -42,13 +42,21 @@
 ### 快速使用
 
 ```bash
+# 方式一: docker compose (推荐)
+cp .env.example .env && vim .env      # 修改 AUTHZ_ADMIN_PASSWORD
+docker compose up -d
+
+# 方式二: docker run
 docker run -d --name gw --network host \
   -v /data/gw:/data \
   -e AUTHZ_ADMIN_PASSWORD=your-secret \
   ghcr.io/yorkane/openresty-base:latest
+
 # 浏览器打开 http://<host>:6080/_authz/ 登录
 # 代理本机 3000 端口: http://3000-myhost.example.com:6080/
 ```
+
+> 维护者请阅读 [design.md](design.md) 了解架构、数据模型与实现约束。
 
 ### 环境变量
 
@@ -200,6 +208,9 @@ GHCR 推送使用内置 `GITHUB_TOKEN`，无需额外配置。
 .
 ├── Dockerfile                  # 单阶段 Alpine 构建
 ├── README.md
+├── design.md                   # ★ 设计文档 (架构/数据模型/踩坑记录, 维护必读)
+├── docker-compose.yml          # 部署编排
+├── .env.example                # 环境变量模板
 ├── docker-entrypoint.sh        # 证书生成 + conf 渲染 + 启动
 ├── docs/
 │   └── sso-jwt-auth.md         # NocoBase SSO (JWT) 集成指南

@@ -1,0 +1,37 @@
+# openresty-base Authz Gateway
+#
+# 功能: 动态端口反向代理 + 本地认证授权 (SQLite + mini-casbin)
+#   - http  入口 AUTHZ_HTTP_PORT(默认6080)  → 本机 http 服务
+#   - https 入口 AUTHZ_HTTPS_PORT(默认6443) → 本机 https 服务 (自签证书)
+#   - 数字前缀子域名免配置: 3000-任意域名 → 本机3000端口 (范围 AUTHZ_PORT_MIN~MAX)
+#   - 管理界面: http://<host>:6080/_authz/  (首次启动 admin/admin123, 登录后改密)
+#
+# 使用:
+#   cp .env.example .env && vim .env      # 至少修改 AUTHZ_ADMIN_PASSWORD
+#   docker compose up -d
+#   docker compose logs -f
+#
+# 注意: --network host 模式见注释掉的 override 说明 (代理本机服务推荐 host 网络)
+
+services:
+  gateway:
+    image: ghcr.io/yorkane/openresty-base:latest
+    container_name: openresty-gateway
+    restart: unless-stopped
+    ports:
+      - "${AUTHZ_HTTP_PORT:-6080}:${AUTHZ_HTTP_PORT:-6080}"
+      - "${AUTHZ_HTTPS_PORT:-6443}:${AUTHZ_HTTPS_PORT:-6443}"
+    environment:
+      AUTHZ_ADMIN_PASSWORD: ${AUTHZ_ADMIN_PASSWORD:-admin123}
+      AUTHZ_HTTP_PORT: ${AUTHZ_HTTP_PORT:-6080}
+      AUTHZ_HTTPS_PORT: ${AUTHZ_HTTPS_PORT:-6443}
+      AUTHZ_PORT_MIN: ${AUTHZ_PORT_MIN:-2000}
+      AUTHZ_PORT_MAX: ${AUTHZ_PORT_MAX:-20000}
+      AUTHZ_DB_PATH: ${AUTHZ_DB_PATH:-/data/authz/authz.db}
+      AUTHZ_CERT_DIR: ${AUTHZ_CERT_DIR:-/data/certs}
+      AUTHZ_SESSION_TTL: ${AUTHZ_SESSION_TTL:-604800}
+    volumes:
+      - ${DATA_DIR:-./data}:/data
+    # ── 推荐: 代理本机 docker 服务时使用 host 网络 (上游固定 127.0.0.1:<port>) ──
+    # 使用 host 网络时删除上面的 ports 段, 改为:
+    # network_mode: host
