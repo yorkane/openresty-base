@@ -6,6 +6,71 @@
 - [nginx-dav-ext-module](https://github.com/arut/nginx-dav-ext-module) — WebDAV PROPFIND / OPTIONS / LOCK / UNLOCK 支持
 - [ngx-fancyindex](https://github.com/aperezdc/ngx-fancyindex) — 美化目录索引
 - [lua-resty-jwt](https://github.com/api7/lua-resty-jwt) — JWT 签发/验证（APISIX 同款 api7 fork，含 `resty.noco_auth` SSO 对接封装）
+- **Authz Gateway** — 动态端口代理 + 本地认证授权（SQLite + mini-casbin + 管理界面）
+
+## Authz Gateway（动态端口代理 + 认证授权）
+
+镜像默认以网关模式启动，两个入口：
+
+| 入口 | 上游 | 说明 |
+|------|------|------|
+| `6080` (http) | `http://127.0.0.1:<port>` | 代理本机 http 服务 |
+| `6443` (https) | `https://127.0.0.1:<port>` | 自签默认证书，代理本机 https 服务 |
+
+### 域名 → 端口解析规则
+
+1. **数字前缀子域名**（免配置）：`3000-任意域名` → 本机 `3000` 端口，
+   支持多级子域名（`3000-a.b.c.example.com`），端口范围默认 `2000-20000`
+2. **显式绑定**：管理界面配置固定域名映射（存 SQLite）
+3. 其余域名 → 404
+
+所有代理流量需登录 + Casbin 策略授权；后端收到 `X-Authz-User` 头。
+
+### 管理界面
+
+访问任意入口的 `/_authz/`：
+
+- 登录 / 登出（服务端会话，HttpOnly Cookie，CSRF 防护）
+- 域名绑定管理（增删/启停）
+- Casbin 策略编辑（p 授权行 / g 角色分配，deny 优先，fail-closed）
+- 用户管理（创建/禁用/删除/重置密码/角色分配）
+- 修改密码
+
+首次启动自动 seed：`admin / admin123`（务必尽快改密）与默认策略
+（`role:admin`、`role:user` 对 `/*` 全放行）。
+
+### 快速使用
+
+```bash
+docker run -d --name gw --network host \
+  -v /data/gw:/data \
+  -e AUTHZ_ADMIN_PASSWORD=your-secret \
+  ghcr.io/yorkane/openresty-base:latest
+# 浏览器打开 http://<host>:6080/_authz/ 登录
+# 代理本机 3000 端口: http://3000-myhost.example.com:6080/
+```
+
+### 环境变量
+
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `AUTHZ_DB_PATH` | `/data/authz/authz.db` | SQLite 路径（用户/会话/策略/绑定） |
+| `AUTHZ_ADMIN_PASSWORD` | `admin123` | 首次 seed 的 admin 密码 |
+| `AUTHZ_PORT_MIN` / `AUTHZ_PORT_MAX` | `2000` / `20000` | 数字前缀端口范围 |
+| `AUTHZ_HTTP_PORT` / `AUTHZ_HTTPS_PORT` | `6080` / `6443` | 入口端口 |
+| `AUTHZ_CERT_DIR` | `/data/certs` | 自签证书目录（10 年有效） |
+| `AUTHZ_SESSION_TTL` | `604800` | 会话有效期（秒） |
+
+### 数据持久化
+
+挂载 `/data` 即可：`/data/authz/authz.db`（全部状态）+ `/data/certs/`（证书）。
+
+### 功能测试
+
+```bash
+# 需要: 容器 authz-gw (--network host) 运行中 + 本机 mock 端口 3456(http)/4567(https)
+bash test/test_authz_gateway.sh   # 26 项断言
+```
 
 ## JWT / SSO 集成
 
@@ -135,14 +200,26 @@ GHCR 推送使用内置 `GITHUB_TOKEN`，无需额外配置。
 .
 ├── Dockerfile                  # 单阶段 Alpine 构建
 ├── README.md
+├── docker-entrypoint.sh        # 证书生成 + conf 渲染 + 启动
 ├── docs/
 │   └── sso-jwt-auth.md         # NocoBase SSO (JWT) 集成指南
 ├── lualib/
 │   └── resty/
 │       ├── hmac.lua            # resty.hmac 适配器（基于捆绑 resty.openssl.hmac）
-│       └── noco_auth.lua       # resty.noco_auth SSO Cookie 认证库
+│       ├── noco_auth.lua       # resty.noco_auth SSO Cookie 认证库
+│       └── authz/              # Authz Gateway (动态端口代理+认证)
+│           ├── init.lua        # 入口: 配置/端口解析/认证授权
+│           ├── app.lua         # 管理界面 (登录/绑定/策略/用户)
+│           ├── db.lua          # SQLite FFI 封装 + schema
+│           ├── casbin.lua      # mini-casbin (p/g, deny优先)
+│           ├── session.lua     # 服务端会话
+│           └── util.lua        # 密码哈希/随机token/HTML转义
+├── conf/
+│   ├── nginx.conf.template     # 网关 nginx 配置模板
+│   └── openssl.cnf             # 最小 openssl 配置(自签证书用)
 └── test/
-    ├── run_tests.sh            # 功能测试脚本
+    ├── run_tests.sh            # 基础功能测试脚本
+    ├── test_authz_gateway.sh   # Authz Gateway 测试矩阵 (26项)
     ├── conf/
     │   └── nginx.conf          # 测试用 nginx 配置
     ├── html/                   # FancyIndex 测试文件

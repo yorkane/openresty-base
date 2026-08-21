@@ -94,7 +94,8 @@ ARG RESTY_LUAJIT_OPTIONS="--with-luajit-xcflags='-DLUAJIT_NUMMODE=2 -DLUAJIT_ENA
 ARG RESTY_PCRE_OPTIONS="--with-pcre-jit"
 
 ARG RESTY_ADD_PACKAGE_BUILDDEPS=""
-ARG RESTY_ADD_PACKAGE_RUNDEPS=""
+# sqlite-libs: resty.authz 本地认证/绑定存储 (SQLite FFI)
+ARG RESTY_ADD_PACKAGE_RUNDEPS="sqlite-libs"
 ARG RESTY_EVAL_PRE_CONFIGURE=""
 ARG RESTY_EVAL_POST_DOWNLOAD_PRE_CONFIGURE=""
 ARG RESTY_EVAL_PRE_MAKE=""
@@ -342,8 +343,19 @@ ENV LUA_CPATH="/usr/local/openresty/site/lualib/?.so;/usr/local/openresty/lualib
 COPY lualib/resty/hmac.lua /usr/local/openresty/lualib/resty/hmac.lua
 COPY lualib/resty/noco_auth.lua /usr/local/openresty/lualib/resty/noco_auth.lua
 
-EXPOSE 80 443
+# ── Authz Gateway (动态端口代理 + 本地认证) ────────────────────────
+# resty.authz: SQLite 用户/会话/策略/域名绑定 + mini-casbin + 管理界面
+COPY lualib/resty/authz/ /usr/local/openresty/lualib/resty/authz/
+# 网关 nginx 配置模板 (entrypoint envsubst 渲染为 nginx.conf)
+COPY conf/nginx.conf.template /usr/local/openresty/nginx/conf/nginx.conf.template
+COPY conf/openssl.cnf /usr/local/openresty/nginx/conf/openssl.cnf
+COPY docker-entrypoint.sh /docker-entrypoint.sh
+RUN chmod +x /docker-entrypoint.sh
+
+EXPOSE 80 443 6080 6443
 
 STOPSIGNAL SIGQUIT
+
+ENTRYPOINT ["/docker-entrypoint.sh"]
 
 CMD ["/usr/local/openresty/bin/openresty", "-g", "daemon off;"]
