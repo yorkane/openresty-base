@@ -2,7 +2,7 @@
 # 由 docker-entrypoint.sh 用 envsubst 生成 nginx.conf
 # 变量: HTTP_PORT HTTPS_PORT CERT_FILE CERT_KEY
 
-worker_processes auto;
+worker_processes ${WORKER_PROCESSES};
 # 容器内以 root 运行 worker, 保证挂载卷中的 SQLite 可写
 user root;
 error_log /usr/local/openresty/nginx/logs/error.log warn;

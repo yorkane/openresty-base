@@ -72,6 +72,10 @@ register("GET", "/authz/v1/authorization", guard.wrap(function(_, _, _, current)
     return { data = service.authorization(current) }
 end, { admin = true }))
 
+register("GET", "/authz/v1/applications", guard.wrap(function()
+    return { data = service.applications() }
+end))
+
 register("POST", "/authz/v1/applications", guard.wrap(with_body(function(_, data)
     return service.create_application(data)
 end), { admin = true, csrf = true }))

@@ -211,6 +211,11 @@ function _M.authorization(s)
     }
 end
 
+function _M.applications()
+    return db.query([[SELECT id, domain, port, note FROM bindings
+        WHERE enabled = 1 ORDER BY domain]]) or {}
+end
+
 function _M.create_user(data)
     local username = tostring(data.username or ""):lower():gsub("%s+", "")
     local password = tostring(data.password or "")

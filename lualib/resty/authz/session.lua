@@ -9,12 +9,19 @@ local _M = {}
 _M.cookie_name = "authz_session"
 _M.ttl = 7 * 86400 -- 7 天
 _M.secure = false
+_M.cookie_domain = ""
 
 local function secure_flag()
     local forwarded = tostring(ngx.var.http_x_forwarded_proto or ""):lower()
     local first_forwarded = forwarded:match("^%s*([^,;]+)")
     local forwarded_https = first_forwarded and first_forwarded:match("^https%s*$") ~= nil
     return (_M.secure or ngx.var.https == "on" or forwarded_https) and "; Secure" or ""
+end
+
+local function domain_flag()
+    local domain = tostring(_M.cookie_domain or "")
+    if domain == "" or not domain:match("^%.?[A-Za-z0-9][A-Za-z0-9.-]*$") then return "" end
+    return "; Domain=" .. domain
 end
 
 -- 创建本机会话，username + source 共同标识身份
@@ -77,12 +84,12 @@ end
 -- 设置/清除 Set-Cookie 头
 function _M.set_cookie(token)
     ngx.header["Set-Cookie"] = _M.cookie_name .. "=" .. token ..
-        "; Path=/; HttpOnly; SameSite=Lax; Max-Age=" .. tostring(_M.ttl) .. secure_flag()
+        "; Path=/; HttpOnly; SameSite=Lax; Max-Age=" .. tostring(_M.ttl) .. domain_flag() .. secure_flag()
 end
 
 function _M.clear_cookie()
     ngx.header["Set-Cookie"] = _M.cookie_name .. "=" ..
-        "; Path=/; HttpOnly; SameSite=Lax; Max-Age=0" .. secure_flag()
+        "; Path=/; HttpOnly; SameSite=Lax; Max-Age=0" .. domain_flag() .. secure_flag()
 end
 
 return _M

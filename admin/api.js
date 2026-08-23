@@ -69,6 +69,7 @@ function savePolicy (values) {
 
 window.adminApi = {
   session: () => request('/session'),
+  applications: () => request('/applications'),
   users: () => request('/users'),
   authorization: () => request('/authorization'),
   saveUser,

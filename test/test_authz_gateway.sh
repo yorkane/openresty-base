@@ -349,6 +349,8 @@ request GET "$ADMIN_HOST" /_radmin_/app.js "$ADMIN_COOKIE"
 assert_contains "admin redirect is limited to API 401" "$BODY" "error?.status === 401"
 assert_contains "authorization menu is admin gated" "$BODY" "if (isAdmin.value)"
 assert_contains "menu reads admin status from session" "$BODY" "isAdmin.value = Boolean(session.admin)"
+assert_contains "menu loads local applications" "$BODY" "window.adminApi.applications"
+assert_contains "menu refreshes local applications" "$BODY" "setInterval(loadApplications, 30000)"
 request GET "$ADMIN_HOST" /_radmin_/apps/users.html "$ADMIN_COOKIE"
 assert_contains "user roles use controlled multi-select" "$BODY" 'multiple use-chips emit-value map-options'
 assert_contains "user role fallback catalog" "$BODY" "['admin', 'staff', 'user', 'viewer']"
@@ -378,6 +380,9 @@ assert_json "session exposes creation time" '.data.created_at > 0 | tostring' "t
 assert_json "session exposes last login time" '.data.last_login_at > 0 | tostring' "true"
 assert_json "session exposes updated time" '.data.updated_at > 0 | tostring' "true"
 CSRF=$(jq -er '.data.csrf' "$TMP_DIR/body")
+request GET "$ADMIN_HOST" /_api_/authz/v1/applications "$ADMIN_COOKIE"
+assert_eq "applications API" "$STATUS" "200"
+assert_json "applications API returns a list" '.data | type' "array"
 
 request GET "$ADMIN_HOST" '/_authz/login?next=/_radmin_/'
 assert_eq "login page with OAuth provider" "$STATUS" "200"

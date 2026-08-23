@@ -16,6 +16,7 @@ const app = createApp({
     const username = ref('正在验证')
     const source = ref('')
     const csrf = ref('')
+    const applications = ref([])
     const locale = ref(window.adminI18n.getLocale())
     const i18n = computed(() => window.adminI18n.messages[locale.value].menu)
     const displayName = computed(() => source.value && source.value !== 'local'
@@ -24,6 +25,7 @@ const app = createApp({
     const toggleIcon = computed(() => drawerMini.value ? 'mdi-chevron-right' : 'mdi-chevron-left')
     const toggleLabel = computed(() => drawerMini.value ? i18n.value.expand : i18n.value.collapse)
     let unsubscribeLocale
+    let applicationsTimer
 
     const menuItems = computed(() => {
       const items = [
@@ -32,11 +34,26 @@ const app = createApp({
       if (isAdmin.value) {
         items.push({ app: 'apps/authorization.html', title: i18n.value.authorizationTitle, label: i18n.value.authorization, icon: 'mdi-shield-key-outline' })
       }
+      applications.value.forEach(application => {
+        const appUrl = applicationUrl(application.port)
+        items.push({
+          app: appUrl,
+          title: application.note || application.domain,
+          label: application.note || application.domain,
+          icon: 'mdi-application-outline'
+        })
+      })
       return items
     })
 
+    function applicationUrl (port) {
+      const hostname = window.location.hostname
+      const gatewayPort = window.location.port ? `:${window.location.port}` : ''
+      return `${window.location.protocol}//${port}-${hostname}${gatewayPort}/`
+    }
+
     function navigate (item) {
-      if (!allowedApps.has(item.app)) return
+      if (!allowedApps.has(item.app) && !item.app.startsWith(`${window.location.protocol}//`)) return
       activeApp.value = item.app
       activeTitle.value = item.title
     }
@@ -53,6 +70,15 @@ const app = createApp({
       window.adminI18n.setLocale(locale.value === 'zh-CN' ? 'en-US' : 'zh-CN')
     }
 
+    async function loadApplications () {
+      try {
+        applications.value = await window.adminApi.applications()
+      } catch (error) {
+        if (error?.status === 401) return window.location.replace('/_authz/login?next=%2F_radmin_%2F')
+        console.error('Unable to load local applications:', error)
+      }
+    }
+
     async function loadSession () {
       try {
         const session = await window.adminApi.session()
@@ -61,6 +87,7 @@ const app = createApp({
         username.value = session.username || 'Signed in'
         source.value = session.source || 'local'
         csrf.value = session.csrf || ''
+        await loadApplications()
       } catch (error) {
         if (error?.status === 401) {
           window.location.replace('/_authz/login?next=%2F_radmin_%2F')
@@ -85,11 +112,14 @@ const app = createApp({
         locale.value = nextLocale
         Quasar.Lang.set(nextLocale === 'zh-CN' ? Quasar.Lang.zhCN : Quasar.Lang.enUS)
       })
-      loadSession()
+      loadSession().then(() => {
+        applicationsTimer = window.setInterval(loadApplications, 30000)
+      })
     })
 
     onBeforeUnmount(() => {
       window.removeEventListener('resize', syncDrawerState)
+      window.clearInterval(applicationsTimer)
       unsubscribeLocale?.()
     })
 
@@ -104,6 +134,7 @@ const app = createApp({
       isAdmin,
       locale,
       logout,
+      applications,
       menuItems,
       navigate,
       toggleDrawer,

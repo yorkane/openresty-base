@@ -46,7 +46,7 @@ body {
   height: 100%;
   min-height: 100% !important;
   box-sizing: border-box;
-  padding: 8px 12px 12px 8px;
+  padding: 0;
   overflow: hidden;
   background: var(--page-bg);
 }
@@ -63,6 +63,6 @@ body {
 
 @media (max-width: 760px) {
   .content-page {
-    padding: 6px;
+    padding: 0;
   }
 }

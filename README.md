@@ -25,7 +25,9 @@
 2. **显式绑定**：管理界面配置固定域名映射（存 SQLite）
 3. 其余域名 → 404
 
-所有代理流量需登录 + Casbin 策略授权；后端收到 `X-Authz-User` 头。
+所有代理流量需登录 + Casbin 策略授权；后端收到 `X-Authz-User` 头。管理菜单会读取已启用的本机端口绑定，
+按 `<port>-当前域名` 生成动态入口；入口变化会定时刷新，右侧 iframe 满屏加载对应服务。该机制读取已配置
+的绑定，不主动扫描宿主机所有端口。
 
 ### 管理界面
 
@@ -86,10 +88,12 @@ docker run -d --name gw --network host \
 | `AUTHZ_ADMIN_PASSWORD` | `admin123` | 首次 seed 的 admin 密码 |
 | `AUTHZ_PORT_MIN` / `AUTHZ_PORT_MAX` | `2000` / `20000` | 数字前缀端口范围 |
 | `AUTHZ_HTTP_PORT` / `AUTHZ_HTTPS_PORT` | `6080` / `6443` | 入口端口 |
+| `NGINX_WORKER_PROCESSES` | `4` | Nginx worker 数量，可按 CPU 核数和并发量调整 |
 | `AUTHZ_HOST_URL` | 空 | 浏览器访问网关的 HTTPS Origin，用于生成 OAuth 回调 |
 | `AUTHZ_CERT_DIR` | `/data/certs` | 自签证书目录（10 年有效） |
 | `AUTHZ_SESSION_TTL` | `604800` | 会话有效期（秒） |
 | `AUTHZ_COOKIE_SECURE` | `false` | 生产入口始终为 HTTPS 时强制 Cookie `Secure` |
+| `AUTHZ_COOKIE_DOMAIN` | 空 | 动态端口 iframe 跨子域共享会话时设置，例如 `.example.com` |
 | `AUTHZ_LOGIN_ATTEMPTS` / `AUTHZ_LOGIN_WINDOW` | `10` / `60` | 单 IP 登录尝试限流 |
 | `AUTHZ_NOCO_ENABLED` | `false` | 在密码登录表单启用 NocoBase 身份来源 |
 | `AUTHZ_NOCO_URL` | 空 | NocoBase 站点根地址（启用远程认证时必须为 HTTPS） |
