@@ -26,6 +26,11 @@ local function with_body(callback)
     end
 end
 
+local function array_data(rows)
+    if rows and #rows > 0 then return rows end
+    return cjson.empty_array
+end
+
 register("GET", "/authz/v1/session", guard.wrap(function(_, _, _, current)
     return { data = service.session_payload(current) }
 end))
@@ -73,7 +78,7 @@ register("GET", "/authz/v1/authorization", guard.wrap(function(_, _, _, current)
 end, { admin = true }))
 
 register("GET", "/authz/v1/applications", guard.wrap(function()
-    return { data = service.applications() }
+    return { data = array_data(service.applications()) }
 end))
 
 register("POST", "/authz/v1/applications", guard.wrap(with_body(function(_, data)
