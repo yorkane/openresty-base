@@ -4,17 +4,27 @@
 #   - http  入口 AUTHZ_HTTP_PORT(默认6080)  → 本机 http 服务
 #   - https 入口 AUTHZ_HTTPS_PORT(默认6443) → 本机 https 服务 (自签证书)
 #   - 数字前缀子域名免配置: 3000-任意域名 → 本机3000端口 (范围 AUTHZ_PORT_MIN~MAX)
-#   - 管理界面: http://<host>:6080/_authz/  (首次启动 admin/admin123, 登录后改密)
+#   - 管理界面: http://<host>:6080/_radmin_/  (首次启动 admin/admin123, 登录后改密)
 #
 # 使用:
 #   cp .env.example .env && vim .env      # 至少修改 AUTHZ_ADMIN_PASSWORD
-#   docker compose up -d
+#   docker compose up -d --build
 #   docker compose logs -f
 #
 # 注意: --network host 模式见注释掉的 override 说明 (代理本机服务推荐 host 网络)
 
 services:
   gateway:
+    build:
+      context: .
+      args:
+        RESTY_J: ${RESTY_J:-8}
+        HTTP_PROXY: ""
+        HTTPS_PROXY: ""
+        ALL_PROXY: ""
+        http_proxy: ""
+        https_proxy: ""
+        all_proxy: ""
     image: ghcr.io/yorkane/openresty-base:latest
     container_name: openresty-gateway
     restart: unless-stopped
@@ -30,8 +40,61 @@ services:
       AUTHZ_DB_PATH: ${AUTHZ_DB_PATH:-/data/authz/authz.db}
       AUTHZ_CERT_DIR: ${AUTHZ_CERT_DIR:-/data/certs}
       AUTHZ_SESSION_TTL: ${AUTHZ_SESSION_TTL:-604800}
+      AUTHZ_COOKIE_SECURE: ${AUTHZ_COOKIE_SECURE:-false}
+      AUTHZ_LOGIN_ATTEMPTS: ${AUTHZ_LOGIN_ATTEMPTS:-10}
+      AUTHZ_LOGIN_WINDOW: ${AUTHZ_LOGIN_WINDOW:-60}
+      AUTHZ_NOCO_ENABLED: ${AUTHZ_NOCO_ENABLED:-false}
+      AUTHZ_NOCO_URL: ${AUTHZ_NOCO_URL:-}
+      AUTHZ_NOCO_ROLE_MAP: ${AUTHZ_NOCO_ROLE_MAP:-root=admin,admin=admin,member=user}
+      AUTHZ_NOCO_CONNECT_TIMEOUT_MS: ${AUTHZ_NOCO_CONNECT_TIMEOUT_MS:-3000}
+      AUTHZ_NOCO_SEND_TIMEOUT_MS: ${AUTHZ_NOCO_SEND_TIMEOUT_MS:-5000}
+      AUTHZ_NOCO_READ_TIMEOUT_MS: ${AUTHZ_NOCO_READ_TIMEOUT_MS:-5000}
+      AUTHZ_NOCO_OAUTH_ENABLED: ${AUTHZ_NOCO_OAUTH_ENABLED:-false}
+      AUTHZ_NOCO_OAUTH_TITLE: ${AUTHZ_NOCO_OAUTH_TITLE:-NocoBase}
+      AUTHZ_NOCO_OAUTH_CLIENT_ID: ${AUTHZ_NOCO_OAUTH_CLIENT_ID:-}
+      AUTHZ_NOCO_OAUTH_CLIENT_SECRET: ${AUTHZ_NOCO_OAUTH_CLIENT_SECRET:-}
+      AUTHZ_NOCO_OAUTH_REDIRECT_URI: ${AUTHZ_NOCO_OAUTH_REDIRECT_URI:-}
+      AUTHZ_NOCO_OAUTH_DEFAULT_ROLES: ${AUTHZ_NOCO_OAUTH_DEFAULT_ROLES:-viewer}
+      AUTHZ_GOOGLE_ENABLED: ${AUTHZ_GOOGLE_ENABLED:-false}
+      AUTHZ_GOOGLE_CLIENT_ID: ${AUTHZ_GOOGLE_CLIENT_ID:-}
+      AUTHZ_GOOGLE_CLIENT_SECRET: ${AUTHZ_GOOGLE_CLIENT_SECRET:-}
+      AUTHZ_GOOGLE_REDIRECT_URI: ${AUTHZ_GOOGLE_REDIRECT_URI:-}
+      AUTHZ_GOOGLE_DEFAULT_ROLES: ${AUTHZ_GOOGLE_DEFAULT_ROLES:-viewer}
+      AUTHZ_DINGTALK_ENABLED: ${AUTHZ_DINGTALK_ENABLED:-false}
+      AUTHZ_DINGTALK_CLIENT_ID: ${AUTHZ_DINGTALK_CLIENT_ID:-}
+      AUTHZ_DINGTALK_CLIENT_SECRET: ${AUTHZ_DINGTALK_CLIENT_SECRET:-}
+      AUTHZ_DINGTALK_REDIRECT_URI: ${AUTHZ_DINGTALK_REDIRECT_URI:-}
+      AUTHZ_DINGTALK_DEFAULT_ROLES: ${AUTHZ_DINGTALK_DEFAULT_ROLES:-viewer}
+      AUTHZ_WECHAT_ENABLED: ${AUTHZ_WECHAT_ENABLED:-false}
+      AUTHZ_WECHAT_APP_ID: ${AUTHZ_WECHAT_APP_ID:-}
+      AUTHZ_WECHAT_APP_SECRET: ${AUTHZ_WECHAT_APP_SECRET:-}
+      AUTHZ_WECHAT_REDIRECT_URI: ${AUTHZ_WECHAT_REDIRECT_URI:-}
+      AUTHZ_WECHAT_DEFAULT_ROLES: ${AUTHZ_WECHAT_DEFAULT_ROLES:-viewer}
+      AUTHZ_OAUTH_ENABLED: ${AUTHZ_OAUTH_ENABLED:-false}
+      AUTHZ_OAUTH_PROVIDER: ${AUTHZ_OAUTH_PROVIDER:-oauth}
+      AUTHZ_OAUTH_TITLE: ${AUTHZ_OAUTH_TITLE:-OAuth}
+      AUTHZ_OAUTH_CLIENT_ID: ${AUTHZ_OAUTH_CLIENT_ID:-}
+      AUTHZ_OAUTH_CLIENT_SECRET: ${AUTHZ_OAUTH_CLIENT_SECRET:-}
+      AUTHZ_OAUTH_AUTHORIZE_URL: ${AUTHZ_OAUTH_AUTHORIZE_URL:-}
+      AUTHZ_OAUTH_TOKEN_URL: ${AUTHZ_OAUTH_TOKEN_URL:-}
+      AUTHZ_OAUTH_USERINFO_URL: ${AUTHZ_OAUTH_USERINFO_URL:-}
+      AUTHZ_OAUTH_REDIRECT_URI: ${AUTHZ_OAUTH_REDIRECT_URI:-}
+      AUTHZ_OAUTH_SCOPE: ${AUTHZ_OAUTH_SCOPE:-openid email profile}
+      AUTHZ_OAUTH_SUBJECT_CLAIM: ${AUTHZ_OAUTH_SUBJECT_CLAIM:-sub}
+      AUTHZ_OAUTH_USERNAME_CLAIM: ${AUTHZ_OAUTH_USERNAME_CLAIM:-email}
+      AUTHZ_OAUTH_ROLE_CLAIM: ${AUTHZ_OAUTH_ROLE_CLAIM:-roles}
+      AUTHZ_OAUTH_ROLE_MAP: ${AUTHZ_OAUTH_ROLE_MAP:-}
+      AUTHZ_OAUTH_DEFAULT_ROLES: ${AUTHZ_OAUTH_DEFAULT_ROLES:-viewer}
+      AUTHZ_OAUTH_REQUIRE_VERIFIED_EMAIL: ${AUTHZ_OAUTH_REQUIRE_VERIFIED_EMAIL:-false}
+      AUTHZ_OAUTH_STATE_TTL: ${AUTHZ_OAUTH_STATE_TTL:-600}
+      AUTHZ_OAUTH_CONNECT_TIMEOUT_MS: ${AUTHZ_OAUTH_CONNECT_TIMEOUT_MS:-10000}
+      AUTHZ_OAUTH_SEND_TIMEOUT_MS: ${AUTHZ_OAUTH_SEND_TIMEOUT_MS:-10000}
+      AUTHZ_OAUTH_READ_TIMEOUT_MS: ${AUTHZ_OAUTH_READ_TIMEOUT_MS:-15000}
+      AUTHZ_DNS_RESOLVER: ${AUTHZ_DNS_RESOLVER:-}
     volumes:
       - ${DATA_DIR:-./data}:/data
+      - ${ADMIN_UI_DIR:-./admin}:/usr/local/openresty/nginx/html/admin:ro
+      - ${LUALIB_DIR:-./lualib}:/usr/local/openresty/site/lualib:ro
     # ── 推荐: 代理本机 docker 服务时使用 host 网络 (上游固定 127.0.0.1:<port>) ──
     # 使用 host 网络时删除上面的 ports 段, 改为:
     # network_mode: host

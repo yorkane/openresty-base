@@ -5,7 +5,8 @@
 - [lua-nginx-module](https://github.com/openresty/lua-nginx-module) — master 分支最新版本（替换 OpenResty 内置捆绑版）
 - [nginx-dav-ext-module](https://github.com/arut/nginx-dav-ext-module) — WebDAV PROPFIND / OPTIONS / LOCK / UNLOCK 支持
 - [ngx-fancyindex](https://github.com/aperezdc/ngx-fancyindex) — 美化目录索引
-- [lua-resty-jwt](https://github.com/api7/lua-resty-jwt) — JWT 签发/验证（APISIX 同款 api7 fork，含 `resty.noco_auth` SSO 对接封装）
+- [lua-resty-jwt](https://github.com/api7/lua-resty-jwt) — 通用 JWT 签发与验证
+- [lua-resty-http](https://github.com/ledgetech/lua-resty-http) — NocoBase HTTPS 身份查询客户端
 - **Authz Gateway** — 动态端口代理 + 本地认证授权（SQLite + mini-casbin + 管理界面）
 
 ## Authz Gateway（动态端口代理 + 认证授权）
@@ -28,35 +29,54 @@
 
 ### 管理界面
 
-访问任意入口的 `/_authz/`：
+管理界面统一从 `/_radmin_/` 进入：
 
 - 登录 / 登出（服务端会话，HttpOnly Cookie，CSRF 防护）
-- 域名绑定管理（增删/启停）
-- Casbin 策略编辑（p 授权行 / g 角色分配，deny 优先，fail-closed）
-- 用户管理（创建/禁用/删除/重置密码/角色分配）
-- 修改密码
+- 深色 Pollux 风格侧栏，无顶部菜单栏
+- 左侧菜单通过 SSI 直接组装到管理壳，支持收起/展开、登录状态和 Logout
+- 右侧通过 iframe 分别加载“用户 / 角色管理”和“授权管理”
+- 管理壳使用 Vue 3 + Quasar UMD，应用页面的 Vue/Quasar 逻辑直接内联在各自 HTML 中
+- 框架静态资源合并为 `vendor/quasar-umd.js` 和 `vendor/quasar-umd.css`；应用层保留独立的 `api.js`
+  与入口 `app.js`
+- 用户 / 角色管理统一展示本地、NocoBase、Google/OAuth 身份；支持远程角色本地覆盖与恢复
+- 授权管理支持域名绑定增删/启停及 Casbin 策略编辑
+- `/_radmin_/` 由服务端会话保护，未登录自动跳转到 `/_authz/login?next=...`
+- 管理端统一调用 `/_api_/authz/v1/*` JSON API；旧 `/_authz/api/*` 与 `*/save` 接口已退役
 
-首次启动自动 seed：`admin / admin123`（务必尽快改密）与默认策略
-（`role:admin`、`role:user` 对 `/*` 全放行）。
+首次启动自动 seed：`admin / admin123`（务必尽快改密）。默认仅
+`role:admin` 对 `/*` 全放行，其他角色默认拒绝。
 
 ### 快速使用
 
 ```bash
-# 方式一: docker compose (推荐)
+# 方式一: 使用 GitHub Actions 已发布镜像（生产/部署推荐）
 cp .env.example .env && vim .env      # 修改 AUTHZ_ADMIN_PASSWORD
-docker compose up -d
+docker compose pull
+docker compose up -d --force-recreate --no-build
 
-# 方式二: docker run
+# 方式二: docker compose 本地构建（仅调试 Dockerfile 或未发布改动时）
+docker compose up -d --build
+
+# 方式三: docker run
 docker run -d --name gw --network host \
   -v /data/gw:/data \
+  -v "$PWD/admin:/usr/local/openresty/nginx/html/admin:ro" \
+  -v "$PWD/lualib:/usr/local/openresty/site/lualib:ro" \
   -e AUTHZ_ADMIN_PASSWORD=your-secret \
   ghcr.io/yorkane/openresty-base:latest
 
-# 浏览器打开 http://<host>:6080/_authz/ 登录
+# 浏览器打开 http://<host>:6080/_radmin_/ 登录
 # 代理本机 3000 端口: http://3000-myhost.example.com:6080/
 ```
 
-> 维护者请阅读 [design.md](design.md) 了解架构、数据模型与实现约束。
+镜像将项目 `lualib/` 整体复制到 `/usr/local/openresty/site/lualib/`。Compose 默认把
+`${LUALIB_DIR:-./lualib}` 整目录只读挂载到同一路径，并同时挂载
+`${ADMIN_UI_DIR:-./admin}`；修改 Lua 后端或管理前端时无需重复构建镜像。
+由于宿主机 `admin/` 挂载会覆盖镜像内的预生成 `.br` 文件，开发挂载场景依靠动态 Brotli；生产静态资源
+应优先使用 CI 构建的镜像，以便 `brotli_static` 直接命中预压缩文件。
+
+> 维护者先阅读 [维护手册](docs/maintenance-handbook.md) 和 [AGENTS.MD](AGENTS.MD)；
+> 项目级 Skill 位于 `.codex/skills/openresty-authz-maintainer/SKILL.md`。
 
 ### 环境变量
 
@@ -66,39 +86,114 @@ docker run -d --name gw --network host \
 | `AUTHZ_ADMIN_PASSWORD` | `admin123` | 首次 seed 的 admin 密码 |
 | `AUTHZ_PORT_MIN` / `AUTHZ_PORT_MAX` | `2000` / `20000` | 数字前缀端口范围 |
 | `AUTHZ_HTTP_PORT` / `AUTHZ_HTTPS_PORT` | `6080` / `6443` | 入口端口 |
+| `AUTHZ_HOST_URL` | 空 | 浏览器访问网关的 HTTPS Origin，用于生成 OAuth 回调 |
 | `AUTHZ_CERT_DIR` | `/data/certs` | 自签证书目录（10 年有效） |
 | `AUTHZ_SESSION_TTL` | `604800` | 会话有效期（秒） |
+| `AUTHZ_COOKIE_SECURE` | `false` | 生产入口始终为 HTTPS 时强制 Cookie `Secure` |
+| `AUTHZ_LOGIN_ATTEMPTS` / `AUTHZ_LOGIN_WINDOW` | `10` / `60` | 单 IP 登录尝试限流 |
+| `AUTHZ_NOCO_ENABLED` | `false` | 在密码登录表单启用 NocoBase 身份来源 |
+| `AUTHZ_NOCO_URL` | 空 | NocoBase 站点根地址（启用远程认证时必须为 HTTPS） |
+| `AUTHZ_NOCO_API_KEY` | 空 | 仅供一次性 Client 注册脚本使用，不注入运行容器 |
+| `AUTHZ_NOCO_ROLE_MAP` | `root=admin,...` | NocoBase 角色到本地四角色的映射 |
+| `AUTHZ_NOCO_*_TIMEOUT_MS` | `3000/5000/5000` | NocoBase 建连/发送/读取超时 |
+| `AUTHZ_NOCO_OAUTH_ENABLED` | `false` | 使用 NocoBase IdP: OAuth 提供关联登录 |
+| `AUTHZ_NOCO_OAUTH_CLIENT_ID/SECRET/REDIRECT_URI` | 空 | NocoBase OAuth Web Client 配置 |
+| `AUTHZ_GOOGLE_ENABLED` | `false` | 启用 Google OIDC 登录按钮 |
+| `AUTHZ_GOOGLE_CLIENT_ID/SECRET/REDIRECT_URI` | 空 | Google Web OAuth client 配置 |
+| `AUTHZ_DINGTALK_*` | 关闭 | 钉钉登录 Client ID、Secret、回调地址和默认角色 |
+| `AUTHZ_WECHAT_*` | 关闭 | 微信开放平台网站应用 App ID、Secret、回调地址和默认角色 |
+| `AUTHZ_OAUTH_ENABLED` | `false` | 启用通用 OAuth2/OIDC 登录 |
+| `AUTHZ_OAUTH_*_URL` | 空 | authorize、token、userinfo 和 callback URL |
+| `AUTHZ_OAUTH_*_CLAIM/ROLE_MAP` | 见 `.env.example` | 用户名、subject、角色 claim 与本地角色映射 |
+| `AUTHZ_OAUTH_*_TIMEOUT_MS` | `10000/10000/15000` | OAuth 建连、发送、读取超时；传输失败自动重试一次 |
+| `AUTHZ_DNS_RESOLVER` | 容器 DNS | Lua HTTPS 请求使用的 DNS 服务器 |
+| `ADMIN_UI_DIR` | `./admin` | 宿主机静态管理前端目录（Compose 只读挂载） |
+| `LUALIB_DIR` | `./lualib` | 宿主机项目 Lua 库目录（Compose 整目录只读挂载） |
+
+### 核心工程约定
+
+#### 后端与 API
+
+- 运行时是 OpenResty + LuaJIT；项目默认不引入 Node、Vite 或前端 Router。
+- 所有管理 API 位于 `/_api_/authz/v1/`，响应使用 `application/json`；旧 `/_authz/api/*` 和 `/save`
+  接口已退役，不得继续新增调用方。
+- `lualib/klib/router.lua` 是注册式 Router 的公共基础；路由注册失败必须返回并检查，默认错误响应不得回显
+  请求头或请求头值。
+- 数字前缀动态端口默认允许 `2000` 起步，角色固定为 `admin`、`staff`、`user`、`viewer`；HTTP 方法使用
+  完整方法目录，并支持多选策略。
+
+#### 身份与授权
+
+- 身份主键是“用户名 + 来源”，即 `user:<source>:<username>`；同名的 local、nocobase、google、dingtalk、
+  wechat 或通用 OAuth 身份可以并存，角色和策略不能按用户名跨来源混用。
+- 本地用户和本地角色优先于远程记录；远程身份只单向同步用户名、来源、角色快照和时间信息，不回写身份源。
+- 启用状态由本机管理员控制，只有管理员主动删除后远程身份才会被清除；远程用户不能修改本地密码。
+- 普通 `viewer` 用户只能查看自己的会话/身份信息，不能读取或修改 Casbin 授权策略。
+- 本系统不再同步 APISIX routes、用户、角色或策略；与外部系统保持松耦合、单向记录。
+
+#### 管理前端
+
+- 使用 Vue 3 + Quasar UMD 2.26.0、MDI v7 和本地 Roboto 字体；Quasar 中文简体与英文语言包必须同时保留。
+- `admin/index.html` 是 SSI 管理壳，菜单由 `/_radmin_/menu.html` 直接组装，不使用菜单 iframe；右侧应用仍使用
+  iframe 加载 `apps/users.html` 与 `apps/authorization.html`，并隐藏 iframe 边框。
+- 菜单的 CSS、模板和交互逻辑保持内联；右侧应用的业务 JavaScript 也直接内联在应用 HTML 中。
+- 所有页面支持全局中英文切换；切换状态必须同步影响右侧 iframe 应用。图标统一使用 MDI v7。
+- 页面设计保持轻量 Linear 风格：移动端可读字体、紧凑侧栏、40px 收起宽度、圆角卡片和大型统计卡片。
+
+#### 构建与运行
+
+- 发布和部署优先使用 GitHub Actions 推送到 GHCR 的镜像；本地构建仅用于调试、验证未发布改动或 CI 不可用。
+- Dockerfile 使用 Buildx 多阶段构建，默认 `RESTY_J=8`；源码下载和编译层必须保持可缓存，容器内不配置代理。
+- `ngx_brotli` 静态编译进 OpenResty；动态 Brotli/Gzip 默认等级均为 5，Admin 静态资源在镜像构建时使用 Brotli
+  等级 11 预压缩，并通过 `brotli_static on` 提供。
+- Compose 的 `/data`、`admin/`、`lualib/` 挂载路径必须与镜像内路径一致，避免镜像和开发挂载行为不一致。
 
 ### 数据持久化
 
-挂载 `/data` 即可：`/data/authz/authz.db`（全部状态）+ `/data/certs/`（证书）。
+挂载 `/data` 保存状态：`/data/authz/authz.db`（全部状态）+ `/data/certs/`（证书）。
+`admin/` 与 `lualib/` 的开发挂载路径分别和镜像内复制路径一致。
 
 ### 功能测试
 
 ```bash
-# 需要: 容器 authz-gw (--network host) 运行中 + 本机 mock 端口 3456(http)/4567(https)
-bash test/test_authz_gateway.sh   # 26 项断言
+bash test/test_klib_router_ctxvar.sh  # 真实 OpenResty Router 回归
+bash test/test_authz_gateway.sh      # 隔离 Authz/API/动态代理回归
+bash test/run_tests.sh <image>       # 镜像基础功能回归
 ```
 
-## JWT / SSO 集成
+验证发布镜像时显式指定镜像：
 
-镜像内置 `resty.jwt`、`resty.hmac`（OpenSSL 3.x 兼容适配）与 `resty.noco_auth`，
-可直接验证 [APISIX noco_sso_auth](../../docs/noco_sso_auth.md) 签发的
-`sso_ck` JWT Cookie，实现 OpenResty 代理与 APISIX SSO 无缝对接。
-
-```nginx
-location / {
-    access_by_lua_block {
-        local noco = require "resty.noco_auth"
-        local user, err = noco.verify_request("sso_key")
-        if not user then return ngx.exit(ngx.HTTP_UNAUTHORIZED) end
-        ngx.ctx.sso_user = user
-    }
-    proxy_pass http://backend;
-}
+```bash
+OPENRESTY_TEST_IMAGE=ghcr.io/yorkane/openresty-base:latest bash test/test_authz_gateway.sh
+OPENRESTY_TEST_IMAGE=ghcr.io/yorkane/openresty-base:latest bash test/test_klib_router_ctxvar.sh
+bash test/run_tests.sh ghcr.io/yorkane/openresty-base:latest
 ```
 
-完整指南见 [docs/sso-jwt-auth.md](docs/sso-jwt-auth.md)。
+回归重点包括：SSI 菜单组装、Brotli/Gzip 静态资源、JSON 错误响应、CSRF、OAuth/PKCE、多来源同名身份、
+远程角色覆盖、启用状态、动态端口策略及 Router 注册错误处理。
+
+## NocoBase 与 OAuth 身份记录
+
+Authz Gateway 可选用 NocoBase 校验远程账号，并在用户成功登录时单向记录用户名和映射角色。
+登录时显式选择本地或 NocoBase；身份以 `user:<source>:<username>` 标识，因此同名多来源用户可并存，
+角色和用户直授权互不影响。NocoBase JWT 和密码不落库，本机会签发自己的 SQLite 服务端会话。
+管理员可在“用户与角色”中覆盖本机有效角色，也可恢复最近一次登录记录的远端角色。所有本机状态
+只用于本网关认证授权，不回写身份源，也不向任何外部网关同步路由、用户、角色或策略。
+
+```dotenv
+AUTHZ_NOCO_ENABLED=true
+AUTHZ_NOCO_URL=https://noco.example.com
+AUTHZ_NOCO_ROLE_MAP=root=admin,admin=admin,member=user
+```
+
+也可启用 NocoBase、Google 或标准 OAuth2/OIDC Authorization Code + PKCE 登录。NocoBase OAuth
+与密码认证共用 `nocobase` 身份来源，但按标准 `/api/idpOAuth/me` 只读取身份，首次登录使用本机默认
+`viewer`；管理员可在本机覆盖角色，并与其他远程身份共用 Casbin 授权。
+
+NocoBase OAuth Client 以 [docs/thirdparty-oauth-login.md](docs/thirdparty-oauth-login.md) 为唯一配置依据；
+之前的 NocoBase OAuth 集成方案作废。填写 `AUTHZ_HOST_URL`、`AUTHZ_NOCO_URL` 和
+`AUTHZ_NOCO_API_KEY` 后运行 `python3 scripts/register_nocobase_oauth.py`，再使用 CI 镜像重建/部署容器。
+其他 OAuth 行为和维护规则见 [docs/maintenance-handbook.md](docs/maintenance-handbook.md)。
 
 ## 镜像地址
 
@@ -133,7 +228,7 @@ docker pull yorkane/openresty-base:latest
 | lua-nginx-module | GitHub `master` 分支最新 commit |
 | stream-lua-nginx-module | GitHub `master` 分支最新 commit |
 | lua-resty-core | GitHub `master` 分支最新 commit |
-| lua-resty-jwt | api7 fork v0.2.6（APISIX 同款） |
+| lua-resty-jwt | api7 fork v0.2.6 |
 | nginx-dav-ext-module | GitHub `master` 分支最新 commit |
 | ngx-fancyindex | 最新 Release tag |
 | LuaRocks | 3.13.0 |
@@ -142,20 +237,32 @@ docker pull yorkane/openresty-base:latest
 
 ## 镜像特性
 
-- **基础镜像**：`alpine:3.23`，最终镜像约 **~75 MB**
-- **单层构建**：所有编译步骤合并为一个 `RUN`，编译工具链在构建完成后完全清除
+- **基础镜像**：`alpine:3.23`，当前运行时镜像约 **60–65 MiB**（随依赖版本变化）
+- **多阶段构建**：源码/编译工具链只存在于 builder stage，最终镜像仅保留运行时文件
+- **可复用缓存**：源码下载独立成层，`RESTY_J` 默认并行度为 8；GitHub Actions 使用 Buildx GHA cache
 - **二进制精简**：`strip` nginx / luajit / openssl / pcre2 / *.so，去掉调试符号
 - **运行时依赖最小化**：仅保留必要的 so 和 Alpine 包
 - **动态模块**：geoip、image_filter、xslt 以动态 `.so` 形式保留
 - **OpenSSL 独立编译**：作为共享库安装到 `/usr/local/openresty/openssl3`，并应用 OpenResty 官方补丁（`sess_set_get_cb_yield`）
 - **PCRE2 独立编译**：作为共享库安装到 `/usr/local/openresty/pcre2`，启用 JIT
+- **Brotli**：静态编译 `ngx_brotli`，动态压缩等级 5；镜像构建时为 Admin 静态资源生成等级 11 的 `.br` 文件
 - **去掉 RDS / Mail POP3/IMAP/SMTP**：与官方 alpine 镜像保持一致
 
 ## 本地构建
 
+日常发布和部署优先使用 GitHub Actions 构建并推送的 GHCR 镜像；只有需要本地验证、Actions 不可用或正在调试 Dockerfile 时，才执行本地构建。
+
 ```bash
-docker build -t openresty-base:local .
+# Docker CLI 需要 buildx；默认 builder 会复用本机 BuildKit 缓存
+docker buildx build --load --build-arg RESTY_J=${RESTY_J:-8} \
+  --tag openresty-base:local .
+
+# Compose 同样使用 BuildKit/buildx
+docker compose build
 ```
+
+GitHub Actions 使用 `docker/setup-buildx-action` 和 `type=gha,mode=max` 缓存；本地不要使用
+`DOCKER_BUILDKIT=0`，否则会退回已弃用的 legacy builder。
 
 ## 本地测试
 
@@ -178,6 +285,7 @@ bash test/run_tests.sh ghcr.io/yorkane/openresty-base:1.31.1.1
 | 5 | FancyIndex | 目录浏览 HTML 响应 |
 | 6 | WebDAV | OPTIONS → Allow 头、PUT 201、PROPFIND 207 |
 | 7 | Error log | 确认无 `[error]` 行 |
+| 8 | JWT | `resty.jwt` 模块、HS256 签发验证和错误密钥拒绝 |
 
 ## 自动构建
 
@@ -206,22 +314,34 @@ GHCR 推送使用内置 `GITHUB_TOKEN`，无需额外配置。
 
 ```
 .
-├── Dockerfile                  # 单阶段 Alpine 构建
+├── Dockerfile                  # 多阶段 Alpine 构建
 ├── README.md
 ├── design.md                   # ★ 设计文档 (架构/数据模型/踩坑记录, 维护必读)
 ├── docker-compose.yml          # 部署编排
 ├── .env.example                # 环境变量模板
 ├── docker-entrypoint.sh        # 证书生成 + conf 渲染 + 启动
 ├── docs/
-│   └── sso-jwt-auth.md         # NocoBase SSO (JWT) 集成指南
+│   ├── thirdparty-oauth-login.md # NocoBase OAuth 唯一配置依据
+│   ├── maintenance-handbook.md  # 生产维护、测试与故障排查
+│   └── sso-jwt-auth.md           # 历史 JWT/SSO 参考
+├── admin/                       # Vue 3 + Quasar UMD 管理界面
+│   ├── index.html               # SSI 管理壳
+│   ├── menu.html                # SSI 菜单片段（内联 CSS/模板）
+│   ├── apps/                    # 用户/角色与授权管理页面
+│   ├── vendor/                  # 合并后的 Quasar/Vue/语言包/MDI 静态资源
+│   ├── api.js                   # 应用公共 API 客户端
+│   └── i18n.js                  # 全局中英文状态
+├── scripts/
+│   └── register_nocobase_oauth.py # NocoBase Client 注册脚本
 ├── lualib/
 │   └── resty/
 │       ├── hmac.lua            # resty.hmac 适配器（基于捆绑 resty.openssl.hmac）
-│       ├── noco_auth.lua       # resty.noco_auth SSO Cookie 认证库
 │       └── authz/              # Authz Gateway (动态端口代理+认证)
 │           ├── init.lua        # 入口: 配置/端口解析/认证授权
-│           ├── app.lua         # 管理界面 (登录/绑定/策略/用户)
+│           ├── app.lua         # 登录、管理入口跳转、旧接口退役响应
+│           ├── api/            # /_api_/authz/v1 JSON API
 │           ├── db.lua          # SQLite FFI 封装 + schema
+│           ├── nocobase.lua    # NocoBase 登录/角色查询与身份快照
 │           ├── casbin.lua      # mini-casbin (p/g, deny优先)
 │           ├── session.lua     # 服务端会话
 │           └── util.lua        # 密码哈希/随机token/HTML转义
@@ -230,10 +350,12 @@ GHCR 推送使用内置 `GITHUB_TOKEN`，无需额外配置。
 │   └── openssl.cnf             # 最小 openssl 配置(自签证书用)
 └── test/
     ├── run_tests.sh            # 基础功能测试脚本
-    ├── test_authz_gateway.sh   # Authz Gateway 测试矩阵 (26项)
+    ├── test_authz_gateway.sh   # Authz Gateway/API 隔离测试矩阵
+    ├── test_klib_router_ctxvar.sh # 真实 OpenResty Router 回归
     ├── conf/
     │   └── nginx.conf          # 测试用 nginx 配置
     ├── html/                   # FancyIndex 测试文件
+    ├── fixtures/               # 迁移与数据库测试夹具
     ├── dav/                    # WebDAV 上传目录（运行时生成）
     └── logs/                   # nginx 日志（运行时生成）
 ```

@@ -3,6 +3,7 @@
 --
 -- 表:
 --   users     用户 (roles 逗号分隔)
+--   remote_users 远程身份快照 (仅用户名和映射后的本地角色)
 --   sessions  服务端会话
 --   policies  casbin 策略行 p/g
 --   bindings  域名 -> 本机端口 绑定
@@ -20,6 +21,7 @@ int sqlite3_prepare_v2(sqlite3 *db, const char *zSql, int nByte,
                        sqlite3_stmt **ppStmt, const char **pzTail);
 int sqlite3_step(sqlite3_stmt *stmt);
 int sqlite3_finalize(sqlite3_stmt *stmt);
+int sqlite3_column_count(sqlite3_stmt *stmt);
 const unsigned char *sqlite3_column_text(sqlite3_stmt *stmt, int iCol);
 sqlite3_int64 sqlite3_column_int64(sqlite3_stmt *stmt, int iCol);
 int sqlite3_column_type(sqlite3_stmt *stmt, int iCol);
@@ -112,17 +114,18 @@ function _M.query(sql, ...)
     local rows = {}
     while lib.sqlite3_step(stmt) == SQLITE_ROW do
         local row = {}
-        for col = 0, 63 do
+        local column_count = lib.sqlite3_column_count(stmt)
+        for col = 0, column_count - 1 do
             local t = lib.sqlite3_column_type(stmt, col)
-            if t == SQLITE_NULL then break end -- 列越界返回 NULL 类型
             local name_ptr = lib.sqlite3_column_name(stmt, col)
-            if name_ptr == nil then break end
-            local name = ffi.string(name_ptr)
-            if t == SQLITE_INTEGER then
-                row[name] = tonumber(lib.sqlite3_column_int64(stmt, col))
-            else
-                local text_ptr = lib.sqlite3_column_text(stmt, col)
-                row[name] = text_ptr ~= nil and ffi.string(text_ptr) or ""
+            if t ~= SQLITE_NULL and name_ptr ~= nil then
+                local name = ffi.string(name_ptr)
+                if t == SQLITE_INTEGER then
+                    row[name] = tonumber(lib.sqlite3_column_int64(stmt, col))
+                else
+                    local text_ptr = lib.sqlite3_column_text(stmt, col)
+                    row[name] = text_ptr ~= nil and ffi.string(text_ptr) or ""
+                end
             end
         end
         rows[#rows + 1] = row
@@ -143,13 +146,31 @@ CREATE TABLE IF NOT EXISTS users(
   salt          TEXT NOT NULL,
   roles         TEXT NOT NULL DEFAULT 'user',
   enabled       INTEGER NOT NULL DEFAULT 1,
-  created_at    INTEGER NOT NULL
+  created_at    INTEGER NOT NULL,
+  last_login_at INTEGER,
+  updated_at    INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS sessions(
   token      TEXT PRIMARY KEY,
   username   TEXT NOT NULL,
+  source     TEXT NOT NULL DEFAULT 'local',
   csrf       TEXT NOT NULL,
   expires_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS remote_users(
+  provider   TEXT NOT NULL,
+  subject    TEXT NOT NULL,
+  username   TEXT NOT NULL,
+  roles      TEXT NOT NULL,
+  remote_roles TEXT NOT NULL DEFAULT '',
+  roles_overridden INTEGER NOT NULL DEFAULT 0,
+  enabled    INTEGER NOT NULL DEFAULT 1,
+  synced_at  INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  last_login_at INTEGER,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY(provider, subject),
+  UNIQUE(provider, username)
 );
 CREATE TABLE IF NOT EXISTS policies(
   id    INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -171,7 +192,7 @@ CREATE TABLE IF NOT EXISTS bindings(
 
 function _M.init(opts)
     opts = opts or {}
-    local path = opts.path or "/data/authz/authz.db"
+    local path = opts.path or opts.db_path or "/data/authz/authz.db"
     _M.open(path)
 
     for stmt in SCHEMA:gmatch("[^;]+") do
@@ -182,9 +203,97 @@ function _M.init(opts)
         end
     end
 
-    -- 默认策略: 管理员全权 / 普通用户全权 (可在管理页收紧)
+    local function ensure_column(table_name, column_name, definition)
+        local columns = _M.query("PRAGMA table_info(" .. table_name .. ")") or {}
+        for _, column in ipairs(columns) do
+            if column.name == column_name then return end
+        end
+        local ok, err = _M.exec("ALTER TABLE " .. table_name .. " ADD COLUMN " .. definition)
+        if not ok then
+            error(table_name .. " migration failed: " .. tostring(err))
+        end
+    end
+
+    ensure_column("sessions", "source", "source TEXT NOT NULL DEFAULT 'local'")
+    ensure_column("users", "last_login_at", "last_login_at INTEGER")
+    ensure_column("users", "updated_at", "updated_at INTEGER NOT NULL DEFAULT 0")
+    ensure_column("remote_users", "remote_roles", "remote_roles TEXT NOT NULL DEFAULT ''")
+    ensure_column("remote_users", "roles_overridden",
+        "roles_overridden INTEGER NOT NULL DEFAULT 0")
+    ensure_column("remote_users", "created_at", "created_at INTEGER NOT NULL DEFAULT 0")
+    ensure_column("remote_users", "last_login_at", "last_login_at INTEGER")
+    ensure_column("remote_users", "updated_at", "updated_at INTEGER NOT NULL DEFAULT 0")
+    local ok, err = _M.exec("UPDATE remote_users SET remote_roles = roles WHERE remote_roles = ''")
+    if not ok then error("remote role migration failed: " .. tostring(err)) end
+    ok, err = _M.exec("UPDATE users SET updated_at = created_at WHERE updated_at = 0")
+    if not ok then error("user timestamp migration failed: " .. tostring(err)) end
+    ok, err = _M.exec([[UPDATE remote_users SET
+        created_at = CASE WHEN created_at = 0 THEN synced_at ELSE created_at END,
+        last_login_at = COALESCE(last_login_at, synced_at),
+        updated_at = CASE WHEN updated_at = 0 THEN synced_at ELSE updated_at END]])
+    if not ok then error("remote timestamp migration failed: " .. tostring(err)) end
+
+    local username_unique = false
+    local indexes = _M.query("PRAGMA index_list(remote_users)") or {}
+    for _, index in ipairs(indexes) do
+        if index["unique"] == 1 then
+            local index_name = tostring(index.name or ""):gsub('"', '""')
+            local columns = _M.query('PRAGMA index_info("' .. index_name .. '")') or {}
+            if #columns == 1 and columns[1].name == "username" then
+                username_unique = true
+                break
+            end
+        end
+    end
+    if username_unique then
+        local statements = {
+            "BEGIN IMMEDIATE",
+            [[CREATE TABLE remote_users_identity(
+                provider TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                username TEXT NOT NULL,
+                roles TEXT NOT NULL,
+                remote_roles TEXT NOT NULL DEFAULT '',
+                roles_overridden INTEGER NOT NULL DEFAULT 0,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                synced_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                last_login_at INTEGER,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY(provider, subject),
+                UNIQUE(provider, username)
+            )]],
+            [[INSERT INTO remote_users_identity
+                (provider, subject, username, roles, remote_roles, roles_overridden, enabled, synced_at,
+                    created_at, last_login_at, updated_at)
+                SELECT provider, subject, username, roles, remote_roles, roles_overridden, enabled, synced_at,
+                    created_at, last_login_at, updated_at
+                FROM remote_users]],
+            "DROP TABLE remote_users",
+            "ALTER TABLE remote_users_identity RENAME TO remote_users",
+            "COMMIT",
+        }
+        for _, statement in ipairs(statements) do
+            local ok, err = _M.exec(statement)
+            if not ok then
+                _M.exec("ROLLBACK")
+                error("remote_users identity migration failed: " .. tostring(err))
+            end
+        end
+    end
+
+    ok, err = _M.exec([[DELETE FROM policies WHERE v0 NOT LIKE 'role:%' AND v0 NOT LIKE 'user:%'
+        AND EXISTS(SELECT 1 FROM policies existing
+            WHERE existing.ptype = policies.ptype
+            AND existing.v0 = 'user:local:' || policies.v0
+            AND existing.v1 = policies.v1 AND existing.v2 = policies.v2)]])
+    if not ok then error("duplicate policy migration failed: " .. tostring(err)) end
+    ok, err = _M.exec([[UPDATE policies SET v0 = 'user:local:' || v0
+        WHERE v0 NOT LIKE 'role:%' AND v0 NOT LIKE 'user:%']])
+    if not ok then error("policy identity migration failed: " .. tostring(err)) end
+
+    -- 默认拒绝: 仅管理员拥有全权, 普通用户必须显式授权
     _M.exec([[INSERT OR IGNORE INTO policies(ptype, v0, v1, v2) VALUES('p','role:admin','/*','*')]])
-    _M.exec([[INSERT OR IGNORE INTO policies(ptype, v0, v1, v2) VALUES('p','role:user','/*','*')]])
 
     -- 默认管理员 (仅在 users 为空时创建)
     local users = _M.query("SELECT COUNT(*) AS c FROM users")
@@ -192,9 +301,11 @@ function _M.init(opts)
         local admin_pw = opts.admin_password or "admin123"
         local salt = util.random_token(16)
         local hash = assert(util.hash_password(admin_pw, salt))
+        local now = os.time()
         _M.exec(
-            "INSERT INTO users(username, password_hash, salt, roles, enabled, created_at) VALUES(?,?,?,?,1,?)",
-            "admin", hash, salt, "admin", os.time())
+            [[INSERT INTO users(username, password_hash, salt, roles, enabled, created_at, updated_at)
+                VALUES(?,?,?,?,1,?,?)]],
+            "admin", hash, salt, "admin", now, now)
         ngx.log(ngx.WARN, "authz: seeded default admin user 'admin' (change password ASAP)")
     end
 

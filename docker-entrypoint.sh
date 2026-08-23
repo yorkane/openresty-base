@@ -10,6 +10,8 @@ HTTP_PORT="${AUTHZ_HTTP_PORT:-6080}"
 HTTPS_PORT="${AUTHZ_HTTPS_PORT:-6443}"
 CERT_DIR="${AUTHZ_CERT_DIR:-/data/certs}"
 DB_PATH="${AUTHZ_DB_PATH:-/data/authz/authz.db}"
+DNS_RESOLVER="${AUTHZ_DNS_RESOLVER:-$(awk '/^nameserver[[:space:]]+/ { print $2; exit }' /etc/resolv.conf)}"
+DNS_RESOLVER="${DNS_RESOLVER:-1.1.1.1}"
 CERT_FILE="$CERT_DIR/default.crt"
 CERT_KEY="$CERT_DIR/default.key"
 
@@ -30,8 +32,8 @@ if [ ! -s "$CERT_FILE" ] || [ ! -s "$CERT_KEY" ]; then
 fi
 
 # ── 渲染 nginx.conf ─────────────────────────────────────────────
-export HTTP_PORT HTTPS_PORT CERT_FILE CERT_KEY
-envsubst '${HTTP_PORT} ${HTTPS_PORT} ${CERT_FILE} ${CERT_KEY}' \
+export HTTP_PORT HTTPS_PORT CERT_FILE CERT_KEY DNS_RESOLVER
+envsubst '${HTTP_PORT} ${HTTPS_PORT} ${CERT_FILE} ${CERT_KEY} ${DNS_RESOLVER}' \
     < "$NGINX_CONF_DIR/nginx.conf.template" \
     > "$NGINX_CONF_DIR/nginx.conf"
 

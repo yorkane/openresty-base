@@ -7,7 +7,7 @@ set -euo pipefail
 
 IMAGE="${1:-ghcr.io/yorkane/openresty-base:latest}"
 CONTAINER="or-test-$$"
-PORT=8080
+CONTAINER_PORT=8080
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 PASS=0; FAIL=0
 
@@ -24,13 +24,17 @@ cleanup() {
 }
 trap cleanup EXIT
 
-info "Pulling / using image: $IMAGE"
-docker pull "$IMAGE" --quiet
+if docker image inspect "$IMAGE" >/dev/null 2>&1; then
+    info "Using local image: $IMAGE"
+else
+    info "Pulling image: $IMAGE"
+    docker pull "$IMAGE" --quiet
+fi
 
-info "Starting container $CONTAINER on port $PORT ..."
+info "Starting container $CONTAINER on a random local port ..."
 docker run -d --name "$CONTAINER" \
     --platform linux/amd64 \
-    -p "${PORT}:8080" \
+    -p "127.0.0.1::${CONTAINER_PORT}" \
     -v "${REPO_DIR}:/repo" \
     "$IMAGE" \
     openresty -g "daemon off;" -c /repo/test/conf/nginx.conf
@@ -38,6 +42,7 @@ docker run -d --name "$CONTAINER" \
 # 等 nginx 就绪
 sleep 2
 
+PORT=$(docker port "$CONTAINER" "${CONTAINER_PORT}/tcp" | awk -F: 'NR == 1 { print $NF }')
 BASE="http://localhost:${PORT}"
 
 # ── 辅助函数 ──────────────────────────────────────────────────────────
@@ -131,61 +136,10 @@ else
 fi
 
 echo ""
-info "=== 8. JWT / SSO 公共库 (resty.jwt + resty.noco_auth) ==="
+info "=== 8. JWT 公共库 ==="
 assert_contains "resty.jwt 可用"            "$BASE/jwt"  "resty.jwt: OK"
-assert_contains "resty.noco_auth 可用"      "$BASE/jwt"  "resty.noco_auth: OK"
 assert_contains "HS256 签发并验证"          "$BASE/jwt"  "sign/verify: OK"
 assert_contains "错误密钥应拒绝"            "$BASE/jwt"  "bad secret: rejected"
-assert_contains "APISIX 格式 JWT 验证"      "$BASE/jwt"  "apisix-style token: OK"
-assert_contains "noco_uid 3段解析"          "$BASE/jwt"  "noco_uid: authed/kate"
-
-echo ""
-info "=== 9. SSO authorize 自动跳转 ==="
-# 9.1 无 cookie → 302 → signin_url
-code=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/auth")
-if [[ "$code" == "302" ]]; then
-    ok "无 cookie → 302"
-else
-    fail "无 cookie 应 302，got $code"
-fi
-loc=$(curl -s -o /dev/null -w "%{redirect_url}" "$BASE/auth")
-if [[ "$loc" == *"/login"* ]]; then
-    ok "跳转 signin_url ($loc)"
-else
-    fail "应跳转 /login，got $loc"
-fi
-
-# 9.2 过期 token + noco_uid → 302 → sso_renew_url?url=...
-b64url() { echo -n "$1" | base64 -w0 | tr '+/' '-_' | tr -d '='; }
-hs256() { echo -n "$1" | openssl dgst -sha256 -hmac "sso_key" -binary | base64 -w0 | tr '+/' '-_' | tr -d '='; }
-EXPIRED_HDR=$(b64url '{"alg":"HS256","typ":"JWT"}')
-EXPIRED_PAY=$(b64url '{"uid":1,"uname":"t","exp":1}')
-EXPIRED_TOKEN="${EXPIRED_HDR}.${EXPIRED_PAY}.$(hs256 "${EXPIRED_HDR}.${EXPIRED_PAY}")"
-code=$(curl -s -o /dev/null -w "%{http_code}" \
-    -H "Cookie: sso_ck=${EXPIRED_TOKEN}; noco_uid=req1-08170000" "$BASE/auth")
-if [[ "$code" == "302" ]]; then
-    ok "过期 token + noco_uid → 302"
-else
-    fail "过期 token 应 302，got $code"
-fi
-loc=$(curl -s -o /dev/null -w "%{redirect_url}" \
-    -H "Cookie: sso_ck=${EXPIRED_TOKEN}; noco_uid=req1-08170000" "$BASE/auth")
-if [[ "$loc" == *"/renew?url="* ]]; then
-    ok "跳转 sso_renew_url 带回跳 ($loc)"
-else
-    fail "应跳转 /renew?url=，got $loc"
-fi
-
-# 9.3 有效 token → 200
-VALID_HDR=$(b64url '{"alg":"HS256","typ":"JWT"}')
-VALID_PAY=$(b64url "{\"uid\":7,\"uname\":\"bob\",\"exp\":$(($(date +%s) + 3600))}")
-VALID_TOKEN="${VALID_HDR}.${VALID_PAY}.$(hs256 "${VALID_HDR}.${VALID_PAY}")"
-body=$(curl -s -H "Cookie: sso_ck=${VALID_TOKEN}" "$BASE/auth")
-if echo "$body" | grep -q "authorized uid=7"; then
-    ok "有效 token 放行"
-else
-    fail "有效 token 应放行，got: $body"
-fi
 
 # ── 汇总 ──────────────────────────────────────────────────────────────
 echo ""

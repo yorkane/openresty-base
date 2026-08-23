@@ -1,532 +1,263 @@
--- resty.authz.app
--- 管理界面 + 认证入口 (/_authz/*)
---
--- 路由:
---   GET  /_authz/login            登录页
---   POST /_authz/login            登录
---   POST /_authz/logout           登出
---   GET  /_authz/                 控制台 (绑定/策略/用户/改密)
---   POST /_authz/bindings/save    域名端口绑定管理  [admin]
---   POST /_authz/policies/save    casbin 策略管理   [admin]
---   POST /_authz/users/save       用户管理          [admin]
---   POST /_authz/password         修改自己密码      [any]
-
+local authz = require "resty.authz"
 local db = require "resty.authz.db"
+local nocobase = require "resty.authz.nocobase"
+local oauth = require "resty.authz.oauth"
 local session = require "resty.authz.session"
 local util = require "resty.authz.util"
-local authz = require "resty.authz"
 
 local _M = {}
+local escape_html = util.escape_html
 
-local e = util.escape_html
+local oauth_brands = {
+    nocobase = {
+        class = "brand-nocobase",
+        icon = [[<img class="brand-icon nocobase-icon" alt="" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAC30lEQVRYR73XW6hVVRQG4O9k0cUoFQrJiowCkwTJF8N6yQcj6KHIkii6KIEm5t0uRISGWml2QaIoSnoJpAgi8aGoXsLozUAisiiqh5AoocAo44e5YLvZe6+59/GcCRs2a405/n+NOcc/xhhzetYFeBaXYhOO1LodqzUcYHcT1uFJ/ITncRh78F+b//EQOA/P4C88jRMdYHfirhKNo4NIjErgejxRCHzRB2AmduNTvI6TveyGJXA2nsK5hUC+vm3tLPZrxktgPrbiBXzShoop2ICrcQaWj0rgTGzBZdiMPyvAr8Jz2If38QpWj0JgDhLCnOGHFcA50lVYiPX4rewZicD9WIy1OFYBfjl24QO802U/NIErsB+/lhT7qoVAyN5czvznHrZDEVhR0idfPQ87SgS24Z8u50m1fPVng1Kt9g5cUpzcUkB+wOzyfwkexuP4ujxbimXYiO9bItQagbvxMmZ0OOokkMfTys0OWG555PbFGrlti8C7iHR2r24CzfvtOIDPKy5mTKaWS3kH/u3ek7TpKZHoR+ARfIRvKwgswlslYodwH77p3DdRBCLZUc1oQRSxWX/jMbzUfPhEELgOb+PaARFKgXogUT6dBCLZqZD5nVVxPMfTRwwiEB85vyjhHx0Oe92BuUX3F1QAn2LSRiDGP+JBfFx2dhJIlcs557zPGRY89jUEYpdM2VuqYpQyWZB2KxG6YRTgZk8tgcY+qfclfsFKnD8e8GEiMF6cvvsTgTQN904YQovjpie8Ha/ioskm0tmUXlxI3DaZJHp1xfcUqZw+GUT6teWz8AbSB9SuVLqoW8p27fpu0FyQdw+VUast3ZKeqXTpFV7DrS0Moiux21gzmFxZBOfGHk7jKN3Oo2VEa0xSaDI/XNhjT3rGzAgHGx2oCVckNzUhs2AjuZHoAPUbUtIlv1k66wYj3XImpN87lbCGQGNzTSm1accyEbcNKYlweslMSPm91w32P9FanGOjb4sgAAAAAElFTkSuQmCC">]],
+    },
+    google = {
+        class = "brand-google",
+        icon = [[<svg class="brand-icon" aria-hidden="true" viewBox="0 0 24 24"><path d="M12.48 10.92v3.28h7.84c-.24 1.84-.853 3.187-1.787 4.133-1.147 1.147-2.933 2.4-6.053 2.4-4.827 0-8.6-3.893-8.6-8.72s3.773-8.72 8.6-8.72c2.6 0 4.507 1.027 5.907 2.347l2.307-2.307C18.747 1.44 16.133 0 12.48 0 5.867 0 .307 5.387.307 12s5.56 12 12.173 12c3.573 0 6.267-1.173 8.373-3.36 2.16-2.16 2.84-5.213 2.84-7.667 0-.76-.053-1.467-.173-2.053H12.48z"/></svg>]],
+    },
+    dingtalk = {
+        class = "brand-dingtalk",
+        icon = [[<svg class="brand-icon" aria-hidden="true" viewBox="64 64 896 896"><path d="M573.7 252.5C422.5 197.4 201.3 96.7 201.3 96.7c-15.7-4.1-17.9 11.1-17.9 11.1-5 61.1 33.6 160.5 53.6 182.8 19.9 22.3 319.1 113.7 319.1 113.7S326 357.9 270.5 341.9c-55.6-16-37.9 17.8-37.9 17.8 11.4 61.7 64.9 131.8 107.2 138.4 42.2 6.6 220.1 4 220.1 4s-35.5 4.1-93.2 11.9c-42.7 5.8-97 12.5-111.1 17.8-33.1 12.5 24 62.6 24 62.6 84.7 76.8 129.7 50.5 129.7 50.5 33.3-10.7 61.4-18.5 85.2-24.2L565 743.1h84.6L603 928l205.3-271.9H700.8l22.3-38.7c.3.5.4.8.4.8S799.8 496.1 829 433.8l.6-1h-.1c5-10.8 8.6-19.7 10-25.8 17-71.3-114.5-99.4-265.8-154.5z"/></svg>]],
+    },
+    wechat = {
+        class = "brand-wechat",
+        icon = [[<svg class="brand-icon" aria-hidden="true" viewBox="0 0 24 24"><path d="M8.691 2.188C3.891 2.188 0 5.476 0 9.53c0 2.212 1.17 4.203 3.002 5.55a.59.59 0 0 1 .213.665l-.39 1.48c-.019.07-.048.141-.048.213 0 .163.13.295.29.295a.326.326 0 0 0 .167-.054l1.903-1.114a.864.864 0 0 1 .717-.098 10.16 10.16 0 0 0 2.837.403c.276 0 .543-.027.811-.05-.857-2.578.157-4.972 1.932-6.446 1.703-1.415 3.882-1.98 5.853-1.838-.576-3.583-4.196-6.348-8.596-6.348zM5.785 5.991c.642 0 1.162.529 1.162 1.18a1.17 1.17 0 0 1-1.162 1.178A1.17 1.17 0 0 1 4.623 7.17c0-.651.52-1.18 1.162-1.18zm5.813 0c.642 0 1.162.529 1.162 1.18a1.17 1.17 0 0 1-1.162 1.178 1.17 1.17 0 0 1-1.162-1.178c0-.651.52-1.18 1.162-1.18zm5.34 2.867c-1.797-.052-3.746.512-5.28 1.786-1.72 1.428-2.687 3.72-1.78 6.22.942 2.453 3.666 4.229 6.884 4.229.826 0 1.622-.12 2.361-.336a.722.722 0 0 1 .598.082l1.584.926a.272.272 0 0 0 .14.047c.134 0 .24-.111.24-.247 0-.06-.023-.12-.038-.177l-.327-1.233a.582.582 0 0 1-.023-.156.49.49 0 0 1 .201-.398C23.024 18.48 24 16.82 24 14.98c0-3.21-2.931-5.837-6.656-6.088V8.89c-.135-.01-.27-.027-.407-.03zm-2.53 3.274c.535 0 .969.44.969.982a.976.976 0 0 1-.969.983.976.976 0 0 1-.969-.983c0-.542.434-.982.97-.982zm4.844 0c.535 0 .969.44.969.982a.976.976 0 0 1-.969.983.976.976 0 0 1-.969-.983c0-.542.434-.982.969-.982z"/></svg>]],
+    },
+}
 
--- ────────────────────────────────────────────────────────────────
--- 基础工具
--- ────────────────────────────────────────────────────────────────
-
-local function bump_rev()
-    local dict = ngx.shared[authz.config.cache_dict]
-    if dict then dict:incr("rev", 1, 0) end
-end
+local default_oauth_brand = {
+    class = "brand-oauth",
+    icon = [[<svg class="brand-icon" aria-hidden="true" viewBox="0 0 24 24"><path d="M12 2a5 5 0 0 0-5 5v2H6a3 3 0 0 0-3 3v7a3 3 0 0 0 3 3h12a3 3 0 0 0 3-3v-7a3 3 0 0 0-3-3h-1V7a5 5 0 0 0-5-5zm-3 7V7a3 3 0 0 1 6 0v2H9zm3 4a2 2 0 0 1 1 3.73V19h-2v-2.27A2 2 0 0 1 12 13z"/></svg>]],
+}
 
 local function post_args()
     ngx.req.read_body()
-    local args, err = ngx.req.get_post_args()
-    if not args then return {} end
-    return args
+    return ngx.req.get_post_args() or {}
+end
+
+local function disable_cache()
+    ngx.header["Cache-Control"] = "no-store, no-cache, must-revalidate"
+    ngx.header["Pragma"] = "no-cache"
+    ngx.header["Expires"] = "0"
 end
 
 local function redirect(location)
-    ngx.status = ngx.HTTP_MOVED_TEMPORARILY
-    ngx.header["Location"] = location
-    ngx.exit(ngx.HTTP_MOVED_TEMPORARILY)
+    disable_cache()
+    return ngx.redirect(location, ngx.HTTP_MOVED_TEMPORARILY)
 end
 
-local function deny(msg, code)
-    ngx.status = code or ngx.HTTP_FORBIDDEN
-    ngx.header.content_type = "text/html; charset=utf-8"
-    ngx.say("<html><body style='font-family:sans-serif'><h2>" ..
-        e(msg or "403 Forbidden") .. "</h2><p><a href='/_authz/'>返回控制台</a></p></body></html>")
-    return ngx.exit(ngx.HTTP_OK)
-end
-
--- 当前登录用户; 未登录返回 nil
 local function current_session()
     local token = session.get_request_token()
-    if not token then return nil end
-    return session.get(token), token
+    return token and session.get(token) or nil
 end
 
-local function user_roles(username)
-    local rows = db.query("SELECT roles FROM users WHERE username = ?", username)
-    if not rows or not rows[1] then return {} end
-    local roles = {}
-    for r in rows[1].roles:gmatch("[^,%s]+") do
-        roles[#roles + 1] = r
-    end
-    return roles
+local function safe_next(value)
+    if value and value:sub(1, 1) == "/" and value:sub(2, 2) ~= "/" then return value end
+    return "/_radmin_/"
 end
 
-local function is_admin(s)
-    if not s then return false end
-    for _, r in ipairs(user_roles(s.username)) do
-        if r == "admin" then return true end
-    end
-    return false
+local function html_response(body, status)
+    ngx.status = status or ngx.HTTP_OK
+    disable_cache()
+    ngx.header.content_type = "text/html; charset=utf-8"
+    ngx.say(body)
+    return ngx.exit(ngx.status)
 end
 
-
--- ────────────────────────────────────────────────────────────────
--- HTML 渲染
--- ────────────────────────────────────────────────────────────────
-
-local CSS = [[
-body{font-family:-apple-system,'Segoe UI',sans-serif;margin:0;background:#f4f6f8;color:#222}
-header{background:#1a2733;color:#fff;padding:14px 24px;display:flex;justify-content:space-between;align-items:center}
-header a{color:#9fc3e8;text-decoration:none;margin-left:16px}
-main{max-width:1080px;margin:24px auto;padding:0 16px}
-h2{margin:28px 0 10px;font-size:18px;border-bottom:2px solid #dde;padding-bottom:6px}
-table{border-collapse:collapse;width:100%;background:#fff;font-size:14px}
-th,td{border:1px solid #e2e6ea;padding:7px 10px;text-align:left}
-th{background:#eef1f4}
-form.inline{display:inline}
-input,select{padding:5px 8px;border:1px solid #c5ccd3;border-radius:4px;font-size:13px}
-button{padding:5px 12px;border:0;border-radius:4px;background:#2563eb;color:#fff;cursor:pointer;font-size:13px}
-button.danger{background:#dc2626}
-button.gray{background:#6b7280}
-.msg{padding:10px 14px;border-radius:6px;margin:12px 0}
-.msg.ok{background:#dcfce7;color:#14532d}.msg.err{background:#fee2e2;color:#7f1d1d}
-.card{background:#fff;border:1px solid #e2e6ea;border-radius:8px;padding:16px;margin-bottom:16px}
-.grid{display:flex;gap:16px;flex-wrap:wrap}.grid .card{flex:1;min-width:320px}
-code{background:#eef;padding:1px 5px;border-radius:3px}
-.login-box{max-width:360px;margin:80px auto;background:#fff;border-radius:10px;
- box-shadow:0 4px 20px rgba(0,0,0,.08);padding:32px}
-.login-box input{width:100%;box-sizing:border-box;margin:8px 0 16px}
-.login-box button{width:100%;padding:10px}
-.muted{color:#888;font-size:12px}
-]]
-
-local function page(title, body, s)
-    local nav
-    if s then
-        nav = "<span>用户: <b>" .. e(s.username) .. "</b> (" ..
-            e(table.concat(user_roles(s.username), ", ")) .. ")</span>" ..
-            "<nav><a href='/'>网关首页</a><form class='inline' method='post' action='/_authz/logout'>" ..
-            "<input type='hidden' name='_csrf' value='" .. e(s.csrf) .. "'>" ..
-            "<button class='gray' type='submit'>登出</button></form></nav>"
-    else
-        nav = "<nav></nav>"
+local function login_page(error_message, next_url)
+    local error_html = error_message and
+        ("<div class='error'>" .. escape_html(error_message) .. "</div>") or ""
+    local provider_links = {}
+    for _, provider in ipairs(oauth.public_providers()) do
+        local brand = oauth_brands[provider.id] or default_oauth_brand
+        local content = brand.icon .. [[<span class="oauth-name">]] ..
+            escape_html(provider.title) .. [[</span>]]
+        if provider.enabled then
+            provider_links[#provider_links + 1] = [[<a class="oauth ]] .. brand.class ..
+                [[" aria-label="]] .. escape_html(provider.title) ..
+                [[" href="/_authz/oauth/start?provider=]] .. ngx.escape_uri(provider.id) ..
+                [[&amp;next=]] .. ngx.escape_uri(next_url) .. [[">]] .. content .. [[</a>]]
+        else
+            provider_links[#provider_links + 1] = [[<span class="oauth ]] .. brand.class ..
+                [[ disabled" aria-label="]] .. escape_html(provider.title .. "（待配置）") ..
+                [[" title="需要配置 OAuth Client ID、Secret 和回调地址">]] .. content ..
+                [[<small>待配置</small></span>]]
+        end
     end
-    return [[<!doctype html><html lang="zh"><head><meta charset="utf-8">
+    local oauth_html = #provider_links > 0 and
+        ([[<section class="login-panel oauth-panel"><h2>关联登录</h2>
+<p class="panel-copy">使用已关联的身份服务继续登录</p><div class="oauth-grid">]] ..
+            table.concat(provider_links) .. [[</div></section>]]) or ""
+    local source_html = ""
+    if authz.config.noco_enabled then
+        source_html = [[<label class="field"><span>身份来源</span><select name="source">
+<option value="local">本地账户</option><option value="nocobase">NocoBase</option>
+</select></label>]]
+    end
+    return [[<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>]] .. e(title) .. [[ - Authz Gateway</title><style>]] .. CSS .. [[</style></head>
-<body><header><b>OpenResty Authz Gateway</b>]] .. nav .. [[</header>
-<main>]] .. body .. [[</main></body></html>]]
+<title>登录</title><style>
+:root{color-scheme:dark}*{box-sizing:border-box}body{display:grid;min-height:100vh;margin:0;padding:16px;place-items:center;background:#191b2b;color:#f1f2f8;font:14px Roboto,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+.card{width:min(720px,calc(100vw - 32px));padding:28px;border:1px solid rgba(139,145,184,.18);border-radius:16px;background:#202337;box-shadow:0 24px 70px rgba(5,7,18,.35)}
+h1{margin:0 0 6px;font-size:22px;font-weight:600}.copy{margin:0 0 22px;color:#969aaf}.login-layout{display:grid;grid-template-columns:1fr 1fr;gap:0}.login-panel{min-width:0;padding-right:28px}.oauth-panel{padding:0 0 0 28px;border-left:1px solid rgba(139,145,184,.18)}h2{margin:0 0 6px;font-size:16px;font-weight:600}.panel-copy{min-height:20px;margin:0 0 14px;color:#969aaf;line-height:1.45}.field{display:grid;gap:7px;margin-top:14px}input,select{width:100%;height:42px;padding:0 12px;border:1px solid rgba(139,145,184,.28);border-radius:10px;outline:none;background:#191c2d;color:#fff}input:focus,select:focus{border-color:#9564ed}button,.oauth{width:100%;min-height:46px;padding:9px 12px;border:0;border-radius:11px;color:#fff;font-weight:600;line-height:1.25;cursor:pointer;text-align:center;text-decoration:none}.password-submit{display:grid;margin-top:20px;place-items:center;background:linear-gradient(135deg,#9564ed,#7356d8)}.oauth-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.oauth{display:flex;align-items:center;justify-content:center;gap:9px;border:1px solid transparent;background:#7654d8;box-shadow:0 6px 18px rgba(0,0,0,.14);transition:transform .16s ease,filter .16s ease,box-shadow .16s ease}.oauth:hover{filter:brightness(1.08);transform:translateY(-1px);box-shadow:0 9px 22px rgba(0,0,0,.2)}.brand-icon{width:20px;height:20px;flex:0 0 20px;fill:currentColor}.nocobase-icon{object-fit:contain;filter:invert(1)}.oauth-name{white-space:nowrap}.oauth small{font-size:10px;font-weight:500;opacity:.72}.brand-nocobase{background:#6f56d9}.brand-google{background:#fff;color:#202124}.brand-google .brand-icon{fill:#4285f4}.brand-dingtalk{background:#1677ff}.brand-wechat{background:#07c160}.brand-oauth{background:#7654d8}.oauth.disabled{cursor:not-allowed;filter:saturate(.45);opacity:.48}.oauth.disabled:hover{filter:saturate(.45);transform:none;box-shadow:0 6px 18px rgba(0,0,0,.14)}.error{margin-bottom:18px;padding:10px 12px;border:1px solid rgba(240,107,130,.25);border-radius:9px;background:rgba(240,107,130,.1);color:#ffb4c0}@media(max-width:680px){.card{padding:22px}.login-layout{grid-template-columns:1fr;gap:24px}.login-panel{padding-right:0}.oauth-panel{padding:24px 0 0;border-top:1px solid rgba(139,145,184,.18);border-left:0}}@media(max-width:420px){.oauth-grid{grid-template-columns:1fr}}
+</style></head><body><main class="card"><h1>登录</h1><p class="copy">OpenResty 认证与权限管理</p>]] ..
+        error_html .. [[<div class="login-layout"><section class="login-panel"><h2>账户登录</h2>
+<p class="panel-copy">使用本地或远程账户密码登录</p><form method="post" action="/_authz/login">
+<input type="hidden" name="next" value="]] .. escape_html(next_url) .. [[">
+]] .. source_html .. [[
+<label class="field"><span>用户名</span><input name="username" autocomplete="username" autofocus required></label>
+<label class="field"><span>密码</span><input name="password" type="password" autocomplete="current-password" required></label>
+<button class="password-submit" type="submit">登录</button></form></section>]] .. oauth_html .. [[</div></main></body></html>]]
 end
-
--- ────────────────────────────────────────────────────────────────
--- 登录 / 登出
--- ────────────────────────────────────────────────────────────────
 
 local function handle_login_get()
-    local s = current_session()
-    if s then redirect("/_authz/") end
-    local err = ngx.var.arg_err
-    local err_html = err and ("<div class='msg err'>" .. e(err) .. "</div>") or ""
-    local next_url = ngx.var.arg_next or "/_authz/"
-    local body = [[<div class="login-box"><h2>登录</h2>]] .. err_html ..
-        [[<form method="post" action="/_authz/login">
-<input type="hidden" name="next" value="]] .. e(next_url) .. [[">
-<label>用户名</label><input name="username" autofocus required>
-<label>密码</label><input name="password" type="password" required>
-<button type="submit">登录</button></form></div>]]
-    ngx.header.content_type = "text/html; charset=utf-8"
-    ngx.say(page("登录", body))
-end
-
-local function safe_next(v)
-    if v and v:sub(1, 1) == "/" and v:sub(2, 2) ~= "/" then return v end
-    return "/_authz/"
+    if current_session() then return redirect("/_radmin_/") end
+    local args = ngx.req.get_uri_args(10)
+    local error_message = type(args.err) == "string" and args.err or nil
+    local next_url = type(args.next) == "string" and safe_next(args.next) or "/_radmin_/"
+    if error_message and #error_message > 256 then error_message = "登录失败" end
+    return html_response(login_page(error_message, next_url))
 end
 
 local function handle_login_post()
+    local limit_dict = ngx.shared[authz.config.login_limit_dict]
+    local limit_key = "login:" .. tostring(ngx.var.remote_addr or "unknown")
+    if limit_dict then
+        local attempts = limit_dict:incr(limit_key, 1, 0, authz.config.login_window)
+        if attempts and attempts > authz.config.login_attempts then
+            return html_response("<h1>429 Too Many Requests</h1><p>登录尝试过多，请稍后重试。</p>",
+                ngx.HTTP_TOO_MANY_REQUESTS)
+        end
+    end
     local args = post_args()
-    local username = args.username or ""
-    local password = args.password or ""
-    local rows = db.query(
-        "SELECT id, password_hash, salt, enabled FROM users WHERE username = ?", username)
-    local u = rows and rows[1]
-    if not u or u.enabled == 0 or not util.verify_password(password, u.salt, u.password_hash) then
-        redirect("/_authz/login?err=" .. ngx.escape_uri("用户名或密码错误") ..
+    local account = tostring(args.username or "")
+    local username = account:lower():gsub("%s+", "")
+    local password = tostring(args.password or "")
+    local source = tostring(args.source or "local"):lower()
+    local identity
+    if source == "local" then
+        local rows = db.query(
+            "SELECT password_hash, salt, enabled FROM users WHERE username = ?", username)
+        local user = rows and rows[1]
+        if user and user.enabled == 1 and
+            util.verify_password(password, user.salt, user.password_hash) then
+            local ok, update_err = db.exec(
+                "UPDATE users SET last_login_at = ? WHERE username = ?", os.time(), username)
+            if not ok then
+                ngx.log(ngx.ERR, "authz local login timestamp failed: ", update_err)
+                return html_response("<h1>登录状态保存失败</h1>", ngx.HTTP_INTERNAL_SERVER_ERROR)
+            end
+            identity = { username = username, source = "local" }
+        end
+    elseif source == "nocobase" and authz.config.noco_enabled then
+        local remote, remote_err = nocobase.authenticate(account, password)
+        if remote then
+            identity = remote
+        elseif remote_err == "identity_disabled" then
+            return redirect("/_authz/login?err=" ..
+                ngx.escape_uri("账户未启用，请联系管理员") ..
+                "&next=" .. ngx.escape_uri(args.next or ""))
+        elseif remote_err ~= "invalid_credentials" then
+            ngx.log(ngx.ERR, "authz NocoBase login failed: ", remote_err)
+            return redirect("/_authz/login?err=" ..
+                ngx.escape_uri("远程认证服务暂时不可用") ..
+                "&next=" .. ngx.escape_uri(args.next or ""))
+        end
+    else
+        return redirect("/_authz/login?err=" .. ngx.escape_uri("身份来源不受支持") ..
             "&next=" .. ngx.escape_uri(args.next or ""))
     end
-    local token, terr = session.create(username)
-    if not token then deny("会话创建失败: " .. tostring(terr), 500) end
+    if not identity then
+        return redirect("/_authz/login?err=" .. ngx.escape_uri("用户名或密码错误") ..
+            "&next=" .. ngx.escape_uri(args.next or ""))
+    end
+    if limit_dict then limit_dict:delete(limit_key) end
+    local token, err = session.create(identity.username, identity.source)
+    if not token then
+        ngx.log(ngx.ERR, "authz session create failed: ", err)
+        return html_response("<h1>会话创建失败</h1>", ngx.HTTP_INTERNAL_SERVER_ERROR)
+    end
     session.set_cookie(token)
-    redirect(safe_next(args.next))
+    return redirect(safe_next(args.next))
 end
 
-local function handle_logout_post()
-    local s, token = current_session()
-    if s then
-        local args = post_args()
-        if args._csrf == s.csrf then
-            session.delete(token)
-        end
+local function handle_oauth_start()
+    if current_session() then return redirect("/_radmin_/") end
+    local location, err = oauth.start(
+        tostring(ngx.var.arg_provider or ""), safe_next(ngx.var.arg_next))
+    if not location then
+        ngx.log(ngx.WARN, "authz OAuth start rejected: ", err)
+        return redirect("/_authz/login?err=" .. ngx.escape_uri("身份登录配置不可用"))
     end
-    session.clear_cookie()
-    redirect("/_authz/login")
+    return redirect(location)
 end
 
--- ────────────────────────────────────────────────────────────────
--- 控制台
--- ────────────────────────────────────────────────────────────────
-
-local function csrf_field(s)
-    return "<input type='hidden' name='_csrf' value='" .. e(s.csrf) .. "'>"
-end
-
-local function render_bindings(s, admin)
-    local rows = db.query("SELECT * FROM bindings ORDER BY domain") or {}
-    local h = "<h2>域名绑定 (domain → 本机端口)</h2><table><tr>" ..
-        "<th>域名</th><th>端口</th><th>状态</th><th>备注</th>"
-    if admin then h = h .. "<th>操作</th>" end
-    h = h .. "</tr>"
-    for _, b in ipairs(rows) do
-        h = h .. "<tr><td><code>" .. e(b.domain) .. "</code></td><td>" .. b.port ..
-            "</td><td>" .. (b.enabled == 1 and "启用" or "停用") ..
-            "</td><td>" .. e(b.note) .. "</td>"
-        if admin then
-            h = h .. "<td><form class='inline' method='post' action='/_authz/bindings/save'>" ..
-                csrf_field(s) ..
-                "<input type='hidden' name='action' value='toggle'>" ..
-                "<input type='hidden' name='id' value='" .. b.id .. "'>" ..
-                "<button class='gray'>" .. (b.enabled == 1 and "停用" or "启用") .. "</button></form> " ..
-                "<form class='inline' method='post' action='/_authz/bindings/save'>" ..
-                csrf_field(s) ..
-                "<input type='hidden' name='action' value='delete'>" ..
-                "<input type='hidden' name='id' value='" .. b.id .. "'>" ..
-                "<button class='danger'>删除</button></form></td>"
-        end
-        h = h .. "</tr>"
+local function handle_oauth_callback()
+    local identity, next_or_err = oauth.callback(ngx.req.get_uri_args() or {})
+    if not identity then
+        ngx.log(ngx.WARN, "authz OAuth callback failed: ", next_or_err)
+        local message = next_or_err == "identity_disabled" and
+            "账户未启用，请联系管理员" or "身份登录失败，请重试"
+        return redirect("/_authz/login?err=" .. ngx.escape_uri(message))
     end
-    h = h .. "</table>"
-    if admin then
-        h = h .. [[<div class="card" style="margin-top:12px"><b>新增绑定</b>
-<form method="post" action="/_authz/bindings/save">]] .. csrf_field(s) ..
-[[<input type="hidden" name="action" value="create">
-<input name="domain" placeholder="app.example.com" required pattern="[A-Za-z0-9.-]+">
-<input name="port" type="number" min="]] .. authz.config.port_min .. [[" max="]] ..
-authz.config.port_max .. [[" placeholder="3000" required>
-<input name="note" placeholder="备注(可选)" size="20">
-<label><input type="checkbox" name="enabled" checked> 启用</label>
-<button>添加</button></form>
-<p class="muted">提示: 数字前缀子域名无需配置 — <code>3000-任意域名</code> 自动代理到本机 3000 端口 (范围 ]] ..
-authz.config.port_min .. "-" .. authz.config.port_max .. [[)。此处配置用于固定域名映射。</p></div>]]
+    local token, err = session.create(identity.username, identity.source)
+    if not token then
+        ngx.log(ngx.ERR, "authz OAuth session create failed: ", err)
+        return html_response("<h1>会话创建失败</h1>", ngx.HTTP_INTERNAL_SERVER_ERROR)
     end
-    return h
+    session.set_cookie(token)
+    return redirect(safe_next(next_or_err))
 end
 
-local function render_policies(s, admin)
-    local rows = db.query("SELECT * FROM policies ORDER BY ptype, v0") or {}
-    local h = "<h2>Casbin 策略</h2><table><tr><th>类型</th><th>v0 (主体)</th><th>v1 (对象)</th><th>v2 (动作)</th>"
-    if admin then h = h .. "<th>操作</th>" end
-    h = h .. "</tr>"
-    for _, p in ipairs(rows) do
-        h = h .. "<tr><td>" .. e(p.ptype) .. "</td><td><code>" .. e(p.v0) ..
-            "</code></td><td><code>" .. e(p.v1) .. "</code></td><td><code>" .. e(p.v2) .. "</code></td>"
-        if admin then
-            h = h .. "<td><form class='inline' method='post' action='/_authz/policies/save'>" ..
-                csrf_field(s) ..
-                "<input type='hidden' name='action' value='del'>" ..
-                "<input type='hidden' name='id' value='" .. p.id .. "'>" ..
-                "<button class='danger'>删除</button></form></td>"
-        end
-        h = h .. "</tr>"
+local function retired_endpoint()
+    local message = "接口已移动到 /_api_/authz/v1"
+    if (ngx.var.http_accept or ""):find("application/json", 1, true) then
+        ngx.status = ngx.HTTP_GONE
+        ngx.header.content_type = "application/json; charset=utf-8"
+        ngx.say('{"error":{"code":"endpoint_moved","message":"' .. message .. '"}}')
+        return ngx.exit(ngx.HTTP_GONE)
     end
-    h = h .. "</table>"
-    if admin then
-        h = h .. [[<div class="card" style="margin-top:12px"><b>新增策略</b>
-<form method="post" action="/_authz/policies/save">]] .. csrf_field(s) ..
-[[<input type="hidden" name="action" value="add">
-<select name="ptype"><option value="p">p (授权)</option><option value="g">g (角色分配)</option></select>
-<input name="v0" placeholder="role:user / alice" size="16" required>
-<input name="v1" placeholder="/* 或 /3000/api/*" size="22">
-<input name="v2" placeholder="* 或 GET" size="10">
-<label><select name="eft"><option value="allow">allow</option><option value="deny">deny</option></select></label>
-<button>添加</button></form>
-<p class="muted">对象格式: <code>/&lt;端口&gt;&lt;路径&gt;</code>, 如 <code>/3000/api/*</code>; 动作为 HTTP 方法或 <code>*</code>。</p></div>]]
-    end
-    return h
+    return html_response("<h1>410 Gone</h1><p>" .. message .. "</p>", ngx.HTTP_GONE)
 end
-
-local function render_users(s, admin)
-    if not admin then return "" end
-    local rows = db.query("SELECT id, username, roles, enabled, created_at FROM users ORDER BY id") or {}
-    local h = "<h2>用户</h2><table><tr><th>ID</th><th>用户名</th><th>角色</th><th>状态</th><th>创建时间</th><th>操作</th></tr>"
-    for _, u in ipairs(rows) do
-        h = h .. "<tr><td>" .. u.id .. "</td><td><b>" .. e(u.username) .. "</b></td><td>" ..
-            e(u.roles) .. "</td><td>" .. (u.enabled == 1 and "正常" or "禁用") .. "</td><td>" ..
-            os.date("%Y-%m-%d", u.created_at) .. "</td><td>"
-        if u.username ~= "admin" then
-            h = h .. "<form class='inline' method='post' action='/_authz/users/save'>" .. csrf_field(s) ..
-                "<input type='hidden' name='id' value='" .. u.id .. "'>" ..
-                "<input type='hidden' name='action' value='" .. (u.enabled == 1 and "disable" or "enable") .. "'>" ..
-                "<button class='gray'>" .. (u.enabled == 1 and "禁用" or "启用") .. "</button></form> " ..
-                "<form class='inline' method='post' action='/_authz/users/save'>" .. csrf_field(s) ..
-                "<input type='hidden' name='id' value='" .. u.id .. "'>" ..
-                "<input type='hidden' name='action' value='delete'>" ..
-                "<button class='danger'>删除</button></form> " ..
-                "<form class='inline' method='post' action='/_authz/users/save'>" .. csrf_field(s) ..
-                "<input type='hidden' name='id' value='" .. u.id .. "'>" ..
-                "<input type='hidden' name='action' value='resetpw'>" ..
-                "<input name='newpw' type='password' placeholder='新密码' size='10' required>" ..
-                "<button>重置密码</button></form> " ..
-                "<form class='inline' method='post' action='/_authz/users/save'>" .. csrf_field(s) ..
-                "<input type='hidden' name='id' value='" .. u.id .. "'>" ..
-                "<input type='hidden' name='action' value='setroles'>" ..
-                "<input name='roles' value='" .. e(u.roles) .. "' size='12'>" ..
-                "<button>设角色</button></form>"
-        else
-            h = h .. "<span class='muted'>内置管理员</span>"
-        end
-        h = h .. "</td></tr>"
-    end
-    h = h .. [[</table><div class="card" style="margin-top:12px"><b>新增用户</b>
-<form method="post" action="/_authz/users/save">]] .. csrf_field(s) ..
-[[<input type="hidden" name="action" value="create">
-<input name="username" placeholder="用户名" required pattern="[a-z0-9_-]{2,32}">
-<input name="password" type="password" placeholder="密码(≥6位)" required minlength="6">
-<input name="roles" value="user" placeholder="角色,逗号分隔" size="14">
-<button>创建</button></form></div>]]
-    return h
-end
-
-local function render_password_form(s)
-    return [[<h2>修改我的密码</h2><div class="card" style="max-width:420px">
-<form method="post" action="/_authz/password">]] .. csrf_field(s) ..
-[[<label>当前密码</label><input name="oldpw" type="password" required style="width:100%"><br><br>
-<label>新密码 (≥6位)</label><input name="newpw" type="password" required minlength="6" style="width:100%"><br><br>
-<button>修改</button></form></div>]]
-end
-
-local function handle_dashboard()
-    local s = current_session()
-    if not s then
-        redirect("/_authz/login?next=" .. ngx.escape_uri(ngx.var.request_uri))
-    end
-    local admin = is_admin(s)
-    local msg, err = ngx.var.arg_msg, ngx.var.arg_err
-    local banner = ""
-    if msg then banner = banner .. "<div class='msg ok'>" .. e(msg) .. "</div>" end
-    if err then banner = banner .. "<div class='msg err'>" .. e(err) .. "</div>" end
-    local body = banner ..
-        render_bindings(s, admin) ..
-        render_policies(s, admin) ..
-        render_users(s, admin) ..
-        render_password_form(s)
-    ngx.header.content_type = "text/html; charset=utf-8"
-    ngx.say(page("控制台", body, s))
-end
-
--- ────────────────────────────────────────────────────────────────
--- 写操作 handlers (POST, CSRF 校验)
--- ────────────────────────────────────────────────────────────────
-
-local function back(msg, errm)
-    local q = ""
-    if msg then q = "?msg=" .. ngx.escape_uri(msg) end
-    if errm then q = "?err=" .. ngx.escape_uri(errm) end
-    redirect("/_authz/" .. q)
-end
-
-local function require_admin(s)
-    if not is_admin(s) then deny("需要管理员权限") end
-end
-
-local function valid_host(domain)
-    -- PCRE: 各级标签 字母数字/连字符, 至少两段
-    return ngx.re.match(domain,
-        [[^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$]]) ~= nil
-end
-
-local function handle_bindings_save(s)
-    require_admin(s)
-    local a = post_args()
-    local action = a.action
-    if action == "create" then
-        local domain = (a.domain or ""):lower():gsub("%s+", "")
-        -- 允许带端口的 Host 输入, 去掉 :port 部分
-        domain = domain:gsub(":%d+$", "")
-        local port = tonumber(a.port)
-        if not valid_host(domain) then back(nil, "域名格式不合法") end
-        if not port or port < authz.config.port_min or port > authz.config.port_max then
-            back(nil, "端口必须在 " .. authz.config.port_min .. "-" .. authz.config.port_max)
-        end
-        local ok, derr = db.exec(
-            "INSERT INTO bindings(domain, port, enabled, note, created_at) VALUES(?,?,?,?,?)",
-            domain, port, a.enabled and 1 or 0, a.note or "", os.time())
-        if not ok then back(nil, "保存失败: " .. tostring(derr)) end
-        bump_rev()
-        back("已添加 " .. domain .. " → :" .. port)
-    elseif action == "toggle" then
-        db.exec("UPDATE bindings SET enabled = 1 - enabled WHERE id = ?", tonumber(a.id))
-        bump_rev(); back(nil)
-    elseif action == "delete" then
-        db.exec("DELETE FROM bindings WHERE id = ?", tonumber(a.id))
-        bump_rev(); back("已删除")
-    end
-    back(nil, "未知操作")
-end
-
-local function handle_policies_save(s)
-    require_admin(s)
-    local a = post_args()
-    if a.action == "add" then
-        local ptype = a.ptype == "g" and "g" or "p"
-        local v0 = (a.v0 or ""):gsub("%s+", "")
-        if v0 == "" then back(nil, "v0 不能为空") end
-        local v1, v2
-        if ptype == "p" then
-            v1 = (a.v1 or ""):gsub("%s+", "")
-            v2 = ((a.v2 or ""):gsub("%s+", "")):upper()
-            if v1 == "" then v1 = "/*" end
-            if v2 == "" then v2 = "*" end
-            if v2 ~= "*" and not ngx.re.match(v2, [[^[A-Z]+$]]) then
-                back(nil, "动作必须是 HTTP 方法或 *")
-            end
-        else
-            v1 = (a.v1 or ""):gsub("%s+", "")
-            if v1 == "" then back(nil, "g 规则必须指定角色") end
-            v2 = "-"
-        end
-        local eft = a.eft == "deny" and "deny" or "allow"
-        -- 表无独立 eft 列, deny 编码在 v2 尾部: "METHOD|deny"
-        if ptype == "p" and eft == "deny" then v2 = v2 .. "|deny" end
-        local ok, derr = db.exec(
-            "INSERT OR IGNORE INTO policies(ptype, v0, v1, v2) VALUES(?,?,?,?)",
-            ptype, v0, v1, v2)
-        if not ok then back(nil, "保存失败: " .. tostring(derr)) end
-        bump_rev(); back("策略已添加")
-    elseif a.action == "del" then
-        db.exec("DELETE FROM policies WHERE id = ?", tonumber(a.id))
-        bump_rev(); back("策略已删除")
-    end
-    back(nil, "未知操作")
-end
-
-local function handle_users_save(s)
-    require_admin(s)
-    local a = post_args()
-    local action = a.action
-    local id = tonumber(a.id)
-    if action == "create" then
-        local username = (a.username or ""):lower():gsub("%s+", "")
-        local password = a.password or ""
-        if not ngx.re.match(username, [[^[a-z0-9_-]{2,32}$]]) then back(nil, "用户名格式不合法") end
-        if #password < 6 then back(nil, "密码至少 6 位") end
-        local roles = (a.roles or "user"):gsub("%s+", "")
-        if roles == "" then roles = "user" end
-        local salt = util.random_token(16)
-        local hash = util.hash_password(password, salt)
-        local ok, derr = db.exec(
-            "INSERT INTO users(username, password_hash, salt, roles, enabled, created_at) VALUES(?,?,?,?,1,?)",
-            username, hash, salt, roles, os.time())
-        if not ok then back(nil, "创建失败: " .. tostring(derr)) end
-        bump_rev(); back("用户 " .. username .. " 已创建")
-    elseif action == "delete" then
-        local rows = db.query("SELECT username FROM users WHERE id = ?", id)
-        if rows and rows[1] then
-            if rows[1].username == "admin" then back(nil, "不能删除内置管理员") end
-            db.exec("DELETE FROM users WHERE id = ?", id)
-            session.delete_all_for(rows[1].username)
-            bump_rev(); back("用户已删除")
-        end
-    elseif action == "enable" or action == "disable" then
-        db.exec("UPDATE users SET enabled = ? WHERE id = ?",
-            action == "enable" and 1 or 0, id)
-        bump_rev(); back(nil)
-    elseif action == "resetpw" then
-        local newpw = a.newpw or ""
-        if #newpw < 6 then back(nil, "密码至少 6 位") end
-        local salt = util.random_token(16)
-        local hash = util.hash_password(newpw, salt)
-        db.exec("UPDATE users SET password_hash = ?, salt = ? WHERE id = ?", hash, salt, id)
-        back("密码已重置")
-    elseif action == "setroles" then
-        local roles = (a.roles or "user"):gsub("%s+", "")
-        if roles == "" then roles = "user" end
-        db.exec("UPDATE users SET roles = ? WHERE id = ?", roles, id)
-        bump_rev(); back("角色已更新")
-    end
-    back(nil, "未知操作")
-end
-
-local function handle_password(s, token)
-    local a = post_args()
-    local oldpw, newpw = a.oldpw or "", a.newpw or ""
-    local rows = db.query("SELECT password_hash, salt FROM users WHERE username = ?", s.username)
-    local u = rows and rows[1]
-    if not u or not util.verify_password(oldpw, u.salt, u.password_hash) then
-        back(nil, "当前密码错误")
-    end
-    if #newpw < 6 then back(nil, "新密码至少 6 位") end
-    local salt = util.random_token(16)
-    local hash = util.hash_password(newpw, salt)
-    db.exec("UPDATE users SET password_hash = ?, salt = ? WHERE username = ?",
-        hash, salt, s.username)
-    -- 更新后使其他会话失效 (保留当前)
-    db.exec("DELETE FROM sessions WHERE username = ? AND token != ?", s.username, token)
-    back("密码修改成功")
-end
-
--- ────────────────────────────────────────────────────────────────
--- 路由分发
--- ────────────────────────────────────────────────────────────────
 
 function _M.handle()
     db.open(authz.config.db_path)
-
     local uri = ngx.var.uri
     local method = ngx.req.get_method()
 
-    if uri == "/_authz" then uri = "/_authz/" end
-
     if uri == "/_authz/login" then
+        if method == "GET" then return handle_login_get() end
         if method == "POST" then return handle_login_post() end
-        return handle_login_get()
+        return html_response("<h1>405 Method Not Allowed</h1>", ngx.HTTP_NOT_ALLOWED)
     end
 
-    if uri == "/_authz/logout" and method == "POST" then
-        return handle_logout_post()
+
+    if uri == "/_authz/oauth/start" or uri == "/_authz/oauth/callback" then
+        if method ~= "GET" then
+            return html_response("<h1>405 Method Not Allowed</h1>", ngx.HTTP_NOT_ALLOWED)
+        end
+        if uri == "/_authz/oauth/start" then return handle_oauth_start() end
+        return handle_oauth_callback()
     end
 
-    -- 以下路由均需登录
-    local s, token = current_session()
-    if not s then
-        redirect("/_authz/login?next=" .. ngx.escape_uri(ngx.var.request_uri))
+    if not current_session() then
+        return redirect("/_authz/login?next=" .. ngx.escape_uri(ngx.var.request_uri))
     end
 
-    if uri == "/_authz/" then
-        if method ~= "GET" then return deny("Method Not Allowed", 405) end
-        return handle_dashboard()
+    if uri == "/_authz" or uri == "/_authz/" or
+        uri == "/_authz/users" or uri == "/_authz/authorization" then
+        return redirect("/_radmin_/")
     end
 
-    -- 写操作: 统一 CSRF 校验
-    if method == "POST" then
-        local args_ok = false
-        ngx.req.read_body()
-        local args = ngx.req.get_post_args() or {}
-        if args._csrf and args._csrf == s.csrf then args_ok = true end
-        if not args_ok then return deny("CSRF 校验失败", 403) end
-
-        if uri == "/_authz/bindings/save" then return handle_bindings_save(s) end
-        if uri == "/_authz/policies/save" then return handle_policies_save(s) end
-        if uri == "/_authz/users/save" then return handle_users_save(s) end
-        if uri == "/_authz/password" then return handle_password(s, token) end
+    if uri == "/_authz/session" or uri == "/_authz/logout" or
+        uri == "/_authz/password" or uri:sub(1, 12) == "/_authz/api/" or
+        uri:sub(-5) == "/save" then
+        return retired_endpoint()
     end
 
-    return deny("Not Found", 404)
+    return html_response("<h1>404 Not Found</h1>", ngx.HTTP_NOT_FOUND)
 end
 
 return _M

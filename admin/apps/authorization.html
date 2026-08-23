@@ -1,0 +1,294 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Admin</title>
+  <link rel="stylesheet" href="../vendor/quasar-umd.css?v=3.5.41-2.26.0-2">
+  <link rel="stylesheet" href="../app-page.css?v=5">
+</head>
+<body>
+  <div id="q-app">
+    <main class="workspace-page">
+      <header class="page-heading">
+        <div><h1>{{ t.title }}</h1><p>{{ t.description }}</p></div>
+        <div v-if="isAdmin" class="heading-actions"><q-btn outline no-caps icon="mdi-lan-connect" :label="t.addBinding" class="secondary-button" @click="bindingOpen = true"></q-btn><q-btn unelevated no-caps icon="mdi-shield-plus-outline" :label="t.addPolicy" class="primary-button" @click="openPolicyDialog"></q-btn></div>
+      </header>
+
+      <q-banner v-if="error" rounded class="error-banner q-mb-lg"><template v-slot:avatar><q-icon name="mdi-alert-circle-outline"></q-icon></template>{{ error }}<template v-slot:action><q-btn flat dense no-caps :label="t.retry" @click="load"></q-btn></template></q-banner>
+
+      <section class="stat-grid">
+        <q-card flat class="stat-card"><q-card-section><q-icon name="mdi-web" class="stat-icon purple"></q-icon><div class="stat-label">{{ t.bindings }}</div><div class="stat-value">{{ bindings.length }}</div><div class="stat-note">{{ t.bindingsNote }}</div></q-card-section></q-card>
+        <q-card flat class="stat-card"><q-card-section><q-icon name="mdi-shield-check-outline" class="stat-icon teal"></q-icon><div class="stat-label">{{ t.allowPolicies }}</div><div class="stat-value">{{ allowCount }}</div><div class="stat-note">{{ t.allowNote }}</div></q-card-section></q-card>
+        <q-card flat class="stat-card"><q-card-section><q-icon name="mdi-shield-off-outline" class="stat-icon red"></q-icon><div class="stat-label">{{ t.denyPolicies }}</div><div class="stat-value">{{ denyCount }}</div><div class="stat-note">{{ t.denyNote }}</div></q-card-section></q-card>
+      </section>
+
+      <q-card flat class="surface-card q-mt-lg">
+        <q-card-section class="surface-heading"><div><div class="surface-title">{{ t.routesTitle }}</div><div class="surface-subtitle">{{ t.routesCopy }} · {{ portMin }}–{{ portMax }}</div></div><q-badge outline color="blue-3" :label="`${bindings.length} ${t.routeCount}`"></q-badge></q-card-section>
+        <q-separator dark></q-separator>
+        <q-table flat dark :rows="bindings" :columns="bindingColumns" row-key="id" :loading="loading" :rows-per-page-options="[8, 16, 0]" class="linear-table">
+          <template v-slot:body-cell-domain="props"><q-td :props="props"><div class="route-cell"><q-icon name="mdi-earth" size="18px"></q-icon><strong>{{ props.row.domain }}</strong></div></q-td></template>
+          <template v-slot:body-cell-port="props"><q-td :props="props"><code class="code-pill">:{{ props.row.port }}</code></q-td></template>
+          <template v-slot:body-cell-enabled="props"><q-td :props="props"><q-toggle :model-value="props.row.enabled === 1" color="teal-4" :disable="!isAdmin" @update:model-value="toggleBinding(props.row)"></q-toggle></q-td></template>
+          <template v-slot:body-cell-actions="props"><q-td :props="props"><q-btn v-if="isAdmin" flat round dense icon="mdi-trash-can-outline" color="red-4" @click="removeBinding(props.row)"><q-tooltip>{{ t.deleteBinding }}</q-tooltip></q-btn></q-td></template>
+          <template v-slot:no-data><div class="full-width row flex-center q-pa-xl empty-state"><q-icon name="mdi-lan-disconnect" size="28px"></q-icon><span>{{ t.noBindings }}</span></div></template>
+        </q-table>
+      </q-card>
+
+      <q-card flat class="surface-card q-mt-lg">
+        <q-card-section class="surface-heading"><div><div class="surface-title">{{ t.policiesTitle }}</div><div class="surface-subtitle">{{ t.policiesCopy }}</div></div><q-input v-model="policyFilter" dense outlined dark debounce="250" :placeholder="t.search" class="search-input"><template v-slot:prepend><q-icon name="mdi-magnify"></q-icon></template></q-input></q-card-section>
+        <q-separator dark></q-separator>
+        <q-table flat dark :rows="policies" :columns="policyColumns" row-key="id" :filter="policyFilter" :loading="loading" :rows-per-page-options="[10, 20, 0]" class="linear-table">
+          <template v-slot:body-cell-ptype="props"><q-td :props="props"><q-badge :color="props.row.ptype === 'p' ? 'deep-purple-4' : 'blue-5'" :label="props.row.ptype.toUpperCase()"></q-badge></q-td></template>
+          <template v-slot:body-cell-v0="props"><q-td :props="props"><code class="code-pill">{{ props.row.subject_label }}</code><q-tooltip>{{ props.row.v0 }}</q-tooltip></q-td></template>
+          <template v-slot:body-cell-v1="props"><q-td :props="props"><code class="code-pill">{{ props.row.v1 }}</code></q-td></template>
+          <template v-slot:body-cell-action="props"><q-td :props="props"><q-chip v-for="method in actionList(props.row.action)" :key="method" dense class="role-chip">{{ method }}</q-chip></q-td></template>
+          <template v-slot:body-cell-effect="props"><q-td :props="props"><q-chip dense :class="props.row.effect === 'deny' ? 'effect-deny' : 'effect-allow'" :icon="props.row.effect === 'deny' ? 'mdi-close-circle-outline' : 'mdi-check-circle-outline'">{{ props.row.ptype === 'g' ? t.assigned : (props.row.effect === 'deny' ? t.deny : t.allow) }}</q-chip></q-td></template>
+          <template v-slot:body-cell-actions="props"><q-td :props="props"><q-btn v-if="isAdmin" flat round dense icon="mdi-trash-can-outline" color="red-4" @click="removePolicy(props.row)"><q-tooltip>{{ t.deletePolicy }}</q-tooltip></q-btn></q-td></template>
+        </q-table>
+      </q-card>
+
+      <q-dialog v-model="bindingOpen"><q-card class="dialog-card"><q-form @submit="createBinding"><q-card-section><div class="dialog-title">{{ t.bindingTitle }}</div><div class="dialog-copy">{{ t.bindingCopy }}</div></q-card-section><q-card-section class="dialog-fields"><q-input v-model="bindingForm.domain" dark outlined :label="t.domain" :placeholder="t.domainPlaceholder" :rules="[required]"></q-input><q-input v-model.number="bindingForm.port" dark outlined type="number" :label="t.port" :min="portMin" :max="portMax" :rules="[required]"></q-input><q-input v-model="bindingForm.note" dark outlined :label="t.note"></q-input><q-toggle v-model="bindingForm.enabled" color="teal-4" :label="t.enabledNow"></q-toggle></q-card-section><q-card-actions align="right"><q-btn flat no-caps :label="t.cancel" v-close-popup></q-btn><q-btn unelevated no-caps type="submit" :label="t.createBinding" class="primary-button" :loading="saving"></q-btn></q-card-actions></q-form></q-card></q-dialog>
+
+      <q-dialog v-model="policyOpen">
+        <q-card class="dialog-card">
+          <q-form @submit="createPolicy">
+            <q-card-section><div class="dialog-title">{{ t.policyTitle }}</div><div class="dialog-copy">{{ t.policyCopy }}</div></q-card-section>
+            <q-card-section class="dialog-fields">
+              <q-select v-model="policyForm.ptype" dark outlined emit-value map-options :options="policyTypes" :label="t.policyType" @update:model-value="resetPolicyFields"></q-select>
+              <q-select v-if="policyForm.ptype === 'p'" v-model="policyForm.v0" dark outlined emit-value map-options :options="policySubjectOptions" :label="t.subject" :hint="t.subjectHint" :rules="[required]"></q-select>
+              <q-select v-else v-model="policyForm.v0" dark outlined emit-value map-options :options="policyUserOptions" :label="t.user" :hint="t.userHint" :rules="[required]"></q-select>
+              <q-select v-if="policyForm.ptype === 'p'" v-model="policyForm.v1" dark outlined use-input emit-value map-options new-value-mode="add-unique" :options="policyObjectOptions" :label="t.object" :hint="t.objectHint" :rules="[required]"></q-select>
+              <q-select v-else v-model="policyForm.v1" dark outlined emit-value map-options :options="policyRoleOptions" :label="t.role" :hint="t.roleHint" :rules="[required]"></q-select>
+              <q-select v-if="policyForm.ptype === 'p'" :model-value="policyForm.v2" dark outlined multiple use-chips emit-value map-options :options="httpActions" :label="t.httpAction" :hint="t.httpActionHint" :rules="[required]" @update:model-value="setPolicyMethods"></q-select>
+              <q-select v-if="policyForm.ptype === 'p'" v-model="policyForm.eft" dark outlined emit-value map-options :options="effects" :label="t.effect"></q-select>
+            </q-card-section>
+            <q-card-actions align="right"><q-btn flat no-caps :label="t.cancel" v-close-popup></q-btn><q-btn unelevated no-caps type="submit" :label="t.createPolicy" class="primary-button" :loading="saving"></q-btn></q-card-actions>
+          </q-form>
+        </q-card>
+      </q-dialog>
+    </main>
+  </div>
+  <script src="../vendor/quasar-umd.js?v=3.5.41-2.26.0-2"></script>
+  <script src="../api.js?v=7"></script>
+  <script src="../i18n.js?v=11"></script>
+  <script>
+    const { createApp, computed, onBeforeUnmount, onMounted, reactive, ref } = Vue
+    
+    const app = createApp({
+      setup () {
+      const bindings = ref([])
+      const policies = ref([])
+      const policyUsers = ref([])
+      const policyRoles = ref(['admin', 'staff', 'user', 'viewer'])
+      const policyMethods = ref(['*', 'GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'CONNECT', 'TRACE'])
+      const locale = ref(window.adminI18n.getLocale())
+      const t = computed(() => window.adminI18n.messages[locale.value].authorization)
+      let unsubscribeLocale
+        const csrf = ref('')
+        const isAdmin = ref(false)
+        const loading = ref(false)
+        const saving = ref(false)
+        const error = ref('')
+        const policyFilter = ref('')
+        const bindingOpen = ref(false)
+        const policyOpen = ref(false)
+        const portMin = ref(2000)
+        const portMax = ref(20000)
+        const bindingForm = reactive({ domain: '', port: 3000, note: '', enabled: true })
+        const policyForm = reactive({ ptype: 'p', v0: 'role:user', v1: '/*', v2: ['*'], eft: 'allow' })
+      const policyTypes = computed(() => [
+        { label: `p · ${t.value.policyRule}`, value: 'p' },
+        { label: `g · ${t.value.roleAssignment}`, value: 'g' }
+      ])
+      const effects = computed(() => [
+        { label: t.value.allow, value: 'allow' },
+        { label: t.value.deny, value: 'deny' }
+      ])
+      const policyUserOptions = computed(() => policyUsers.value.map(user => ({
+        label: `${user.username} · ${sourceLabel(user.source)}`,
+        value: user.identity
+      })))
+      const policyRoleOptions = computed(() => policyRoles.value.map(role => ({ label: role, value: `role:${role}` })))
+      const policySubjectOptions = computed(() => [
+        ...policyRoleOptions.value.map(option => ({ label: `${t.value.role} · ${option.label}`, value: option.value })),
+        ...policyUserOptions.value.map(option => ({ label: `${t.value.user} · ${option.label}`, value: option.value }))
+      ])
+      const policyObjectOptions = computed(() => {
+        const options = [{ label: t.value.allObjects, value: '/*' }]
+        const seen = new Set(['/*'])
+        bindings.value.forEach(binding => {
+          const value = `/${binding.port}/*`
+          if (!seen.has(value)) {
+            seen.add(value)
+            options.push({ label: `${binding.domain} → ${value}`, value })
+          }
+        })
+        policies.value.filter(policy => policy.ptype === 'p').forEach(policy => {
+          if (policy.v1 && !seen.has(policy.v1)) {
+            seen.add(policy.v1)
+            options.push({ label: policy.v1, value: policy.v1 })
+          }
+        })
+        return options
+      })
+      const httpActions = computed(() => policyMethods.value
+        .map(value => ({ label: value === '*' ? t.value.allActions : value, value })))
+
+      function actionList (value) {
+        return String(value || '-').split(',').filter(Boolean)
+      }
+
+      function sourceLabel (source) {
+        if (!source) return ''
+        return source === 'local' ? t.value.local : source === 'nocobase' ? 'NocoBase' : source === 'google' ? 'Google' : source === 'dingtalk' ? t.value.dingtalk : source === 'wechat' ? t.value.wechat : source
+      }
+
+      function setPolicyMethods (values) {
+        const nextValues = Array.isArray(values) ? values : []
+        if (nextValues.includes('*') && nextValues.length > 1) {
+          policyForm.v2 = policyForm.v2.includes('*') ? nextValues.filter(value => value !== '*') : ['*']
+          return
+        }
+        policyForm.v2 = nextValues
+      }
+      const bindingColumns = computed(() => [
+        { name: 'domain', label: t.value.domain, field: 'domain', align: 'left', sortable: true },
+        { name: 'port', label: t.value.port, field: 'port', align: 'left', sortable: true },
+        { name: 'enabled', label: t.value.status, field: 'enabled', align: 'left', sortable: true },
+        { name: 'note', label: t.value.note, field: 'note', align: 'left' },
+        { name: 'actions', label: '', field: 'actions', align: 'right' }
+      ])
+      const policyColumns = computed(() => [
+        { name: 'ptype', label: t.value.type, field: 'ptype', align: 'left', sortable: true },
+        { name: 'v0', label: t.value.subject, field: 'subject_label', align: 'left', sortable: true },
+        { name: 'v1', label: t.value.objectRole, field: 'v1', align: 'left', sortable: true },
+        { name: 'action', label: t.value.action, field: 'action', align: 'left' },
+        { name: 'effect', label: t.value.effect, field: 'effect', align: 'left', sortable: true },
+        { name: 'actions', label: '', field: 'actions', align: 'right' }
+      ])
+    
+        const allowCount = computed(() => policies.value.filter(policy => policy.effect !== 'deny').length)
+        const denyCount = computed(() => policies.value.filter(policy => policy.effect === 'deny').length)
+    
+      function required (value) {
+        if (Array.isArray(value)) return value.length > 0 || t.value.required
+        return value !== '' && value !== null && value !== undefined || t.value.required
+        }
+    
+        function notify (message, type = 'positive') {
+          Quasar.Notify.create({ message, type, position: 'top-right', timeout: 2200 })
+        }
+    
+        async function load () {
+          loading.value = true
+          error.value = ''
+          try {
+            const data = await window.adminApi.authorization()
+            bindings.value = data.bindings || []
+            policies.value = data.policies || []
+            policyUsers.value = data.policy_users || []
+            policyRoles.value = data.policy_roles || ['admin', 'staff', 'user', 'viewer']
+            policyMethods.value = data.http_methods || ['*', 'GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'CONNECT', 'TRACE']
+            csrf.value = data.csrf || ''
+            isAdmin.value = Boolean(data.admin)
+            portMin.value = data.port_min || 2000
+            portMax.value = data.port_max || 20000
+          } catch (loadError) {
+            error.value = loadError.message
+          } finally {
+            loading.value = false
+          }
+        }
+    
+        async function mutate (action, successMessage) {
+          saving.value = true
+          try {
+            await action()
+            notify(successMessage)
+            await load()
+            return true
+          } catch (mutationError) {
+            notify(mutationError.message, 'negative')
+            return false
+          } finally {
+            saving.value = false
+          }
+        }
+    
+        async function createBinding () {
+        const ok = await mutate(() => window.adminApi.saveBinding({ _csrf: csrf.value, action: 'create', ...bindingForm }), t.value.bindingCreated)
+          if (ok) {
+            bindingOpen.value = false
+            Object.assign(bindingForm, { domain: '', port: 3000, note: '', enabled: true })
+          }
+        }
+    
+        function toggleBinding (binding) {
+        mutate(() => window.adminApi.saveBinding({ _csrf: csrf.value, action: 'toggle', id: binding.id, enabled: binding.enabled !== 1 }), binding.enabled === 1 ? t.value.bindingDisabled : t.value.bindingEnabled)
+        }
+    
+        function removeBinding (binding) {
+        Quasar.Dialog.create({ title: t.value.deleteBindingTitle, message: `${binding.domain} → :${binding.port} · ${t.value.deleteBindingConfirm}`, cancel: true, persistent: true, ok: { label: t.value.deleteAction, color: 'negative', flat: true } })
+          .onOk(() => mutate(() => window.adminApi.saveBinding({ _csrf: csrf.value, action: 'delete', id: binding.id }), t.value.bindingDeleted))
+        }
+    
+        async function createPolicy () {
+          const values = { _csrf: csrf.value, action: 'add', ...policyForm }
+        const ok = await mutate(() => window.adminApi.savePolicy(values), t.value.policyCreated)
+          if (ok) {
+            policyOpen.value = false
+            resetPolicyFields('p')
+          }
+        }
+
+        function resetPolicyFields (ptype) {
+          policyForm.ptype = ptype
+          policyForm.v2 = ['*']
+          policyForm.eft = 'allow'
+          if (ptype === 'g') {
+            policyForm.v0 = policyUserOptions.value[0]?.value || ''
+            policyForm.v1 = policyRoleOptions.value[0]?.value || ''
+            return
+          }
+          policyForm.v0 = policyRoleOptions.value.find(option => option.value === 'role:user')?.value || policyRoleOptions.value[0]?.value || policyUserOptions.value[0]?.value || ''
+          policyForm.v1 = '/*'
+        }
+
+        function openPolicyDialog () {
+          resetPolicyFields('p')
+          policyOpen.value = true
+        }
+    
+        function removePolicy (policy) {
+        Quasar.Dialog.create({ title: t.value.deletePolicyTitle, message: `${policy.v0} → ${policy.v1} · ${t.value.deletePolicyConfirm}`, cancel: true, persistent: true, ok: { label: t.value.deleteAction, color: 'negative', flat: true } })
+          .onOk(() => mutate(() => window.adminApi.savePolicy({ _csrf: csrf.value, action: 'del', id: policy.id }), t.value.policyDeleted))
+        }
+    
+      function applyLocale (nextLocale) {
+        locale.value = nextLocale
+        document.documentElement.lang = nextLocale
+        document.title = t.value.title
+        Quasar.Lang.set(nextLocale === 'zh-CN' ? Quasar.Lang.zhCN : Quasar.Lang.enUS)
+      }
+
+      onMounted(() => {
+        applyLocale(locale.value)
+        unsubscribeLocale = window.adminI18n.subscribe(applyLocale)
+        load()
+      })
+
+      onBeforeUnmount(() => unsubscribeLocale?.())
+    
+      return { actionList, allowCount, bindingColumns, bindingForm, bindingOpen, bindings, createBinding, createPolicy, denyCount, effects, error, httpActions, isAdmin, load, loading, openPolicyDialog, policies, policyColumns, policyFilter, policyForm, policyObjectOptions, policyOpen, policyRoleOptions, policySubjectOptions, policyTypes, policyUserOptions, portMax, portMin, removeBinding, removePolicy, required, resetPolicyFields, saving, setPolicyMethods, sourceLabel, t, toggleBinding }
+      }
+    })
+    
+    app.use(Quasar, { config: { dark: true } })
+    Quasar.Dark.set(true)
+    Quasar.Lang.set(window.adminI18n.getLocale() === 'en-US' ? Quasar.Lang.enUS : Quasar.Lang.zhCN)
+    Quasar.IconSet.set(Quasar.IconSet.mdiV7)
+    app.mount('#q-app')
+  </script>
+</body>
+</html>

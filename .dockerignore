@@ -2,3 +2,12 @@
 .github
 *.md
 .dockerignore
+.codex
+test
+scripts
+data
+.env
+.env.*
+*.db
+*.log
+.docker-cache

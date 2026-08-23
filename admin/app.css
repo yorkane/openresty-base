@@ -1,0 +1,68 @@
+:root {
+  --shell-bg: #171928;
+  --sidebar-bg: #1d2033;
+  --page-bg: #191b2b;
+  --line: rgba(132, 137, 174, .16);
+}
+
+html,
+body,
+#q-app {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  background: var(--shell-bg);
+}
+
+body {
+  overflow: hidden;
+  color: #f4f5fb;
+  font-family: Roboto, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+.admin-layout {
+  width: 100%;
+  height: 100vh;
+  min-height: 100vh !important;
+  background: var(--shell-bg);
+}
+
+.admin-drawer {
+  overflow: hidden;
+  border: 0 !important;
+  background: var(--sidebar-bg);
+  box-shadow: none !important;
+}
+
+.admin-content {
+  min-width: 0;
+  height: 100vh;
+  overflow: hidden;
+  background: var(--page-bg);
+}
+
+.content-page {
+  width: 100%;
+  height: 100%;
+  min-height: 100% !important;
+  box-sizing: border-box;
+  padding: 8px 12px 12px 8px;
+  overflow: hidden;
+  background: var(--page-bg);
+}
+
+.app-frame {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border: 0 !important;
+  outline: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+@media (max-width: 760px) {
+  .content-page {
+    padding: 6px;
+  }
+}

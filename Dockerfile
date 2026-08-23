@@ -6,6 +6,7 @@
 #                              so resty.core ABI matches the master C modules)
 #   - nginx-dav-ext-module    (WebDAV PROPFIND/OPTIONS/LOCK/UNLOCK)
 #   - ngx-fancyindex          (fancy directory listing)
+#   - ngx_brotli               (Brotli dynamic and pre-compressed static responses)
 #
 # Reference: https://github.com/openresty/docker-openresty/blob/master/alpine/Dockerfile
 #            https://github.com/openresty/docker-openresty/blob/master/alpine/Dockerfile.fat
@@ -15,8 +16,29 @@
 # --------------------------------------------------------------------------
 ARG RESTY_IMAGE_BASE="alpine"
 ARG RESTY_IMAGE_TAG="3.23.5"
+ARG LUA_RESTY_HTTP_VERSION="0.18.0"
 
-FROM ${RESTY_IMAGE_BASE}:${RESTY_IMAGE_TAG}
+FROM ${RESTY_IMAGE_BASE}:${RESTY_IMAGE_TAG} AS lua-resty-http-source
+ARG LUA_RESTY_HTTP_VERSION
+RUN unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy \
+    && apk add --no-cache curl tar \
+    && mkdir -p /out \
+    && curl -fSL "https://github.com/ledgetech/lua-resty-http/archive/refs/tags/v${LUA_RESTY_HTTP_VERSION}.tar.gz" \
+        | tar -xz --strip-components=3 -C /out \
+            "lua-resty-http-${LUA_RESTY_HTTP_VERSION}/lib/resty/http.lua" \
+            "lua-resty-http-${LUA_RESTY_HTTP_VERSION}/lib/resty/http_connect.lua" \
+            "lua-resty-http-${LUA_RESTY_HTTP_VERSION}/lib/resty/http_headers.lua"
+
+# Keep the Brotli source and its git submodule in an independent layer. A
+# change to OpenResty configure flags can then reuse this download layer.
+FROM ${RESTY_IMAGE_BASE}:${RESTY_IMAGE_TAG} AS ngx-brotli-source
+ARG NGX_BROTLI_VERSION="master"
+RUN unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy \
+    && apk add --no-cache git \
+    && git clone --depth=1 --recurse-submodules --branch "${NGX_BROTLI_VERSION}" \
+        https://github.com/google/ngx_brotli.git /opt/ngx_brotli
+
+FROM ${RESTY_IMAGE_BASE}:${RESTY_IMAGE_TAG} AS openresty-builder
 
 # https://github.com/openresty/openresty-packaging/blob/master/alpine/openresty/APKBUILD
 ARG RESTY_VERSION="1.31.1.1"
@@ -25,7 +47,7 @@ ARG RESTY_VERSION="1.31.1.1"
 ARG RESTY_OPENSSL_VERSION="3.5.7"
 ARG RESTY_OPENSSL_PATCH_VERSION="3.5.5"
 ARG RESTY_OPENSSL_URL_BASE="https://github.com/openssl/openssl/releases/download/openssl-${RESTY_OPENSSL_VERSION}"
-ARG RESTY_OPENSSL_BUILD_OPTIONS="enable-camellia enable-seed enable-rfc3779 enable-cms enable-md2 enable-rc5 \
+ARG RESTY_OPENSSL_BUILD_OPTIONS="no-asm enable-camellia enable-seed enable-rfc3779 enable-cms enable-md2 enable-rc5 \
         enable-weak-ssl-ciphers enable-ssl3 enable-ssl3-method enable-md2 enable-ktls enable-fips \
         "
 
@@ -39,7 +61,8 @@ ARG RESTY_PCRE_BUILD_OPTIONS="--enable-jit --enable-pcre2grep-jit --disable-bsr-
     "
 
 ARG RESTY_LUAROCKS_VERSION="3.13.0"
-ARG RESTY_J="1"
+ARG RESTY_J="8"
+ARG NGX_BROTLI_VERSION="master"
 
 # Versions for extra modules (overridden by workflow to pin exact commits/tags)
 ARG LUA_NGINX_MODULE_VERSION="master"
@@ -47,8 +70,8 @@ ARG LUA_RESTY_CORE_VERSION="master"
 ARG NGX_FANCYINDEX_VERSION="master"
 ARG NGX_DAV_EXT_VERSION="master"
 
-# api7 fork of lua-resty-jwt (used by APISIX jwt-auth) - works with
-# OpenSSL 3.x via resty.openssl; no legacy HMAC_CTX_init dependency.
+# lua-resty-jwt implementation compatible with OpenSSL 3.x through
+# resty.openssl; no legacy HMAC_CTX_init dependency.
 ARG LUA_RESTY_JWT_VERSION="0.2.6"
 
 ARG RESTY_CONFIG_OPTIONS="\
@@ -104,6 +127,8 @@ ARG RESTY_EVAL_POST_MAKE=""
 # Strip debug symbols from binaries to reduce image size (set to "" to disable)
 ARG RESTY_STRIP_BINARIES="1"
 
+COPY --from=ngx-brotli-source /opt/ngx_brotli /opt/ngx_brotli
+
 # These are not intended to be user-specified.
 # PCRE2 and OpenSSL3 are pre-built into /usr/local/openresty/{pcre2,openssl3}
 # and pulled in via --with-cc-opt / --with-ld-opt rpath.
@@ -123,14 +148,18 @@ LABEL lua_resty_jwt_version="${LUA_RESTY_JWT_VERSION}"
 LABEL ngx_fancyindex_version="${NGX_FANCYINDEX_VERSION}"
 LABEL ngx_dav_ext_module_version="${NGX_DAV_EXT_VERSION}"
 
+# Runtime libraries are installed only in the final stage below. Keeping
+# them out of the builder keeps the shipped image independent of the toolchain.
 # --------------------------------------------------------------------------
 # Single RUN: install build deps → build PCRE2 → build OpenSSL →
 #             clone modules → compile OpenResty → install LuaRocks →
 #             extract envsubst → strip → cleanup
 # --------------------------------------------------------------------------
-RUN apk add --no-cache --virtual .build-deps \
+RUN unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy \
+    && apk add --no-cache --virtual .build-deps \
         build-base \
         binutils \
+        cmake \
         coreutils \
         curl \
         gd-dev \
@@ -142,20 +171,10 @@ RUN apk add --no-cache --virtual .build-deps \
         perl-dev \
         readline-dev \
         zlib-dev \
-        ${RESTY_ADD_PACKAGE_BUILDDEPS} \
-    # Runtime libs that must survive after .build-deps removal
-    && apk add --no-cache \
-        gd \
-        geoip \
-        libgcc \
-        libintl \
-        libxslt \
-        libxml2 \
-        tzdata \
-        zlib \
-        ${RESTY_ADD_PACKAGE_RUNDEPS} \
-    \
-    # ── Build PCRE2 (shared, installed under openresty prefix) ────────────
+        ${RESTY_ADD_PACKAGE_BUILDDEPS}
+
+# ── Build PCRE2 (shared, installed under openresty prefix) ────────────
+RUN unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy \
     && cd /tmp \
     && curl -fSL "https://github.com/PCRE2Project/pcre2/releases/download/pcre2-${RESTY_PCRE_VERSION}/pcre2-${RESTY_PCRE_VERSION}.tar.gz" \
             -o "pcre2-${RESTY_PCRE_VERSION}.tar.gz" \
@@ -186,8 +205,12 @@ RUN apk add --no-cache --virtual .build-deps \
         --libdir=lib \
         -Wl,-rpath,/usr/local/openresty/openssl3/lib \
         ${RESTY_OPENSSL_BUILD_OPTIONS} \
-    && make -j${RESTY_J} \
-    && make -j${RESTY_J} install_sw \
+    # OpenSSL's default target also compiles hundreds of test binaries; the
+    # runtime only needs the software libraries and CLI.
+    && make -j${RESTY_J} build_libs build_modules apps/openssl \
+    && make install_dev install_engines install_modules \
+    && mkdir -p /usr/local/openresty/openssl3/bin \
+    && cp apps/openssl /usr/local/openresty/openssl3/bin/openssl \
     && cd /tmp \
     && rm -rf "openssl-${RESTY_OPENSSL_VERSION}" "openssl-${RESTY_OPENSSL_VERSION}.tar.gz" \
     \
@@ -213,6 +236,7 @@ RUN apk add --no-cache --virtual .build-deps \
     && git clone --depth=1 --branch "${NGX_FANCYINDEX_VERSION}" \
             https://github.com/aperezdc/ngx-fancyindex.git \
             /tmp/ngx-fancyindex \
+    && cp -a /opt/ngx_brotli /tmp/ngx_brotli \
     \
     # ── Download & build OpenResty ────────────────────────────────────────
     && if [ -n "${RESTY_EVAL_PRE_CONFIGURE}" ]; then eval $(echo ${RESTY_EVAL_PRE_CONFIGURE}); fi \
@@ -243,6 +267,14 @@ RUN apk add --no-cache --virtual .build-deps \
          rm -rf "${BUNDLED_LUA_RESTY_CORE}"; \
          cp -r  /tmp/lua-resty-core "${BUNDLED_LUA_RESTY_CORE}"; \
        fi \
+    # Build the Brotli encoder library consumed by ngx_brotli's filter module.
+    && cd /tmp/ngx_brotli/deps/brotli \
+    && cmake -S . -B out \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DCMAKE_C_FLAGS="-O3" \
+        -DCMAKE_CXX_FLAGS="-O3" \
+    && cmake --build out --config Release --target brotlienc -j${RESTY_J} \
     && cd "/tmp/openresty-${RESTY_VERSION}" \
     && if [ -n "${RESTY_EVAL_POST_DOWNLOAD_PRE_CONFIGURE}" ]; then eval $(echo ${RESTY_EVAL_POST_DOWNLOAD_PRE_CONFIGURE}); fi \
     && eval ./configure -j${RESTY_J} \
@@ -253,11 +285,12 @@ RUN apk add --no-cache --virtual .build-deps \
         ${RESTY_PCRE_OPTIONS} \
         --add-module=/tmp/nginx-dav-ext-module \
         --add-module=/tmp/ngx-fancyindex \
+        --add-module=/tmp/ngx_brotli \
     && if [ -n "${RESTY_EVAL_PRE_MAKE}" ]; then eval $(echo ${RESTY_EVAL_PRE_MAKE}); fi \
     && make -j${RESTY_J} \
     && make install \
     \
-    # ── Fetch lua-resty-jwt (api7 fork, APISIX jwt-auth compatible) ───
+    # ── Fetch lua-resty-jwt ──────────────────────────────────────────
     # NOTE: must run AFTER `make install` because /usr/local/openresty/lualib
     # does not exist before OpenResty is installed.
     && curl -fSL "https://codeload.github.com/api7/lua-resty-jwt/tar.gz/refs/tags/v${LUA_RESTY_JWT_VERSION}" \
@@ -318,6 +351,8 @@ RUN apk add --no-cache --virtual .build-deps \
         /tmp/lua-resty-core \
         /tmp/nginx-dav-ext-module \
         /tmp/ngx-fancyindex \
+        /tmp/ngx_brotli \
+        /opt/ngx_brotli \
     \
     # ── Remove build toolchain ────────────────────────────────────────────
     && apk del .build-deps .gettext \
@@ -329,6 +364,31 @@ RUN apk add --no-cache --virtual .build-deps \
     && ln -sf /dev/stderr /usr/local/openresty/nginx/logs/error.log
 
 # --------------------------------------------------------------------------
+# Runtime stage: keep only OpenResty, runtime libraries and application files.
+# --------------------------------------------------------------------------
+ARG RESTY_IMAGE_BASE="alpine"
+ARG RESTY_IMAGE_TAG="3.23.5"
+FROM ${RESTY_IMAGE_BASE}:${RESTY_IMAGE_TAG}
+ARG RESTY_ADD_PACKAGE_RUNDEPS="sqlite-libs"
+
+COPY --from=openresty-builder /usr/local/openresty /usr/local/openresty
+COPY --from=openresty-builder /usr/local/bin/envsubst /usr/local/bin/envsubst
+
+RUN unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy \
+    && apk add --no-cache \
+        ca-certificates \
+        gd \
+        geoip \
+        libgcc \
+        libintl \
+        libxslt \
+        libxml2 \
+        tzdata \
+        zlib \
+        ${RESTY_ADD_PACKAGE_RUNDEPS} \
+    && mkdir -p /var/run/openresty
+
+# --------------------------------------------------------------------------
 # Runtime environment
 # --------------------------------------------------------------------------
 ENV PATH="/usr/local/openresty/luajit/bin:/usr/local/openresty/nginx/sbin:/usr/local/openresty/bin:${PATH}"
@@ -337,15 +397,21 @@ ENV LUA_PATH="/usr/local/openresty/site/lualib/?.ljbc;/usr/local/openresty/site/
 
 ENV LUA_CPATH="/usr/local/openresty/site/lualib/?.so;/usr/local/openresty/lualib/?.so;./?.so;/usr/local/lib/lua/5.1/?.so;/usr/local/openresty/luajit/lib/lua/5.1/?.so;/usr/local/lib/lua/5.1/loadall.so;/usr/local/openresty/luajit/lib/lua/5.1/?.so"
 
-# ── JWT / SSO 公共库 ────────────────────────────────────────────────
-# 覆盖注入本项目维护的 resty.hmac 适配器（基于捆绑 resty.openssl.hmac）
-# 和 resty.noco_auth（对接 APISIX noco_sso_auth 的 sso_ck / noco_uid Cookie）
-COPY lualib/resty/hmac.lua /usr/local/openresty/lualib/resty/hmac.lua
-COPY lualib/resty/noco_auth.lua /usr/local/openresty/lualib/resty/noco_auth.lua
+COPY --from=lua-resty-http-source /out/ /usr/local/openresty/lualib/resty/
 
-# ── Authz Gateway (动态端口代理 + 本地认证) ────────────────────────
-# resty.authz: SQLite 用户/会话/策略/域名绑定 + mini-casbin + 管理界面
-COPY lualib/resty/authz/ /usr/local/openresty/lualib/resty/authz/
+# ── 项目 Lua 库 ─────────────────────────────────────────────────────
+# 整体复制到 site/lualib，和开发时只读挂载目录保持完全一致；同时不遮蔽
+# OpenResty 自带的 /usr/local/openresty/lualib 模块。
+COPY lualib/ /usr/local/openresty/site/lualib/
+# 静态 SSI 管理界面
+COPY admin/ /usr/local/openresty/nginx/html/admin/
+
+# Generate Brotli sidecars at image build time. Because this step follows
+# COPY admin, changing a frontend asset invalidates only this small layer.
+RUN apk add --no-cache --virtual .brotli-tools brotli \
+    && find /usr/local/openresty/nginx/html/admin -type f ! -name '*.br' \
+        -exec sh -c 'brotli -f -q 11 "$1" -o "$1.br"' _ {} \; \
+    && apk del .brotli-tools
 # 网关 nginx 配置模板 (entrypoint envsubst 渲染为 nginx.conf)
 COPY conf/nginx.conf.template /usr/local/openresty/nginx/conf/nginx.conf.template
 COPY conf/openssl.cnf /usr/local/openresty/nginx/conf/openssl.cnf

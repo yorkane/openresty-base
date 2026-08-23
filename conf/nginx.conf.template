@@ -18,10 +18,46 @@ http {
     sendfile      on;
     keepalive_timeout 65;
 
+    # Default response compression. Static files with a sibling .br file use
+    # Brotli directly; other responses fall back to dynamic Brotli/Gzip.
+    brotli on;
+    brotli_comp_level 5;
+    brotli_static on;
+    brotli_types
+        application/javascript
+        application/json
+        application/manifest+json
+        application/xml
+        image/svg+xml
+        text/css
+        text/javascript
+        text/plain
+        text/xml;
+    gzip on;
+    gzip_comp_level 5;
+    gzip_vary on;
+    gzip_min_length 256;
+    gzip_types
+        application/javascript
+        application/json
+        application/manifest+json
+        application/xml
+        image/svg+xml
+        text/css
+        text/javascript
+        text/plain
+        text/xml;
+
     # resty.authz 库路径 (LUA_PATH 已含, 此处显式兜底)
-    lua_package_path "/usr/local/openresty/lualib/?.lua;/usr/local/openresty/lualib/?/init.lua;;";
+    lua_package_path "/usr/local/openresty/site/lualib/?.lua;/usr/local/openresty/site/lualib/?/init.lua;/usr/local/openresty/lualib/?.lua;/usr/local/openresty/lualib/?/init.lua;;";
 
     lua_shared_dict authz_cache 5m;
+    lua_shared_dict authz_login_limit 1m;
+    lua_shared_dict authz_oauth_state 5m;
+    resolver ${DNS_RESOLVER} ipv6=off valid=300s;
+    resolver_timeout 5s;
+    lua_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
+    lua_ssl_verify_depth 5;
 
     init_by_lua_block {
         require("resty.authz").init()
@@ -44,9 +80,95 @@ http {
             }
         }
 
+        location ^~ /_api_/ {
+            content_by_lua_block {
+                require("resty.authz.api.router"):handle()
+            }
+        }
+
+        location = /_radmin_ {
+            return 301 /_radmin_/;
+        }
+
+        location = /_radmin_/ {
+            alias /usr/local/openresty/nginx/html/admin/;
+            index index.html;
+            default_type text/html;
+            ssi on;
+            gzip on;
+            gzip_comp_level 7;
+            gzip_vary on;
+            gzip_min_length 256;
+            expires off;
+            add_header Cache-Control "no-store" always;
+            access_by_lua_block {
+                local authz = require "resty.authz"
+                require("resty.authz.db").open(authz.config.db_path)
+                local session = require "resty.authz.session"
+                local token = session.get_request_token()
+                local current = token and session.get(token)
+                if not current then
+                    return ngx.redirect("/_authz/login?next=" .. ngx.escape_uri(ngx.var.request_uri))
+                end
+            }
+        }
+
+        location = /_radmin_/index.html {
+            alias /usr/local/openresty/nginx/html/admin/index.html;
+            default_type text/html;
+            ssi on;
+            gzip on;
+            gzip_comp_level 7;
+            gzip_vary on;
+            gzip_min_length 256;
+            expires off;
+            add_header Cache-Control "no-store" always;
+            access_by_lua_block {
+                local authz = require "resty.authz"
+                require("resty.authz.db").open(authz.config.db_path)
+                local session = require "resty.authz.session"
+                local token = session.get_request_token()
+                local current = token and session.get(token)
+                if not current then
+                    return ngx.redirect("/_authz/login?next=" .. ngx.escape_uri(ngx.var.request_uri))
+                end
+            }
+        }
+
+        location ^~ /_radmin_/ {
+            alias /usr/local/openresty/nginx/html/admin/;
+            index index.html;
+            gzip on;
+            gzip_comp_level 7;
+            gzip_vary on;
+            gzip_min_length 256;
+            gzip_types
+                application/javascript
+                application/json
+                application/manifest+json
+                application/xml
+                image/svg+xml
+                text/css
+                text/plain
+                text/xml;
+            expires max;
+            access_by_lua_block {
+                local authz = require "resty.authz"
+                require("resty.authz.db").open(authz.config.db_path)
+                local session = require "resty.authz.session"
+                local token = session.get_request_token()
+                local current = token and session.get(token)
+                if not current then
+                    return ngx.redirect("/_authz/login?next=" .. ngx.escape_uri(ngx.var.request_uri))
+                end
+            }
+        }
+
         location / {
             set $authz_target "";
             set $authz_user   "";
+            set $authz_source "";
+            set $authz_identity "";
             access_by_lua_block {
                 require("resty.authz").access()
             }
@@ -57,6 +179,8 @@ http {
             proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
             proxy_set_header X-Forwarded-Proto $scheme;
             proxy_set_header X-Authz-User      $authz_user;
+            proxy_set_header X-Authz-Source    $authz_source;
+            proxy_set_header X-Authz-Identity  $authz_identity;
             proxy_set_header Upgrade           $http_upgrade;
             proxy_set_header Connection        $connection_upgrade;
         }
@@ -78,9 +202,95 @@ http {
             }
         }
 
+        location ^~ /_api_/ {
+            content_by_lua_block {
+                require("resty.authz.api.router"):handle()
+            }
+        }
+
+        location = /_radmin_ {
+            return 301 /_radmin_/;
+        }
+
+        location = /_radmin_/ {
+            alias /usr/local/openresty/nginx/html/admin/;
+            index index.html;
+            default_type text/html;
+            ssi on;
+            gzip on;
+            gzip_comp_level 7;
+            gzip_vary on;
+            gzip_min_length 256;
+            expires off;
+            add_header Cache-Control "no-store" always;
+            access_by_lua_block {
+                local authz = require "resty.authz"
+                require("resty.authz.db").open(authz.config.db_path)
+                local session = require "resty.authz.session"
+                local token = session.get_request_token()
+                local current = token and session.get(token)
+                if not current then
+                    return ngx.redirect("/_authz/login?next=" .. ngx.escape_uri(ngx.var.request_uri))
+                end
+            }
+        }
+
+        location = /_radmin_/index.html {
+            alias /usr/local/openresty/nginx/html/admin/index.html;
+            default_type text/html;
+            ssi on;
+            gzip on;
+            gzip_comp_level 7;
+            gzip_vary on;
+            gzip_min_length 256;
+            expires off;
+            add_header Cache-Control "no-store" always;
+            access_by_lua_block {
+                local authz = require "resty.authz"
+                require("resty.authz.db").open(authz.config.db_path)
+                local session = require "resty.authz.session"
+                local token = session.get_request_token()
+                local current = token and session.get(token)
+                if not current then
+                    return ngx.redirect("/_authz/login?next=" .. ngx.escape_uri(ngx.var.request_uri))
+                end
+            }
+        }
+
+        location ^~ /_radmin_/ {
+            alias /usr/local/openresty/nginx/html/admin/;
+            index index.html;
+            gzip on;
+            gzip_comp_level 7;
+            gzip_vary on;
+            gzip_min_length 256;
+            gzip_types
+                application/javascript
+                application/json
+                application/manifest+json
+                application/xml
+                image/svg+xml
+                text/css
+                text/plain
+                text/xml;
+            expires max;
+            access_by_lua_block {
+                local authz = require "resty.authz"
+                require("resty.authz.db").open(authz.config.db_path)
+                local session = require "resty.authz.session"
+                local token = session.get_request_token()
+                local current = token and session.get(token)
+                if not current then
+                    return ngx.redirect("/_authz/login?next=" .. ngx.escape_uri(ngx.var.request_uri))
+                end
+            }
+        }
+
         location / {
             set $authz_target "";
             set $authz_user   "";
+            set $authz_source "";
+            set $authz_identity "";
             access_by_lua_block {
                 require("resty.authz").access()
             }
@@ -94,6 +304,8 @@ http {
             proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
             proxy_set_header X-Forwarded-Proto $scheme;
             proxy_set_header X-Authz-User      $authz_user;
+            proxy_set_header X-Authz-Source    $authz_source;
+            proxy_set_header X-Authz-Identity  $authz_identity;
             proxy_set_header Upgrade           $http_upgrade;
             proxy_set_header Connection        $connection_upgrade;
         }
