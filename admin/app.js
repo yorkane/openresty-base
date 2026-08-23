@@ -35,7 +35,7 @@ const app = createApp({
         items.push({ app: 'apps/authorization.html', title: i18n.value.authorizationTitle, label: i18n.value.authorization, icon: 'mdi-shield-key-outline' })
       }
       applications.value.forEach(application => {
-        const appUrl = applicationUrl(application.port)
+        const appUrl = applicationUrl(application)
         items.push({
           app: appUrl,
           title: application.note || application.domain,
@@ -46,10 +46,10 @@ const app = createApp({
       return items
     })
 
-    function applicationUrl (port) {
-      const hostname = window.location.hostname
+    function applicationUrl (application) {
+      const hostname = application.domain || `${application.port}-${window.location.hostname}`
       const gatewayPort = window.location.port ? `:${window.location.port}` : ''
-      return `${window.location.protocol}//${port}-${hostname}${gatewayPort}/`
+      return `${window.location.protocol}//${hostname}${gatewayPort}/`
     }
 
     function navigate (item) {
