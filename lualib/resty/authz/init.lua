@@ -427,7 +427,8 @@ function _M.access()
     ngx.var.authz_user = s.username
     ngx.var.authz_source = s.source
     ngx.var.authz_identity = principal
-    ngx.var.authz_target = ngx.var.scheme .. "://127.0.0.1:" .. port
+    -- TLS terminates at the gateway; local services are always HTTP upstreams.
+    ngx.var.authz_target = "http://127.0.0.1:" .. port
     local requested_upgrade = tostring(ngx.var.http_upgrade or "")
     -- WebSocket 代理默认对所有已解析目标开启；bindings.websocket 仅保留
     -- 为历史配置兼容，不再作为升级请求的阻断条件。
