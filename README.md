@@ -28,14 +28,14 @@
 所有代理流量需登录 + Casbin 策略授权；后端收到 `X-Authz-User` 头。管理菜单会读取本机监听端口，
 在配置的端口范围内用 `127.0.0.1` 和短超时 HTTP `HEAD` 探测，只列出实际 HTTP 服务；入口变化会定时刷新，
 并按 `<port>-当前域名` 生成动态入口，右侧 iframe 满屏加载对应服务。扫描结果默认缓存 30 秒，网关自身端口会排除。
-代理默认按普通 HTTP 处理；只有显式绑定开启 WebSocket 且请求带有 `Upgrade: websocket` 时，才转发升级头、关闭响应缓冲并延长读写超时，可承载 code-server 等 WebSocket 应用。
+代理默认支持 WebSocket；只要请求带有 `Upgrade: websocket`，所有已解析的目标都会转发升级头、关闭响应缓冲并延长读写超时，可承载 code-server 等 WebSocket 应用。
 
 管理端的“新增域名绑定”支持以下配置：
 
 - 只填写最后一级域名前缀，例如 `name1`；当前实例为 `m.ws.example.com` 时保存为 `name1-m.ws.example.com`；
 - 不同前缀可以绑定同一个端口，最终域名必须唯一，重复提交返回 `409`；
 - 可填写 `menu-name` 覆盖左侧菜单名称；配置绑定后，该端口不再依赖主动探测的菜单名称；
-- WebSocket 是绑定级开关，普通 HTTP 绑定会清空升级头。
+- WebSocket 默认对所有已解析目标开启；`bindings.websocket` 字段保留用于兼容历史数据，不再作为升级请求的阻断开关。
 
 ### 管理界面
 

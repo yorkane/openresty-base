@@ -429,7 +429,9 @@ function _M.access()
     ngx.var.authz_identity = principal
     ngx.var.authz_target = ngx.var.scheme .. "://127.0.0.1:" .. port
     local requested_upgrade = tostring(ngx.var.http_upgrade or "")
-    local websocket_request = websocket and requested_upgrade:lower() == "websocket"
+    -- WebSocket 代理默认对所有已解析目标开启；bindings.websocket 仅保留
+    -- 为历史配置兼容，不再作为升级请求的阻断条件。
+    local websocket_request = requested_upgrade:lower() == "websocket"
     ngx.var.authz_websocket = websocket_request and "1" or "0"
     ngx.var.authz_upgrade = websocket_request and requested_upgrade or ""
     ngx.var.authz_connection = websocket_request and "upgrade" or ""

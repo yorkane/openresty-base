@@ -785,16 +785,16 @@ login fixed.test.example bob bob654321 "$APP_COOKIE"
 request GET fixed.test.example / "$APP_COOKIE"
 assert_eq "fixed application proxy" "$STATUS" "200"
 
-request POST "$ADMIN_HOST" /_api_/authz/v1/applications "$ADMIN_COOKIE" "$CSRF" "{\"domain\":\"ws-fixed.test.example\",\"port\":$WS_PORT,\"enabled\":true,\"websocket\":true,\"note\":\"websocket test\"}"
+request POST "$ADMIN_HOST" /_api_/authz/v1/applications "$ADMIN_COOKIE" "$CSRF" "{\"domain\":\"ws-fixed.test.example\",\"port\":$WS_PORT,\"enabled\":true,\"websocket\":false,\"note\":\"websocket default test\"}"
 assert_eq "create WebSocket application" "$STATUS" "201"
 request GET "$ADMIN_HOST" /_api_/authz/v1/authorization "$ADMIN_COOKIE"
-assert_json "WebSocket binding is enabled" '.data.bindings[] | select(.domain == "ws-fixed.test.example") | .websocket | tostring' "1"
+assert_json "WebSocket compatibility field is stored" '.data.bindings[] | select(.domain == "ws-fixed.test.example") | .websocket | tostring' "0"
 WS_STATUS=$(curl -sS --max-time 5 --http1.1 --resolve "ws-fixed.test.example:$HTTP_PORT:127.0.0.1" \
     -b "$ADMIN_COOKIE" -D "$TMP_DIR/websocket-headers" -o "$TMP_DIR/websocket-body" -w '%{http_code}' \
     -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
     -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
     "http://ws-fixed.test.example:$HTTP_PORT/" || true)
-assert_eq "WebSocket handshake through enabled binding" "$WS_STATUS" "101"
+assert_eq "WebSocket handshake through default binding" "$WS_STATUS" "101"
 assert_contains "WebSocket upgrade response" "$(cat "$TMP_DIR/websocket-headers")" "101 Switching Protocols"
 
 request POST "$ADMIN_HOST" /_api_/authz/v1/applications "$ADMIN_COOKIE" "$CSRF" "{\"domain\":\"ws-fixed.test.example\",\"port\":$WS_PORT,\"enabled\":true}"

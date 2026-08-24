@@ -48,7 +48,7 @@ Browser
 - 目标端口优先取启用的精确域名绑定，否则解析 `<port>-任意域名`；显式绑定记录包含 `menu_name` 和 `websocket` 配置；
 - 可代理端口下限强制不小于 2000；目标为网关自身端口时返回 508；
 - 上游收到 `X-Authz-User`、`X-Authz-Source`、`X-Authz-Identity`。
-- 只有绑定启用 WebSocket 且请求带有 `Upgrade: websocket` 时，动态代理才转发升级头；此时通过 `X-Forwarded-Host` 转发外部 Origin Host，并关闭缓冲、延长读写超时。普通 HTTP 绑定会清空升级头。
+- 只要请求带有 `Upgrade: websocket`，所有已解析的动态代理目标都会转发升级头；同时通过 `X-Forwarded-Host` 转发外部 Origin Host，并关闭缓冲、延长读写超时。`bindings.websocket` 保留为历史兼容字段，不再阻断升级请求。
 
 Admin 菜单应用列表不依赖 `bindings` 表：`/_api_/authz/v1/applications` 读取 `/proc/net/tcp` 和
 `/proc/net/tcp6` 的监听端口，在 `AUTHZ_PORT_MIN/MAX` 范围内排除网关端口，再向 `127.0.0.1` 发送
@@ -327,7 +327,7 @@ bash scripts/restart_gateway.sh --build  # 按当前 Docker 架构重建镜像�
 1. 先确认上游服务本身：`curl -i http://127.0.0.1:2077/` 返回 `200` 才说明本机 code-server HTTP 服务正常；本机 HTTPS 失败不代表网关故障。
 2. 再确认网关入口：`6443` 对外提供 HTTPS，但上游仍是 HTTP，不能设置上游 TLS 参数。
 3. 未登录时，绑定已解析但返回 `302` 到 `/_authz/login` 是预期认证结果；它证明请求已经进入认证链路。
-4. WebSocket 必须按绑定打开；不同前缀可以共用同一端口，但同一最终域名重复创建返回 `409`。
+4. WebSocket 默认全局开启；不同前缀可以共用同一端口，但同一最终域名重复创建返回 `409`。验证时只需携带 `Upgrade: websocket`，不依赖绑定记录中的旧 `websocket` 值。
 5. 管理菜单优先使用已配置绑定的 `menu-name`，其次是绑定域名；没有绑定时才使用自动发现的 `local:<port>`。
 
 ## 11. 已解决故障与防回归点
