@@ -112,6 +112,10 @@ assert_eq "HTTP and HTTPS share server template" \
     "$(grep -c 'include server.conf.template;' "$REPO_DIR/conf/nginx.conf.template")" "2"
 assert_contains "WebSocket origin host forwarding" "$SERVER_TEMPLATE" \
     'proxy_set_header X-Forwarded-Host  $authz_forwarded_host;'
+assert_contains "upstream Host uses local proxy target" "$SERVER_TEMPLATE" \
+    'proxy_set_header Host              $proxy_host;'
+assert_not_contains "upstream Host does not expose public domain" "$SERVER_TEMPLATE" \
+    'proxy_set_header Host              $host;'
 assert_contains "WebSocket buffering disabled" "$SERVER_TEMPLATE" 'proxy_buffering off;'
 assert_contains "WebSocket idle timeout extended" "$SERVER_TEMPLATE" 'proxy_read_timeout 3600s;'
 AUTHZ_INIT_SOURCE=$(cat "$REPO_DIR/lualib/resty/authz/init.lua")
@@ -801,6 +805,7 @@ request GET "$DYNAMIC_HOST" /identity "$DYNAMIC_COOKIE"
 assert_json "upstream receives raw username" '.user' "bob"
 assert_json "upstream receives identity source" '.source' "local"
 assert_json "upstream receives canonical identity" '.identity' "user:local:bob"
+assert_json "upstream receives local target Host" '.host' "127.0.0.1:$UPSTREAM_PORT"
 login "$DYNAMIC_HOST" remote@example.test remote123 "$REMOTE_DYNAMIC_COOKIE" nocobase
 request GET "$DYNAMIC_HOST" / "$REMOTE_DYNAMIC_COOKIE"
 assert_eq "mapped remote role authorizes application" "$STATUS" "200"
