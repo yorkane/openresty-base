@@ -9,6 +9,7 @@
 --   bindings  域名 -> 本机端口 绑定
 
 local ffi = require "ffi"
+local mlcache = require "resty.mlcache"
 local util = require "resty.authz.util"
 
 ffi.cdef[[
@@ -41,11 +42,61 @@ local SQLITE_OPEN_FLAGS = 0x02 + 0x04 + 0x10000
 local TRANSIENT = ffi.cast("void (*)(void*)", -1) -- SQLITE_TRANSIENT
 
 local _M = {}
+local DB_CACHE_DICT = "authz_db_cache"
+local DB_REV_DICT = "authz_cache"
+local db_cache = nil
+local db_cache_disabled = false
+local db_cache_ttl = 30
+local db_cache_lru_size = 500
 
 -- 显式加载 libsqlite3 (不在 nginx 全局符号表内; Alpine 运行包无 .so 软链)
 local lib = ffi.load("libsqlite3.so.0")
 
 local conn = nil -- 每个 worker 一条连接 (懒加载)
+
+local function current_db_revision()
+    local dict = ngx.shared[DB_REV_DICT]
+    if not dict then return 0 end
+    return dict:get("db_rev") or 0
+end
+
+local function bump_db_revision()
+    local dict = ngx.shared[DB_REV_DICT]
+    if dict then dict:incr("db_rev", 1, 0) end
+end
+
+local function cache_in_master()
+    return ngx.worker and ngx.worker.in_master and ngx.worker.in_master()
+end
+
+local function get_db_cache()
+    if db_cache or db_cache_disabled or cache_in_master() then
+        return db_cache
+    end
+
+    local cache, err = mlcache.new("authz_db", DB_CACHE_DICT, {
+        lru_size = db_cache_lru_size,
+        ttl = db_cache_ttl,
+        neg_ttl = 5,
+    })
+    if not cache then
+        db_cache_disabled = true
+        ngx.log(ngx.WARN, "authz: database cache disabled: ", tostring(err))
+        return nil
+    end
+    db_cache = cache
+    return db_cache
+end
+
+local function query_key(sql, params)
+    local parts = { tostring(current_db_revision()), sql }
+    for index, value in ipairs(params) do
+        parts[#parts + 1] = tostring(index)
+        parts[#parts + 1] = type(value)
+        parts[#parts + 1] = tostring(value)
+    end
+    return ngx.encode_base64(table.concat(parts, "\0"))
+end
 
 local function errmsg(db)
     local p = lib.sqlite3_errmsg(db)
@@ -72,6 +123,8 @@ function _M.close()
         lib.sqlite3_close_v2(conn)
         conn = nil
     end
+    db_cache = nil
+    db_cache_disabled = false
 end
 
 local function bind_params(stmt, params)
@@ -98,19 +151,20 @@ function _M.exec(sql, ...)
     bind_params(stmt, { ... })
     rc = lib.sqlite3_step(stmt)
     lib.sqlite3_finalize(stmt)
-    if rc == SQLITE_DONE or rc == SQLITE_ROW then return true end
+    if rc == SQLITE_DONE or rc == SQLITE_ROW then
+        bump_db_revision()
+        return true
+    end
     return nil, errmsg(conn)
 end
 
--- 执行查询 (带绑定参数), 返回行数组, 每行为 {列名=值} 字典
--- INTEGER → number, 其他 → string
-function _M.query(sql, ...)
+local function query_uncached(sql, params)
     if not conn then return nil, "db not opened" end
     local pstmt = ffi.new("sqlite3_stmt*[1]")
     local rc = lib.sqlite3_prepare_v2(conn, sql, #sql, pstmt, nil)
     if rc ~= SQLITE_OK then return nil, errmsg(conn) end
     local stmt = pstmt[0]
-    bind_params(stmt, { ... })
+    bind_params(stmt, params)
     local rows = {}
     while lib.sqlite3_step(stmt) == SQLITE_ROW do
         local row = {}
@@ -132,6 +186,24 @@ function _M.query(sql, ...)
     end
     lib.sqlite3_finalize(stmt)
     return rows
+end
+
+local function query_callback(sql, params)
+    return query_uncached(sql, params)
+end
+
+-- 执行查询 (带绑定参数), 返回行数组, 每行为 {列名=值} 字典
+-- INTEGER → number, 其他 → string
+function _M.query(sql, ...)
+    local params = { ... }
+    local cache = get_db_cache()
+    if not cache then return query_uncached(sql, params) end
+
+    local rows, err = cache:get(query_key(sql, params), nil, query_callback, sql, params)
+    if not err then return rows end
+
+    ngx.log(ngx.WARN, "authz: database cache read failed: ", tostring(err))
+    return query_uncached(sql, params)
 end
 
 -- ─────────────────────────────────────────────────────────────────
@@ -192,6 +264,10 @@ CREATE TABLE IF NOT EXISTS bindings(
 
 function _M.init(opts)
     opts = opts or {}
+    db_cache_ttl = math.max(1, tonumber(opts.db_cache_ttl) or 30)
+    db_cache_lru_size = math.max(50, tonumber(opts.db_cache_lru_size) or 500)
+    db_cache = nil
+    db_cache_disabled = false
     local path = opts.path or opts.db_path or "/data/authz/authz.db"
     _M.open(path)
 

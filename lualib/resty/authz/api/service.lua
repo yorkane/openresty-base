@@ -4,6 +4,7 @@ local db = require "resty.authz.db"
 local identity_key = require "resty.authz.identity"
 local session = require "resty.authz.session"
 local util = require "resty.authz.util"
+local discovery = require "resty.authz.discovery"
 
 local _M = {}
 
@@ -212,8 +213,7 @@ function _M.authorization(s)
 end
 
 function _M.applications()
-    return db.query([[SELECT id, domain, port, note FROM bindings
-        WHERE enabled = 1 ORDER BY domain]]) or {}
+    return discovery.list(authz.config)
 end
 
 function _M.create_user(data)
@@ -386,8 +386,12 @@ local function valid_host(domain)
         [[^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$]]) ~= nil
 end
 
+local function normalize_host(value)
+    return tostring(value or ""):lower():gsub("%s+", ""):gsub(":%d+$", "")
+end
+
 function _M.create_application(data)
-    local domain = tostring(data.domain or ""):lower():gsub("%s+", ""):gsub(":%d+$", "")
+    local domain = normalize_host(data.domain)
     local port = tonumber(data.port)
     if not valid_host(domain) then return nil, "域名格式不合法", 422 end
     if not port or port < authz.config.port_min or port > authz.config.port_max then
@@ -404,9 +408,36 @@ end
 function _M.update_application(id, data)
     local rows = db.query("SELECT id FROM bindings WHERE id = ?", id)
     if not rows or not rows[1] then return nil, "应用不存在", 404 end
-    if data.enabled == nil then return nil, "没有可更新字段", 422 end
-    local enabled = data.enabled == true or data.enabled == 1
-    local ok, err = db.exec("UPDATE bindings SET enabled = ? WHERE id = ?", enabled and 1 or 0, id)
+    local fields, values = {}, {}
+    if data.domain ~= nil then
+        local domain = normalize_host(data.domain)
+        if not valid_host(domain) then return nil, "域名格式不合法", 422 end
+        local duplicate = db.query("SELECT id FROM bindings WHERE domain = ? AND id != ?", domain, id)
+        if duplicate and duplicate[1] then return nil, "域名已存在", 409 end
+        fields[#fields + 1] = "domain = ?"
+        values[#values + 1] = domain
+    end
+    if data.port ~= nil then
+        local port = tonumber(data.port)
+        if not port or port < authz.config.port_min or port > authz.config.port_max then
+            return nil, "端口必须在 " .. authz.config.port_min .. "-" .. authz.config.port_max, 422
+        end
+        fields[#fields + 1] = "port = ?"
+        values[#values + 1] = port
+    end
+    if data.note ~= nil then
+        local note = tostring(data.note)
+        if #note > 256 then return nil, "备注不能超过 256 个字符", 422 end
+        fields[#fields + 1] = "note = ?"
+        values[#values + 1] = note
+    end
+    if data.enabled ~= nil then
+        fields[#fields + 1] = "enabled = ?"
+        values[#values + 1] = (data.enabled == true or data.enabled == 1) and 1 or 0
+    end
+    if #fields == 0 then return nil, "没有可更新字段", 422 end
+    values[#values + 1] = id
+    local ok, err = db.exec("UPDATE bindings SET " .. table.concat(fields, ", ") .. " WHERE id = ?", unpack(values))
     if not ok then return db_error("更新应用失败", err) end
     bump_rev()
     return { message = "应用已更新" }

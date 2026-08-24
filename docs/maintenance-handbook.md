@@ -1,6 +1,6 @@
 # OpenResty Authz Gateway 维护手册
 
-> 面向后续维护 Agent。本文记录截至 2026-08-23 已验证的系统设计、开发约束、测试基线与部署方式。
+> 面向后续维护 Agent。本文记录截至 2026-08-24 已验证的系统设计、开发约束、测试基线与部署方式。
 > 修改前先读根目录 `AGENTS.MD`；涉及身份源时再读 `docs/sso-jwt-auth.md`。
 
 ## 1. 系统定位与入口
@@ -48,28 +48,43 @@ Browser
 - 目标端口优先取启用的精确域名绑定，否则解析 `<port>-任意域名`；
 - 可代理端口下限强制不小于 2000；目标为网关自身端口时返回 508；
 - 上游收到 `X-Authz-User`、`X-Authz-Source`、`X-Authz-Identity`。
+- 动态代理保留 HTTP/1.1 Upgrade；通过 `X-Forwarded-Host` 转发外部 Origin Host，并关闭缓冲、延长读写超时，支持 code-server WebSocket。
+
+Admin 菜单应用列表不依赖 `bindings` 表：`/_api_/authz/v1/applications` 读取 `/proc/net/tcp` 和
+`/proc/net/tcp6` 的监听端口，在 `AUTHZ_PORT_MIN/MAX` 范围内排除网关端口，再向 `127.0.0.1` 发送
+短超时 `HEAD /`；只有返回 HTTP 状态行的端口才会列出。结果按 worker 缓存，默认 30 秒；容器需要使用
+host 网络或其他方式让目标服务位于网关容器的 `127.0.0.1` 网络命名空间内。
 
 ## 3. 代码职责
 
 | 路径 | 责任 |
 |---|---|
-| `conf/nginx.conf.template` | 两个 server、三个控制面 location、动态代理入口 |
+| `conf/nginx.conf.template` | 全局配置、HTTP/HTTPS listener 与 TLS；两个 server 都 include 公共片段 |
+| `conf/server.conf.template` | HTTP/HTTPS 共用的控制面 location、Admin 静态资源和动态代理配置 |
 | `lualib/resty/authz/init.lua` | 环境配置、初始化、端口解析、缓存和 access 阶段 |
 | `lualib/resty/authz/app.lua` | 登录、OAuth 跳转、旧接口 410；不承载管理业务 API |
 | `lualib/resty/authz/api/router.lua` | `/_api_/authz/v1` 代码注册式路由 |
 | `lualib/resty/authz/api/guard.lua` | 会话、admin、CSRF guard 和统一错误结构 |
 | `lualib/resty/authz/api/service.lua` | 用户、远程身份、绑定和策略业务规则 |
-| `lualib/resty/authz/db.lua` | SQLite FFI、schema、迁移和 seed |
+| `lualib/resty/authz/db.lua` | SQLite FFI 数据层、schema、迁移、seed 和查询缓存 |
+| `lualib/resty/mlcache.lua` | vendored lua-resty-mlcache 分层缓存实现 |
 | `lualib/resty/authz/session.lua` | 服务端会话与 Cookie |
 | `lualib/resty/authz/identity.lua` | 来源感知身份键 |
 | `lualib/resty/authz/remote.lua` | 远程身份单向记录、本地启用状态和角色覆盖 |
 | `lualib/resty/authz/nocobase.lua` | NocoBase 用户名密码认证 |
 | `lualib/resty/authz/oauth.lua` | OAuth Code + PKCE、token/userinfo、身份记录 |
+| `lualib/resty/authz/discovery.lua` | 读取本机监听端口并用短超时 HTTP HEAD 发现本地服务 |
 | `admin/` | 无构建步骤的 Vue 3 + Quasar UMD Admin UI |
 | `lualib/klib/` | 项目代码注册式 Router 和请求上下文框架 |
 
 `lualib` 在镜像构建时整体复制到 `/usr/local/openresty/site/lualib`，开发部署也必须整体挂载。
 只挂载 `lualib/resty/authz` 会漏掉 `klib.router`、模板等依赖，导致镜像与挂载行为不一致。
+
+`db.lua` 的查询使用 `resty.mlcache`：worker 内 L1 LRU、共享字典 L2 和 SQLite 回调 L3。缓存默认
+使用 `authz_db_cache` 共享字典，TTL 由 `AUTHZ_DB_CACHE_TTL` 控制，L1 容量由
+`AUTHZ_DB_CACHE_LRU_SIZE` 控制。每次成功执行 `db.exec()` 都递增 `authz_cache:db_rev`，查询键包含
+该 revision，因此管理 API 的写入会让所有 worker 使用新查询键，不需要 IPC 广播。直接改 SQLite
+不会触发 revision；生产变更必须走管理 API 或重启网关。
 
 ## 4. 数据和身份模型
 
@@ -259,7 +274,7 @@ bash test/run_tests.sh openresty-base:nocobase-test
 | `test/test_authz_gateway.sh` | 登录、API、CSRF、身份隔离、远端记录、OAuth、动态代理和 HTTPS Cookie |
 | `test/run_tests.sh` | 镜像基础库、WebDAV、FancyIndex、JWT/旧 SSO 兼容 |
 
-截至本文更新，最近基线为 Router 99、Authz 234、基础镜像 17，共 350 项/断言。数量不是固定契约；
+截至本文更新，最近基线为 Router 99、Authz 270、基础镜像 17，共 386 项/断言。数量不是固定契约；
 任何行为变更必须增加或调整能验证真实 HTTP 结果的断言。
 
 OAuth 测试使用 `test/mock_nocobase.py`，不得连接生产账号或把真实 token 写入测试输出。测试至少覆盖
@@ -278,7 +293,8 @@ PKCE、resource、回调 issuer、state 一次性、角色映射、同名来源�
 这使 Lua 和前端修改无需重建镜像。部署操作区分：
 
 - 只改挂载代码/静态资源：`openresty -t` 后重启或 reload；
-- 改 `conf/nginx.conf.template`：必须重启容器，使 entrypoint 重新执行 `envsubst`；仅 reload 不会重渲染模板；
+- 镜像部署修改 `conf/nginx.conf.template` 或 `conf/server.conf.template`：重新构建并重建容器；主模板由 entrypoint 执行 `envsubst`，公共 server 模板由两个 listener 直接 include；
+- 开发时若显式挂载两个模板：主模板变化需要重启容器重新渲染，只有公共 server 模板变化时可先 `openresty -t` 再 reload；
 - 改环境变量、网络、挂载、镜像：重建容器；
 - 改数据库 schema：先备份 `/data/authz/authz.db`，不得先热更新挂载 Lua；必须重启或重建容器，让 `init_by_lua` 的幂等迁移在 worker 接收流量前完成；
 - 改 vendor：重新生成 manifest 和哈希，不在页面恢复 CDN 依赖。
@@ -304,7 +320,8 @@ curl -fsS http://127.0.0.1:6080/_authz/login >/dev/null
 - 40px mini drawer 下，菜单、收缩按钮、Logout、语言按钮必须分别验证“可见”和“可点击”。
 - `klib.router` JSON Content-Type、默认错误请求头脱敏、`merge()` 返回/原子性均有真实回归，不能退回旧行为。
 - 整体挂载 `lualib`，避免镜像内有 `klib`、挂载后却缺失的差异。
-- 直接改 SQLite 不会 bump cache revision；管理变更必须走 service/API，或重启进程。
+- `db.lua` 的缓存查询键包含 `authz_cache:db_rev`；管理 API 写入会 bump revision 并让所有 worker 使用新查询键。
+  直接改 SQLite 不会触发 revision，必须走 service/API，或重启进程。
 - 反向代理终止 TLS 时正确传递 `X-Forwarded-Proto`，或设置 `AUTHZ_COOKIE_SECURE=true`。
 - `/_radmin_/` 静态资源默认启用 Brotli/Gzip，Brotli 动态等级 5、Gzip 等级 5；镜像构建为资源生成 Brotli 等级 11 的 `.br` 侧车文件，并通过 `brotli_static on` 优先提供。
 - Admin 入口启用 SSI，个性化壳输出 `Cache-Control: no-store`；普通静态资源通过 `expires max` 输出长期缓存头。

@@ -412,8 +412,9 @@ RUN apk add --no-cache --virtual .brotli-tools brotli \
     && find /usr/local/openresty/nginx/html/admin -type f ! -name '*.br' \
         -exec sh -c 'brotli -f -q 11 "$1" -o "$1.br"' _ {} \; \
     && apk del .brotli-tools
-# 网关 nginx 配置模板 (entrypoint envsubst 渲染为 nginx.conf)
+# 网关 nginx 主模板与 HTTP/HTTPS 共用 server 配置
 COPY conf/nginx.conf.template /usr/local/openresty/nginx/conf/nginx.conf.template
+COPY conf/server.conf.template /usr/local/openresty/nginx/conf/server.conf.template
 COPY conf/openssl.cnf /usr/local/openresty/nginx/conf/openssl.cnf
 COPY docker-entrypoint.sh /docker-entrypoint.sh
 RUN chmod +x /docker-entrypoint.sh

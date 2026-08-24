@@ -97,6 +97,21 @@ docker run --rm "$IMAGE" sh -c \
     'test -s /usr/local/openresty/nginx/html/admin/api.js.br' \
     || fail "image does not contain Brotli static sidecar"
 pass "admin assets have Brotli static sidecars"
+docker run --rm "$IMAGE" sh -c \
+    'test -s /usr/local/openresty/site/lualib/resty/mlcache.lua' \
+    || fail "image does not contain vendored lua-resty-mlcache"
+pass "lua-resty-mlcache is vendored in the image"
+
+SERVER_TEMPLATE=$(cat "$REPO_DIR/conf/server.conf.template")
+assert_eq "HTTP and HTTPS share server template" \
+    "$(grep -c 'include server.conf.template;' "$REPO_DIR/conf/nginx.conf.template")" "2"
+assert_contains "WebSocket origin host forwarding" "$SERVER_TEMPLATE" \
+    'proxy_set_header X-Forwarded-Host  $authz_forwarded_host;'
+assert_contains "WebSocket buffering disabled" "$SERVER_TEMPLATE" 'proxy_buffering off;'
+assert_contains "WebSocket idle timeout extended" "$SERVER_TEMPLATE" 'proxy_read_timeout 3600s;'
+NGINX_TEMPLATE=$(cat "$REPO_DIR/conf/nginx.conf.template")
+assert_contains "database cache shared dictionary configured" "$NGINX_TEMPLATE" \
+    'lua_shared_dict authz_db_cache 10m;'
 
 cat >"$TMP_DIR/nocobase.env" <<EOF
 AUTHZ_HOST_URL=http://admin.test.example:$HTTP_PORT
@@ -170,7 +185,10 @@ docker run -d \
     --network host \
     -e AUTHZ_HTTP_PORT="$HTTP_PORT" \
     -e AUTHZ_HTTPS_PORT="$HTTPS_PORT" \
+    -e AUTHZ_COOKIE_DOMAIN=.test.example \
     -e AUTHZ_ADMIN_PASSWORD=admin123 \
+    -e AUTHZ_DB_CACHE_TTL=30 \
+    -e AUTHZ_DB_CACHE_LRU_SIZE=500 \
     -e AUTHZ_PORT_MIN=1000 \
     -e AUTHZ_PORT_MAX=65535 \
     -e AUTHZ_NOCO_ENABLED=true \
@@ -209,6 +227,7 @@ docker run -d \
     -v "$TMP_DIR/data:/data" \
     -v "$REPO_DIR/admin:/usr/local/openresty/nginx/html/admin:ro" \
     -v "$REPO_DIR/conf/nginx.conf.template:/usr/local/openresty/nginx/conf/nginx.conf.template:ro" \
+    -v "$REPO_DIR/conf/server.conf.template:/usr/local/openresty/nginx/conf/server.conf.template:ro" \
     -v "$REPO_DIR/lualib:/usr/local/openresty/site/lualib:ro" \
     "$IMAGE" >/dev/null
 
@@ -323,12 +342,18 @@ request GET "$ADMIN_HOST" /_radmin_/ "$ADMIN_COOKIE"
 assert_eq "authenticated admin UI" "$STATUS" "200"
 assert_contains "admin UI loads shell" "$BODY" "app-frame"
 assert_contains "admin UI assembles menu with SSI" "$BODY" "id=\"admin-menu\""
+assert_not_contains "admin SSI menu has no inline style" "$BODY" "<style>"
 assert_not_contains "admin UI does not iframe menu" "$BODY" "menu-frame"
 assert_contains "admin shell is not cached" "$(cat "$TMP_DIR/headers")" "Cache-Control: no-store"
+request GET "$ADMIN_HOST" '/_radmin_/app.css?v=6' "$ADMIN_COOKIE"
+assert_eq "admin shared CSS asset" "$STATUS" "200"
+assert_contains "shared CSS contains SSI menu styles" "$BODY" "#admin-menu .menu-shell"
+assert_contains "shared CSS contains mini drawer styles" "$BODY" ".admin-drawer-mini #admin-menu"
 request GET "$ADMIN_HOST" '/_radmin_/api.js?v=7' "$ADMIN_COOKIE"
 assert_eq "admin API client asset" "$STATUS" "200"
 assert_contains "admin client uses new API root" "$BODY" "/_api_/authz/v1"
 assert_contains "admin API errors expose status" "$BODY" "error.status = response.status"
+assert_contains "binding API supports edit" "$BODY" "values.action === 'edit'"
 STATIC_STATUS=$(curl -sS --max-time 5 --resolve "$ADMIN_HOST:$HTTP_PORT:127.0.0.1" \
     -H 'Accept-Encoding: gzip' -b "$ADMIN_COOKIE" -D "$TMP_DIR/static-headers" \
     -o /dev/null -w '%{http_code}' "http://$ADMIN_HOST:$HTTP_PORT/_radmin_/api.js?v=7")
@@ -351,6 +376,7 @@ assert_contains "authorization menu is admin gated" "$BODY" "if (isAdmin.value)"
 assert_contains "menu reads admin status from session" "$BODY" "isAdmin.value = Boolean(session.admin)"
 assert_contains "menu loads local applications" "$BODY" "window.adminApi.applications"
 assert_contains "menu refreshes local applications" "$BODY" "setInterval(loadApplications, 30000)"
+assert_contains "built-in app URLs are versioned" "$BODY" "apps/authorization.html?v=6"
 request GET "$ADMIN_HOST" /_radmin_/apps/users.html "$ADMIN_COOKIE"
 assert_contains "user roles use controlled multi-select" "$BODY" 'multiple use-chips emit-value map-options'
 assert_contains "user role fallback catalog" "$BODY" "['admin', 'staff', 'user', 'viewer']"
@@ -365,12 +391,15 @@ assert_contains "user timestamps include seconds" "$BODY" "second: '2-digit'"
 assert_contains "profile page loads current session first" "$BODY" "const current = await window.adminApi.session()"
 assert_contains "non-admin profile uses only session identity" "$BODY" "if (!current.admin)"
 request GET "$ADMIN_HOST" /_radmin_/apps/authorization.html "$ADMIN_COOKIE"
+assert_contains "admin application HTML is not cached" "$(cat "$TMP_DIR/headers")" "Cache-Control: no-store"
 assert_contains "policy subject uses select options" "$BODY" 'policySubjectOptions'
 assert_contains "policy object uses binding options" "$BODY" 'policyObjectOptions'
 assert_contains "policy HTTP method uses select options" "$BODY" ':options="httpActions"'
 assert_contains "policy HTTP method supports multi-select" "$BODY" 'multiple use-chips emit-value map-options :options="httpActions"'
 assert_contains "policy methods include CONNECT" "$BODY" "'CONNECT'"
 assert_contains "policy methods include TRACE" "$BODY" "'TRACE'"
+assert_contains "binding page supports editing" "$BODY" "openEditBinding"
+assert_contains "binding form supports saving" "$BODY" "saveBindingForm"
 request GET "$ADMIN_HOST" /_api_/authz/v1/session "$ADMIN_COOKIE"
 assert_eq "session API" "$STATUS" "200"
 assert_json "session username" '.data.username' "admin"
@@ -383,6 +412,7 @@ CSRF=$(jq -er '.data.csrf' "$TMP_DIR/body")
 request GET "$ADMIN_HOST" /_api_/authz/v1/applications "$ADMIN_COOKIE"
 assert_eq "applications API" "$STATUS" "200"
 assert_json "applications API returns a list" '.data | type' "array"
+assert_json "applications API discovers local HTTP service" ".data | map(select(.port == $UPSTREAM_PORT)) | length" "1"
 
 request GET "$ADMIN_HOST" '/_authz/login?next=/_radmin_/'
 assert_eq "login page with OAuth provider" "$STATUS" "200"
@@ -584,12 +614,15 @@ request GET "$ADMIN_HOST" /_api_/authz/v1/users "$ADMIN_COOKIE"
 BOB_ID=$(jq -er '.data.users[] | select(.username == "bob") | .id' "$TMP_DIR/body")
 [[ -n "$BOB_ID" ]] || fail "created user not found"
 pass "created user appears in list"
+assert_json "cached user list starts with original role" '.data.users[] | select(.username == "bob") | .roles' "user"
 assert_json "new user exposes nullable last login field" '.data.users[] | select(.username == "bob") | has("last_login_at") | tostring' "true"
 assert_json "new user has no login time before first login" '.data.users[] | select(.username == "bob") | .last_login_at == null | tostring' "true"
 assert_json "columns after null remain readable" '.data.users[] | select(.username == "bob") | .updated_at == .created_at | tostring' "true"
 
 request PATCH "$ADMIN_HOST" "/_api_/authz/v1/users/$BOB_ID" "$ADMIN_COOKIE" "$CSRF" '{"roles":["staff","user"]}'
 assert_eq "update user roles" "$STATUS" "200"
+request GET "$ADMIN_HOST" /_api_/authz/v1/users "$ADMIN_COOKIE"
+assert_json "cached user list invalidates after write" '.data.users[] | select(.username == "bob") | .roles' "staff,user"
 request PUT "$ADMIN_HOST" "/_api_/authz/v1/users/$BOB_ID/password" "$ADMIN_COOKIE" "$CSRF" '{"password":"bob654321"}'
 assert_eq "reset user password" "$STATUS" "200"
 
@@ -729,6 +762,18 @@ request POST "$ADMIN_HOST" /_api_/authz/v1/applications "$ADMIN_COOKIE" "$CSRF" 
 assert_eq "create application" "$STATUS" "201"
 request GET "$ADMIN_HOST" /_api_/authz/v1/authorization "$ADMIN_COOKIE"
 APP_ID=$(jq -er '.data.bindings[] | select(.domain == "fixed.test.example") | .id' "$TMP_DIR/body")
+request PATCH "$ADMIN_HOST" "/_api_/authz/v1/applications/$APP_ID" "$ADMIN_COOKIE" "$CSRF" "{\"domain\":\"edited.test.example\",\"port\":$NOCO_PORT,\"enabled\":true,\"note\":\"edited\"}"
+assert_eq "edit binding fields" "$STATUS" "200"
+request GET "$ADMIN_HOST" /_api_/authz/v1/authorization "$ADMIN_COOKIE"
+assert_json "edited binding domain" '.data.bindings[] | select(.domain == "edited.test.example") | .domain' "edited.test.example"
+assert_json "edited binding port" '.data.bindings[] | select(.domain == "edited.test.example") | .port | tostring' "$NOCO_PORT"
+assert_json "edited binding note" '.data.bindings[] | select(.domain == "edited.test.example") | .note' "edited"
+request PATCH "$ADMIN_HOST" "/_api_/authz/v1/applications/$APP_ID" "$ADMIN_COOKIE" "$CSRF" "{\"port\":1999}"
+assert_eq "edit binding rejects port below minimum" "$STATUS" "422"
+request PATCH "$ADMIN_HOST" "/_api_/authz/v1/applications/$APP_ID" "$ADMIN_COOKIE" "$CSRF" "{\"domain\":\"fixed.test.example\",\"port\":$UPSTREAM_PORT,\"enabled\":true,\"note\":\"test\"}"
+assert_eq "restore edited binding" "$STATUS" "200"
+request GET "$ADMIN_HOST" /_api_/authz/v1/authorization "$ADMIN_COOKIE"
+APP_ID=$(jq -er '.data.bindings[] | select(.domain == "fixed.test.example") | .id' "$TMP_DIR/body")
 login fixed.test.example bob bob654321 "$APP_COOKIE"
 request GET fixed.test.example / "$APP_COOKIE"
 assert_eq "fixed application proxy" "$STATUS" "200"
@@ -777,6 +822,7 @@ STATUS=$(curl -skS --max-time 5 --resolve "$ADMIN_HOST:$HTTPS_PORT:127.0.0.1" \
 assert_eq "HTTPS login succeeds" "$STATUS" "302"
 SECURE_COOKIE=$(awk 'BEGIN { IGNORECASE=1 } /^Set-Cookie:/ { print }' "$TMP_DIR/secure-headers")
 assert_contains "HTTPS session cookie is Secure" "$SECURE_COOKIE" "; Secure"
+assert_contains "session cookie uses root domain" "$SECURE_COOKIE" "; Domain=.test.example"
 
 STATUS=$(curl -sS --max-time 5 --resolve "$ADMIN_HOST:$HTTP_PORT:127.0.0.1" \
     -H 'X-Forwarded-Proto: https' -D "$TMP_DIR/forwarded-secure-headers" \

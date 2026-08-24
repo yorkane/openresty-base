@@ -29,6 +29,10 @@ description: 维护本仓库的 OpenResty Authz Gateway、klib Router、Vue 3 + 
 - 身份键固定为 `user:<source>:<username>`；同名不同来源必须完全隔离。
 - 本地角色目录固定为 `admin/staff/user/viewer`，默认拒绝，只有 admin 默认拥有 `/*`。
 - 管理写操作必须经过 service 并 bump cache revision；不要绕过 API 直接改库作为功能实现。
+- `lualib/resty/authz/db.lua` 是 SQLite 数据层，查询必须使用 vendored `resty.mlcache`；成功 `exec()`
+  必须 bump `authz_cache:db_rev`，查询键必须包含 revision，保证多 worker 写后读到新数据。
+- `lualib/resty/mlcache.lua` 必须随 `lualib/` 整体复制和挂载；不引入网络运行时依赖，不使用未经验证的
+  CDN 版本。直接 SQLite 写入不会触发数据库缓存失效。
 - 外部身份只在成功登录时单向记录到本机；禁止回写身份源或同步外部网关路由、用户、角色和策略。
 
 ## 后端与框架规则
@@ -55,7 +59,9 @@ description: 维护本仓库的 OpenResty Authz Gateway、klib Router、Vue 3 + 
 - 延续 Linear/Pollux 暗色、低对比边框、柔和紫色、10-16px 圆角和可读的响应式字号。
 - 网络操作展示 Loading/错误，删除、禁用、覆盖和恢复操作需要确认。
 - `/_radmin_/` 精确入口必须启用 SSI 并输出 `Cache-Control: no-store`；菜单是 `menu.html` SSI 片段，不能恢复菜单 iframe。
+- 菜单应用列表通过 `resty.authz.discovery` 探测网关本机 `127.0.0.1` 的 HTTP 服务，仅扫描配置端口范围、排除网关端口，并使用短超时缓存结果；不要恢复仅依赖 `bindings` 表的菜单发现。
 - Dockerfile 必须保留 `--with-http_ssi_module` 和 `ngx_brotli`；Brotli 动态等级 5，静态资源构建时生成等级 11 的 `.br`，由 `brotli_static` 提供。
+- `conf/nginx.conf.template` 只维护全局配置、HTTP/HTTPS listener 和 TLS；两个 server 必须共同 include `conf/server.conf.template`，控制面 location 与代理参数只在公共片段维护。
 
 ## 验证顺序
 

@@ -56,6 +56,7 @@ function saveRemoteUser (values) {
 
 function saveApplication (values) {
   if (values.action === 'create') return mutation('POST', '/applications', values)
+  if (values.action === 'edit') return mutation('PATCH', `/applications/${values.id}`, values)
   if (values.action === 'toggle') return mutation('PATCH', `/applications/${values.id}`, values)
   if (values.action === 'delete') return mutation('DELETE', `/applications/${values.id}`, values)
   throw new Error('Unsupported application action')

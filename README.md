@@ -25,9 +25,10 @@
 2. **显式绑定**：管理界面配置固定域名映射（存 SQLite）
 3. 其余域名 → 404
 
-所有代理流量需登录 + Casbin 策略授权；后端收到 `X-Authz-User` 头。管理菜单会读取已启用的本机端口绑定，
-按 `<port>-当前域名` 生成动态入口；入口变化会定时刷新，右侧 iframe 满屏加载对应服务。该机制读取已配置
-的绑定，不主动扫描宿主机所有端口。
+所有代理流量需登录 + Casbin 策略授权；后端收到 `X-Authz-User` 头。管理菜单会读取本机监听端口，
+在配置的端口范围内用 `127.0.0.1` 和短超时 HTTP `HEAD` 探测，只列出实际 HTTP 服务；入口变化会定时刷新，
+并按 `<port>-当前域名` 生成动态入口，右侧 iframe 满屏加载对应服务。扫描结果默认缓存 30 秒，网关自身端口会排除。
+代理使用 HTTP/1.1 Upgrade，保留外部 Origin Host，并关闭响应缓冲、延长读写超时，可直接承载 code-server 等 WebSocket 应用。
 
 ### 管理界面
 
@@ -71,6 +72,11 @@ docker run -d --name gw --network host \
 # 代理本机 3000 端口: http://3000-myhost.example.com:6080/
 ```
 
+本项目的 Compose 默认使用 `network_mode: host`，因此本机服务发现和代理目标都直接访问宿主机
+网络命名空间的 `127.0.0.1`。这也是动态端口代理访问宿主机 HTTP 服务的必要配置；不要再为该服务
+添加 `ports` 映射。若改为普通 bridge 网络，容器内的 `127.0.0.1` 只代表网关容器自身，无法访问
+宿主机监听的端口。
+
 镜像将项目 `lualib/` 整体复制到 `/usr/local/openresty/site/lualib/`。Compose 默认把
 `${LUALIB_DIR:-./lualib}` 整目录只读挂载到同一路径，并同时挂载
 `${ADMIN_UI_DIR:-./admin}`；修改 Lua 后端或管理前端时无需重复构建镜像。
@@ -89,6 +95,10 @@ docker run -d --name gw --network host \
 | `AUTHZ_PORT_MIN` / `AUTHZ_PORT_MAX` | `2000` / `20000` | 数字前缀端口范围 |
 | `AUTHZ_HTTP_PORT` / `AUTHZ_HTTPS_PORT` | `6080` / `6443` | 入口端口 |
 | `NGINX_WORKER_PROCESSES` | `4` | Nginx worker 数量，可按 CPU 核数和并发量调整 |
+| `AUTHZ_DISCOVERY_TTL` | `30` | 本机 HTTP 服务发现缓存秒数 |
+| `AUTHZ_DISCOVERY_CONNECT_TIMEOUT_MS` / `AUTHZ_DISCOVERY_READ_TIMEOUT_MS` | `100` / `200` | 本机 HTTP 服务探测超时 |
+| `AUTHZ_DB_CACHE_TTL` | `30` | SQLite 查询的 mlcache TTL（秒） |
+| `AUTHZ_DB_CACHE_LRU_SIZE` | `500` | 每个 worker 的 mlcache L1 条目数 |
 | `AUTHZ_HOST_URL` | 空 | 浏览器访问网关的 HTTPS Origin，用于生成 OAuth 回调 |
 | `AUTHZ_CERT_DIR` | `/data/certs` | 自签证书目录（10 年有效） |
 | `AUTHZ_SESSION_TTL` | `604800` | 会话有效期（秒） |
@@ -123,6 +133,8 @@ docker run -d --name gw --network host \
   接口已退役，不得继续新增调用方。
 - `lualib/klib/router.lua` 是注册式 Router 的公共基础；路由注册失败必须返回并检查，默认错误响应不得回显
   请求头或请求头值。
+- `lualib/resty/authz/db.lua` 是 SQLite 数据层；只读查询通过 vendored `resty.mlcache` 的 L1/L2/L3
+  分层缓存，成功写入会递增共享的数据库 revision，使其他 worker 的旧查询键失效。
 - 数字前缀动态端口默认允许 `2000` 起步，角色固定为 `admin`、`staff`、`user`、`viewer`；HTTP 方法使用
   完整方法目录，并支持多选策略。
 
@@ -231,6 +243,7 @@ docker pull yorkane/openresty-base:latest
 | LuaJIT | OpenResty 捆绑版（2.1.ROLLING） |
 | lua-nginx-module | GitHub `master` 分支最新 commit |
 | stream-lua-nginx-module | GitHub `master` 分支最新 commit |
+| lua-resty-mlcache | vendored `2.6.1`，用于 SQLite 查询 L1/L2/L3 缓存 |
 | lua-resty-core | GitHub `master` 分支最新 commit |
 | lua-resty-jwt | api7 fork v0.2.6 |
 | nginx-dav-ext-module | GitHub `master` 分支最新 commit |
@@ -330,7 +343,7 @@ GHCR 推送使用内置 `GITHUB_TOKEN`，无需额外配置。
 │   └── sso-jwt-auth.md           # 历史 JWT/SSO 参考
 ├── admin/                       # Vue 3 + Quasar UMD 管理界面
 │   ├── index.html               # SSI 管理壳
-│   ├── menu.html                # SSI 菜单片段（内联 CSS/模板）
+│   ├── menu.html                # SSI 菜单片段（仅模板）
 │   ├── apps/                    # 用户/角色与授权管理页面
 │   ├── vendor/                  # 合并后的 Quasar/Vue/语言包/MDI 静态资源
 │   ├── api.js                   # 应用公共 API 客户端
@@ -350,7 +363,8 @@ GHCR 推送使用内置 `GITHUB_TOKEN`，无需额外配置。
 │           ├── session.lua     # 服务端会话
 │           └── util.lua        # 密码哈希/随机token/HTML转义
 ├── conf/
-│   ├── nginx.conf.template     # 网关 nginx 配置模板
+│   ├── nginx.conf.template     # 全局配置、HTTP/HTTPS listener 与 TLS
+│   ├── server.conf.template    # HTTP/HTTPS 共用 location 与代理配置
 │   └── openssl.cnf             # 最小 openssl 配置(自签证书用)
 └── test/
     ├── run_tests.sh            # 基础功能测试脚本

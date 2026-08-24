@@ -12,7 +12,7 @@
     <main class="workspace-page">
       <header class="page-heading">
         <div><h1>{{ t.title }}</h1><p>{{ t.description }}</p></div>
-        <div v-if="isAdmin" class="heading-actions"><q-btn outline no-caps icon="mdi-lan-connect" :label="t.addBinding" class="secondary-button" @click="bindingOpen = true"></q-btn><q-btn unelevated no-caps icon="mdi-shield-plus-outline" :label="t.addPolicy" class="primary-button" @click="openPolicyDialog"></q-btn></div>
+        <div v-if="isAdmin" class="heading-actions"><q-btn outline no-caps icon="mdi-lan-connect" :label="t.addBinding" class="secondary-button" @click="openCreateBinding"></q-btn><q-btn unelevated no-caps icon="mdi-shield-plus-outline" :label="t.addPolicy" class="primary-button" @click="openPolicyDialog"></q-btn></div>
       </header>
 
       <q-banner v-if="error" rounded class="error-banner q-mb-lg"><template v-slot:avatar><q-icon name="mdi-alert-circle-outline"></q-icon></template>{{ error }}<template v-slot:action><q-btn flat dense no-caps :label="t.retry" @click="load"></q-btn></template></q-banner>
@@ -30,7 +30,7 @@
           <template v-slot:body-cell-domain="props"><q-td :props="props"><div class="route-cell"><q-icon name="mdi-earth" size="18px"></q-icon><strong>{{ props.row.domain }}</strong></div></q-td></template>
           <template v-slot:body-cell-port="props"><q-td :props="props"><code class="code-pill">:{{ props.row.port }}</code></q-td></template>
           <template v-slot:body-cell-enabled="props"><q-td :props="props"><q-toggle :model-value="props.row.enabled === 1" color="teal-4" :disable="!isAdmin" @update:model-value="toggleBinding(props.row)"></q-toggle></q-td></template>
-          <template v-slot:body-cell-actions="props"><q-td :props="props"><q-btn v-if="isAdmin" flat round dense icon="mdi-trash-can-outline" color="red-4" @click="removeBinding(props.row)"><q-tooltip>{{ t.deleteBinding }}</q-tooltip></q-btn></q-td></template>
+          <template v-slot:body-cell-actions="props"><q-td :props="props"><q-btn v-if="isAdmin" flat round dense icon="mdi-pencil-outline" @click="openEditBinding(props.row)"><q-tooltip>{{ t.editBinding }}</q-tooltip></q-btn><q-btn v-if="isAdmin" flat round dense icon="mdi-trash-can-outline" color="red-4" @click="removeBinding(props.row)"><q-tooltip>{{ t.deleteBinding }}</q-tooltip></q-btn></q-td></template>
           <template v-slot:no-data><div class="full-width row flex-center q-pa-xl empty-state"><q-icon name="mdi-lan-disconnect" size="28px"></q-icon><span>{{ t.noBindings }}</span></div></template>
         </q-table>
       </q-card>
@@ -48,7 +48,7 @@
         </q-table>
       </q-card>
 
-      <q-dialog v-model="bindingOpen"><q-card class="dialog-card"><q-form @submit="createBinding"><q-card-section><div class="dialog-title">{{ t.bindingTitle }}</div><div class="dialog-copy">{{ t.bindingCopy }}</div></q-card-section><q-card-section class="dialog-fields"><q-input v-model="bindingForm.domain" dark outlined :label="t.domain" :placeholder="t.domainPlaceholder" :rules="[required]"></q-input><q-input v-model.number="bindingForm.port" dark outlined type="number" :label="t.port" :min="portMin" :max="portMax" :rules="[required]"></q-input><q-input v-model="bindingForm.note" dark outlined :label="t.note"></q-input><q-toggle v-model="bindingForm.enabled" color="teal-4" :label="t.enabledNow"></q-toggle></q-card-section><q-card-actions align="right"><q-btn flat no-caps :label="t.cancel" v-close-popup></q-btn><q-btn unelevated no-caps type="submit" :label="t.createBinding" class="primary-button" :loading="saving"></q-btn></q-card-actions></q-form></q-card></q-dialog>
+      <q-dialog v-model="bindingOpen"><q-card class="dialog-card"><q-form @submit="saveBindingForm"><q-card-section><div class="dialog-title">{{ bindingEditingId ? t.editBindingTitle : t.bindingTitle }}</div><div class="dialog-copy">{{ t.bindingCopy }}</div></q-card-section><q-card-section class="dialog-fields"><q-input v-model="bindingForm.domain" dark outlined :label="t.domain" :placeholder="t.domainPlaceholder" :rules="[required]"></q-input><q-input v-model.number="bindingForm.port" dark outlined type="number" :label="t.port" :min="portMin" :max="portMax" :rules="[required]"></q-input><q-input v-model="bindingForm.note" dark outlined :label="t.note"></q-input><q-toggle v-model="bindingForm.enabled" color="teal-4" :label="t.enabledNow"></q-toggle></q-card-section><q-card-actions align="right"><q-btn flat no-caps :label="t.cancel" v-close-popup></q-btn><q-btn unelevated no-caps type="submit" :label="bindingEditingId ? t.saveBinding : t.createBinding" class="primary-button" :loading="saving"></q-btn></q-card-actions></q-form></q-card></q-dialog>
 
       <q-dialog v-model="policyOpen">
         <q-card class="dialog-card">
@@ -92,6 +92,7 @@
         const error = ref('')
         const policyFilter = ref('')
         const bindingOpen = ref(false)
+        const bindingEditingId = ref(null)
         const policyOpen = ref(false)
         const portMin = ref(2000)
         const portMax = ref(20000)
@@ -216,10 +217,26 @@
           }
         }
     
-        async function createBinding () {
-        const ok = await mutate(() => window.adminApi.saveBinding({ _csrf: csrf.value, action: 'create', ...bindingForm }), t.value.bindingCreated)
+        function openCreateBinding () {
+          bindingEditingId.value = null
+          Object.assign(bindingForm, { domain: '', port: 3000, note: '', enabled: true })
+          bindingOpen.value = true
+        }
+
+        function openEditBinding (binding) {
+          bindingEditingId.value = binding.id
+          Object.assign(bindingForm, { domain: binding.domain, port: binding.port, note: binding.note || '', enabled: binding.enabled === 1 })
+          bindingOpen.value = true
+        }
+
+        async function saveBindingForm () {
+        const action = bindingEditingId.value ? 'edit' : 'create'
+        const values = { _csrf: csrf.value, action, ...bindingForm }
+        if (bindingEditingId.value) values.id = bindingEditingId.value
+        const ok = await mutate(() => window.adminApi.saveBinding(values), action === 'edit' ? t.value.bindingUpdated : t.value.bindingCreated)
           if (ok) {
             bindingOpen.value = false
+            bindingEditingId.value = null
             Object.assign(bindingForm, { domain: '', port: 3000, note: '', enabled: true })
           }
         }
@@ -280,7 +297,7 @@
 
       onBeforeUnmount(() => unsubscribeLocale?.())
     
-      return { actionList, allowCount, bindingColumns, bindingForm, bindingOpen, bindings, createBinding, createPolicy, denyCount, effects, error, httpActions, isAdmin, load, loading, openPolicyDialog, policies, policyColumns, policyFilter, policyForm, policyObjectOptions, policyOpen, policyRoleOptions, policySubjectOptions, policyTypes, policyUserOptions, portMax, portMin, removeBinding, removePolicy, required, resetPolicyFields, saving, setPolicyMethods, sourceLabel, t, toggleBinding }
+      return { actionList, allowCount, bindingColumns, bindingEditingId, bindingForm, bindingOpen, bindings, createPolicy, denyCount, effects, error, httpActions, isAdmin, load, loading, openCreateBinding, openEditBinding, openPolicyDialog, policies, policyColumns, policyFilter, policyForm, policyObjectOptions, policyOpen, policyRoleOptions, policySubjectOptions, policyTypes, policyUserOptions, portMax, portMin, removeBinding, removePolicy, required, resetPolicyFields, saveBindingForm, saving, setPolicyMethods, sourceLabel, t, toggleBinding }
       }
     })
     

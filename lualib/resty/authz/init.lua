@@ -85,6 +85,13 @@ function _M.init()
     c.port_min = math.max(2000, tonumber(os.getenv("AUTHZ_PORT_MIN")) or 2000)
     c.port_max = math.min(65535, tonumber(os.getenv("AUTHZ_PORT_MAX")) or 20000)
     if c.port_max < c.port_min then c.port_max = c.port_min end
+    c.http_port = tonumber(os.getenv("AUTHZ_HTTP_PORT")) or 6080
+    c.https_port = tonumber(os.getenv("AUTHZ_HTTPS_PORT")) or 6443
+    c.discovery_ttl = math.max(5, tonumber(os.getenv("AUTHZ_DISCOVERY_TTL")) or 30)
+    c.discovery_connect_timeout = math.max(20, tonumber(os.getenv("AUTHZ_DISCOVERY_CONNECT_TIMEOUT_MS")) or 100)
+    c.discovery_read_timeout = math.max(20, tonumber(os.getenv("AUTHZ_DISCOVERY_READ_TIMEOUT_MS")) or 200)
+    c.db_cache_ttl = math.max(1, tonumber(os.getenv("AUTHZ_DB_CACHE_TTL")) or 30)
+    c.db_cache_lru_size = math.max(50, tonumber(os.getenv("AUTHZ_DB_CACHE_LRU_SIZE")) or 500)
     c.cache_dict = "authz_cache"
     c.login_limit_dict = "authz_login_limit"
     c.login_attempts = math.max(1, tonumber(os.getenv("AUTHZ_LOGIN_ATTEMPTS")) or 10)

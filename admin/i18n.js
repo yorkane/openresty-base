@@ -29,11 +29,11 @@
         routesTitle: '域名与端口绑定', routesCopy: '固定域名映射到本机服务端口', routeCount: '条路由', domain: '域名', port: '端口', status: '状态', note: '备注', noBindings: '尚未创建固定绑定',
         policiesTitle: 'Casbin 策略', policiesCopy: '拒绝规则优先匹配；对象格式为 /<端口><路径>', search: '搜索主体或对象',
         type: '类型', subject: '主体', objectRole: '对象 / 角色', action: '动作', effect: '效果', retry: '重试', cancel: '取消', local: '本地', dingtalk: '钉钉', wechat: '微信',
-        bindingTitle: '新增域名绑定', bindingCopy: '将固定域名映射到本机端口。', domainPlaceholder: 'app.example.com', enabledNow: '立即启用', createBinding: '创建绑定',
+        bindingTitle: '新增域名绑定', editBindingTitle: '编辑域名绑定', bindingCopy: '将固定域名映射到本机端口。', domainPlaceholder: 'app.example.com', enabledNow: '立即启用', createBinding: '创建绑定', saveBinding: '保存绑定', editBinding: '编辑绑定',
         policyTitle: '新增访问策略', policyCopy: '创建授权规则或用户角色分配。', policyType: '策略类型', user: '用户', role: '角色', object: '对象', httpAction: 'HTTP 动作', createPolicy: '创建策略',
         subjectHint: '选择角色或具体用户', userHint: '选择需要分配角色的用户', roleHint: '选择 admin、staff、user 或 viewer', objectHint: '选择绑定地址，或输入 /<端口><路径>', httpActionHint: '可选择多个标准 HTTP 方法；* 表示全部方法', allObjects: '全部地址 · /*', allActions: '全部方法 · *', allow: '允许', deny: '拒绝', assigned: '已分配',
         policyRule: '授权规则', roleAssignment: '角色分配', deleteBinding: '删除绑定', deletePolicy: '删除策略',
-        required: '此项不能为空', bindingCreated: '绑定已创建', bindingDisabled: '绑定已停用', bindingEnabled: '绑定已启用',
+        required: '此项不能为空', bindingCreated: '绑定已创建', bindingUpdated: '绑定已更新', bindingDisabled: '绑定已停用', bindingEnabled: '绑定已启用',
         deleteBindingTitle: '删除域名绑定', deleteBindingConfirm: '确认删除此域名绑定？', deleteAction: '删除', bindingDeleted: '绑定已删除',
         policyCreated: '策略已创建', deletePolicyTitle: '删除访问策略', deletePolicyConfirm: '权限结果可能立即改变。', policyDeleted: '策略已删除'
       }
@@ -67,11 +67,11 @@
         routesTitle: 'Domain and port bindings', routesCopy: 'Map fixed domains to local service ports', routeCount: 'routes', domain: 'Domain', port: 'Port', status: 'Status', note: 'Note', noBindings: 'No fixed bindings yet',
         policiesTitle: 'Casbin policies', policiesCopy: 'Deny rules match first; object format is /<port><path>', search: 'Search subjects or objects',
         type: 'Type', subject: 'Subject', objectRole: 'Object / Role', action: 'Action', effect: 'Effect', retry: 'Retry', cancel: 'Cancel', local: 'Local', dingtalk: 'DingTalk', wechat: 'WeChat',
-        bindingTitle: 'Add domain binding', bindingCopy: 'Map a fixed domain to a local port.', domainPlaceholder: 'app.example.com', enabledNow: 'Enable now', createBinding: 'Create binding',
+        bindingTitle: 'Add domain binding', editBindingTitle: 'Edit domain binding', bindingCopy: 'Map a fixed domain to a local port.', domainPlaceholder: 'app.example.com', enabledNow: 'Enable now', createBinding: 'Create binding', saveBinding: 'Save binding', editBinding: 'Edit binding',
         policyTitle: 'Add access policy', policyCopy: 'Create an authorization rule or assign a user role.', policyType: 'Policy type', user: 'User', role: 'Role', object: 'Object', httpAction: 'HTTP action', createPolicy: 'Create policy',
         subjectHint: 'Select a role or a specific user', userHint: 'Select the user receiving the role', roleHint: 'Select admin, staff, user, or viewer', objectHint: 'Select a binding or enter /<port><path>', httpActionHint: 'Select multiple standard HTTP methods; * matches every method', allObjects: 'All objects · /*', allActions: 'All methods · *', allow: 'Allow', deny: 'Deny', assigned: 'Assigned',
         policyRule: 'Access rule', roleAssignment: 'Role assignment', deleteBinding: 'Delete binding', deletePolicy: 'Delete policy',
-        required: 'This field is required', bindingCreated: 'Binding created', bindingDisabled: 'Binding disabled', bindingEnabled: 'Binding enabled',
+        required: 'This field is required', bindingCreated: 'Binding created', bindingUpdated: 'Binding updated', bindingDisabled: 'Binding disabled', bindingEnabled: 'Binding enabled',
         deleteBindingTitle: 'Delete domain binding', deleteBindingConfirm: 'Delete this domain binding?', deleteAction: 'Delete', bindingDeleted: 'Binding deleted',
         policyCreated: 'Policy created', deletePolicyTitle: 'Delete access policy', deletePolicyConfirm: 'Authorization results may change immediately.', policyDeleted: 'Policy deleted'
       }

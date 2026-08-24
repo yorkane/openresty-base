@@ -1,15 +1,16 @@
 const { createApp, computed, onBeforeUnmount, onMounted, ref } = Vue
 
-const allowedApps = new Set([
-  'apps/users.html',
-  'apps/authorization.html'
-])
+const builtInApps = {
+  users: 'apps/users.html?v=6',
+  authorization: 'apps/authorization.html?v=6'
+}
+const allowedApps = new Set(Object.values(builtInApps))
 
 const app = createApp({
   setup () {
     const drawerVisible = ref(true)
     const drawerMini = ref(window.innerWidth < 760)
-    const activeApp = ref('apps/users.html')
+    const activeApp = ref(builtInApps.users)
     const activeTitle = ref('用户 / 角色管理')
     const authenticated = ref(false)
     const isAdmin = ref(false)
@@ -29,17 +30,18 @@ const app = createApp({
 
     const menuItems = computed(() => {
       const items = [
-        { app: 'apps/users.html', title: i18n.value.usersTitle, label: i18n.value.users, icon: 'mdi-account-group-outline' }
+        { app: builtInApps.users, title: i18n.value.usersTitle, label: i18n.value.users, icon: 'mdi-account-group-outline' }
       ]
       if (isAdmin.value) {
-        items.push({ app: 'apps/authorization.html', title: i18n.value.authorizationTitle, label: i18n.value.authorization, icon: 'mdi-shield-key-outline' })
+        items.push({ app: builtInApps.authorization, title: i18n.value.authorizationTitle, label: i18n.value.authorization, icon: 'mdi-shield-key-outline' })
       }
       applications.value.forEach(application => {
         const appUrl = applicationUrl(application)
+        const applicationLabel = application.note || application.domain || `127.0.0.1:${application.port}`
         items.push({
           app: appUrl,
-          title: application.note || application.domain,
-          label: application.note || application.domain,
+          title: applicationLabel,
+          label: applicationLabel,
           icon: 'mdi-application-outline'
         })
       })

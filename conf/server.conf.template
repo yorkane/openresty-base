@@ -1,0 +1,135 @@
+location /_authz {
+    default_type text/html;
+    content_by_lua_block {
+        require("resty.authz.app").handle()
+    }
+}
+
+location ^~ /_api_/ {
+    content_by_lua_block {
+        require("resty.authz.api.router"):handle()
+    }
+}
+
+location = /_radmin_ {
+    return 301 /_radmin_/;
+}
+
+location = /_radmin_/ {
+    alias /usr/local/openresty/nginx/html/admin/;
+    index index.html;
+    default_type text/html;
+    ssi on;
+    gzip on;
+    gzip_comp_level 7;
+    gzip_vary on;
+    gzip_min_length 256;
+    expires off;
+    add_header Cache-Control "no-store" always;
+    access_by_lua_block {
+        local authz = require "resty.authz"
+        require("resty.authz.db").open(authz.config.db_path)
+        local session = require "resty.authz.session"
+        local token = session.get_request_token()
+        local current = token and session.get(token)
+        if not current then
+            return ngx.redirect("/_authz/login?next=" .. ngx.escape_uri(ngx.var.request_uri))
+        end
+    }
+}
+
+location = /_radmin_/index.html {
+    alias /usr/local/openresty/nginx/html/admin/index.html;
+    default_type text/html;
+    ssi on;
+    gzip on;
+    gzip_comp_level 7;
+    gzip_vary on;
+    gzip_min_length 256;
+    expires off;
+    add_header Cache-Control "no-store" always;
+    access_by_lua_block {
+        local authz = require "resty.authz"
+        require("resty.authz.db").open(authz.config.db_path)
+        local session = require "resty.authz.session"
+        local token = session.get_request_token()
+        local current = token and session.get(token)
+        if not current then
+            return ngx.redirect("/_authz/login?next=" .. ngx.escape_uri(ngx.var.request_uri))
+        end
+    }
+}
+
+location ^~ /_radmin_/apps/ {
+    alias /usr/local/openresty/nginx/html/admin/apps/;
+    default_type text/html;
+    expires off;
+    add_header Cache-Control "no-store" always;
+    access_by_lua_block {
+        local authz = require "resty.authz"
+        require("resty.authz.db").open(authz.config.db_path)
+        local session = require "resty.authz.session"
+        local token = session.get_request_token()
+        local current = token and session.get(token)
+        if not current then
+            return ngx.redirect("/_authz/login?next=" .. ngx.escape_uri(ngx.var.request_uri))
+        end
+    }
+}
+
+location ^~ /_radmin_/ {
+    alias /usr/local/openresty/nginx/html/admin/;
+    index index.html;
+    gzip on;
+    gzip_comp_level 7;
+    gzip_vary on;
+    gzip_min_length 256;
+    gzip_types
+        application/javascript
+        application/json
+        application/manifest+json
+        application/xml
+        image/svg+xml
+        text/css
+        text/plain
+        text/xml;
+    expires max;
+    access_by_lua_block {
+        local authz = require "resty.authz"
+        require("resty.authz.db").open(authz.config.db_path)
+        local session = require "resty.authz.session"
+        local token = session.get_request_token()
+        local current = token and session.get(token)
+        if not current then
+            return ngx.redirect("/_authz/login?next=" .. ngx.escape_uri(ngx.var.request_uri))
+        end
+    }
+}
+
+location / {
+    set $authz_target "";
+    set $authz_user   "";
+    set $authz_source "";
+    set $authz_identity "";
+    access_by_lua_block {
+        require("resty.authz").access()
+    }
+    proxy_pass $authz_target;
+    proxy_http_version 1.1;
+    proxy_ssl_verify off;
+    proxy_ssl_server_name on;
+    proxy_ssl_name $host;
+    proxy_set_header Host              $host;
+    proxy_set_header X-Real-IP         $remote_addr;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Authz-User      $authz_user;
+    proxy_set_header X-Authz-Source    $authz_source;
+    proxy_set_header X-Authz-Identity  $authz_identity;
+    proxy_set_header X-Forwarded-Host  $authz_forwarded_host;
+    proxy_set_header Upgrade           $http_upgrade;
+    proxy_set_header Connection        $connection_upgrade;
+    proxy_buffering off;
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+}
