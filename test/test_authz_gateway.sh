@@ -114,6 +114,11 @@ assert_contains "WebSocket origin host forwarding" "$SERVER_TEMPLATE" \
     'proxy_set_header X-Forwarded-Host  $authz_forwarded_host;'
 assert_contains "WebSocket buffering disabled" "$SERVER_TEMPLATE" 'proxy_buffering off;'
 assert_contains "WebSocket idle timeout extended" "$SERVER_TEMPLATE" 'proxy_read_timeout 3600s;'
+AUTHZ_INIT_SOURCE=$(cat "$REPO_DIR/lualib/resty/authz/init.lua")
+assert_contains "gateway always uses HTTP upstream" "$AUTHZ_INIT_SOURCE" \
+    'ngx.var.authz_target = "http://127.0.0.1:" .. port'
+assert_not_contains "gateway does not derive upstream scheme from listener" "$AUTHZ_INIT_SOURCE" \
+    'ngx.var.scheme .. "://127.0.0.1:" .. port'
 NGINX_TEMPLATE=$(cat "$REPO_DIR/conf/nginx.conf.template")
 assert_contains "database cache shared dictionary configured" "$NGINX_TEMPLATE" \
     'lua_shared_dict authz_db_cache 10m;'
@@ -188,6 +193,7 @@ PY
 docker run -d \
     --name "$CONTAINER_NAME" \
     --network host \
+    -e NGINX_WORKER_PROCESSES=1 \
     -e AUTHZ_HTTP_PORT="$HTTP_PORT" \
     -e AUTHZ_HTTPS_PORT="$HTTPS_PORT" \
     -e AUTHZ_COOKIE_DOMAIN=.test.example \
@@ -196,6 +202,7 @@ docker run -d \
     -e AUTHZ_DB_CACHE_LRU_SIZE=500 \
     -e AUTHZ_PORT_MIN=1000 \
     -e AUTHZ_PORT_MAX=65535 \
+    -e AUTHZ_DISCOVERY_PORTS="$UPSTREAM_PORT,$WS_PORT" \
     -e AUTHZ_NOCO_ENABLED=true \
     -e AUTHZ_NOCO_URL="http://127.0.0.1:$NOCO_PORT" \
     -e AUTHZ_NOCO_ALLOW_HTTP=true \
@@ -298,10 +305,31 @@ PY
 )
 assert_eq "legacy user policy migrated to local identity" "$LEGACY_POLICY" "user:local:legacy_user"
 
+cookie_header() {
+    awk '
+        !/^#/ && NF >= 7 {
+            value = $6 "=" $7
+            cookies = cookies (cookies == "" ? "" : "; ") value
+            next
+        }
+        !/^#/ && /^[^=[:space:]]+=/ {
+            cookies = cookies (cookies == "" ? "" : "; ") $0
+        }
+        END { print cookies }
+    ' "$1"
+}
+
+save_session_cookie() {
+    local headers=$1 cookie=$2 token
+    token=$(awk 'BEGIN { IGNORECASE=1 } /^Set-Cookie:/ { line=$0; sub(/^[^:]+:[[:space:]]*/, "", line); sub(/;.*/, "", line); if (line ~ /^authz_session=/) { sub(/^authz_session=/, "", line); print line; exit } }' "$headers")
+    [[ "$token" =~ ^[A-Fa-f0-9]{64}$ ]] || fail "response did not set a valid session cookie"
+    printf 'authz_session=%s' "$token" > "$cookie"
+}
+
 request() {
     local method=$1 host=$2 path=$3 cookie=${4:-} csrf=${5:-} data=${6:-}
     local args=(--silent --show-error --max-time 5 --request "$method" --resolve "$host:$HTTP_PORT:127.0.0.1" -H 'Accept: application/json' -D "$TMP_DIR/headers" -o "$TMP_DIR/body" -w '%{http_code}')
-    [[ -n "$cookie" ]] && args+=(-b "$cookie")
+    [[ -n "$cookie" ]] && args+=(-H "Cookie: $(cookie_header "$cookie")")
     [[ -n "$csrf" ]] && args+=(-H "X-CSRF-Token: $csrf")
     if [[ -n "$data" ]]; then args+=(-H 'Content-Type: application/json' --data "$data"); fi
     STATUS=$(curl "${args[@]}" "http://$host:$HTTP_PORT$path")
@@ -310,13 +338,21 @@ request() {
 }
 
 login() {
-    local host=$1 username=$2 password=$3 cookie=$4 source=${5:-local}
+    local host=$1 username=$2 password=$3 cookie=$4 source=${5:-local} expect_session=${6:-true}
     rm -f "$cookie"
-    STATUS=$(curl -sS --max-time 5 --resolve "$host:$HTTP_PORT:127.0.0.1" -c "$cookie" -o /dev/null -w '%{http_code}' \
+    STATUS=$(curl -sS --max-time 5 --resolve "$host:$HTTP_PORT:127.0.0.1" -D "$TMP_DIR/login-headers" -o /dev/null -w '%{http_code}' \
         -X POST "http://$host:$HTTP_PORT/_authz/login" \
         --data-urlencode "username=$username" --data-urlencode "password=$password" \
         --data-urlencode "source=$source")
     assert_eq "login $username from $source" "$STATUS" "302"
+    if [[ "$expect_session" == "true" ]]; then
+        save_session_cookie "$TMP_DIR/login-headers" "$cookie"
+    else
+        if awk 'BEGIN { IGNORECASE=1; found=0 } /^Set-Cookie:[[:space:]]*authz_session=/ { found=1 } END { exit found ? 0 : 1 }' "$TMP_DIR/login-headers"; then
+            fail "rejected login unexpectedly set a session cookie"
+        fi
+        printf '' > "$cookie"
+    fi
 }
 
 ADMIN_HOST=admin.test.example
@@ -343,6 +379,15 @@ request GET "$ADMIN_HOST" /_radmin_/
 assert_eq "unauthenticated admin UI redirects" "$STATUS" "302"
 
 login "$ADMIN_HOST" admin admin123 "$ADMIN_COOKIE"
+HTTP_LOGIN_COOKIE=$(awk 'BEGIN { IGNORECASE=1 } /^Set-Cookie:/ { sub(/^[^:]+:[[:space:]]*/, ""); sub(/^[^;]+/, ""); sub(/\r$/, ""); print; exit }' "$TMP_DIR/login-headers")
+assert_not_contains "HTTP session cookie is not Secure" "$HTTP_LOGIN_COOKIE" "; Secure"
+for _ in $(seq 1 20); do
+    request GET "$ADMIN_HOST" /_api_/authz/v1/session "$ADMIN_COOKIE"
+    [[ "$STATUS" == "200" ]] && break
+    sleep 0.05
+done
+assert_eq "session becomes available after login" "$STATUS" "200"
+
 request GET "$ADMIN_HOST" /_radmin_/ "$ADMIN_COOKIE"
 assert_eq "authenticated admin UI" "$STATUS" "200"
 assert_contains "admin UI loads shell" "$BODY" "app-frame"
@@ -360,13 +405,13 @@ assert_contains "admin client uses new API root" "$BODY" "/_api_/authz/v1"
 assert_contains "admin API errors expose status" "$BODY" "error.status = response.status"
 assert_contains "binding API supports edit" "$BODY" "values.action === 'edit'"
 STATIC_STATUS=$(curl -sS --max-time 5 --resolve "$ADMIN_HOST:$HTTP_PORT:127.0.0.1" \
-    -H 'Accept-Encoding: gzip' -b "$ADMIN_COOKIE" -D "$TMP_DIR/static-headers" \
+    -H 'Accept-Encoding: gzip' -H "Cookie: $(cookie_header "$ADMIN_COOKIE")" -D "$TMP_DIR/static-headers" \
     -o /dev/null -w '%{http_code}' "http://$ADMIN_HOST:$HTTP_PORT/_radmin_/api.js?v=7")
 assert_eq "admin static asset status" "$STATIC_STATUS" "200"
 assert_eq "admin static asset gzip encoding" \
     "$(awk 'BEGIN { IGNORECASE=1 } /^Content-Encoding:/ { sub(/^[^:]+:[[:space:]]*/, ""); sub(/\r$/, ""); print; exit }' "$TMP_DIR/static-headers")" "gzip"
 BR_STATIC_STATUS=$(curl -sS --max-time 5 --resolve "$ADMIN_HOST:$HTTP_PORT:127.0.0.1" \
-    -H 'Accept-Encoding: br' -b "$ADMIN_COOKIE" -D "$TMP_DIR/br-static-headers" \
+    -H 'Accept-Encoding: br' -H "Cookie: $(cookie_header "$ADMIN_COOKIE")" -D "$TMP_DIR/br-static-headers" \
     -o /dev/null -w '%{http_code}' "http://$ADMIN_HOST:$HTTP_PORT/_radmin_/api.js?v=7")
 assert_eq "admin static asset Brotli status" "$BR_STATIC_STATUS" "200"
 assert_eq "admin static asset Brotli encoding" \
@@ -381,7 +426,7 @@ assert_contains "authorization menu is admin gated" "$BODY" "if (isAdmin.value)"
 assert_contains "menu reads admin status from session" "$BODY" "isAdmin.value = Boolean(session.admin)"
 assert_contains "menu loads local applications" "$BODY" "window.adminApi.applications"
 assert_contains "menu refreshes local applications" "$BODY" "setInterval(loadApplications, 30000)"
-assert_contains "built-in app URLs are versioned" "$BODY" "apps/authorization.html?v=6"
+assert_contains "built-in app URLs are versioned" "$BODY" "apps/authorization.html?v=7"
 request GET "$ADMIN_HOST" /_radmin_/apps/users.html "$ADMIN_COOKIE"
 assert_contains "user roles use controlled multi-select" "$BODY" 'multiple use-chips emit-value map-options'
 assert_contains "user role fallback catalog" "$BODY" "['admin', 'staff', 'user', 'viewer']"
@@ -459,9 +504,10 @@ print(value.path + ("?" + value.query if value.query else ""))
 PY
 )
 STATUS=$(curl -sS --max-time 5 --resolve "$ADMIN_HOST:$HTTP_PORT:127.0.0.1" \
-    -c "$OAUTH_COOKIE" -o /dev/null -w '%{http_code}' \
+    -D "$TMP_DIR/headers" -o /dev/null -w '%{http_code}' \
     "http://$ADMIN_HOST:$HTTP_PORT$OAUTH_CALLBACK_PATH")
 assert_eq "OAuth callback creates local session" "$STATUS" "302"
+save_session_cookie "$TMP_DIR/headers" "$OAUTH_COOKIE"
 request GET "$ADMIN_HOST" /_api_/authz/v1/session "$OAUTH_COOKIE"
 assert_eq "OAuth session API" "$STATUS" "200"
 assert_json "OAuth session source" '.data.source' "testid"
@@ -494,10 +540,11 @@ print(value.path + "?" + value.query)
 PY
 )
 STATUS=$(curl -sS --max-time 5 --resolve "$ADMIN_HOST:$HTTP_PORT:127.0.0.1" \
-    -c "$NOCO_OAUTH_COOKIE" -D "$TMP_DIR/headers" -o /dev/null -w '%{http_code}' \
+    -D "$TMP_DIR/headers" -o /dev/null -w '%{http_code}' \
     "http://$ADMIN_HOST:$HTTP_PORT$NOCO_OAUTH_CALLBACK_PATH")
 assert_eq "NocoBase OAuth callback creates session" "$STATUS" "302"
 assert_contains "NocoBase OAuth callback disables browser cache" "$(cat "$TMP_DIR/headers")" "Cache-Control: no-store"
+save_session_cookie "$TMP_DIR/headers" "$NOCO_OAUTH_COOKIE"
 request GET "$ADMIN_HOST" /_api_/authz/v1/session "$NOCO_OAUTH_COOKIE"
 assert_eq "NocoBase OAuth session API" "$STATUS" "200"
 assert_json "NocoBase OAuth shares source" '.data.source' "nocobase"
@@ -516,12 +563,13 @@ print(value.path + "?" + value.query)
 PY
 )
 STATUS=$(curl -sS --max-time 5 --resolve "$ADMIN_HOST:$HTTP_PORT:127.0.0.1" \
-    -c "$NOCO_OAUTH_SECOND_COOKIE" -D "$TMP_DIR/headers" -o /dev/null -w '%{http_code}' \
+    -D "$TMP_DIR/headers" -o /dev/null -w '%{http_code}' \
     "http://$ADMIN_HOST:$HTTP_PORT$NOCO_SECOND_CALLBACK_PATH")
 assert_eq "second NocoBase OAuth callback succeeds" "$STATUS" "302"
 assert_eq "second NocoBase OAuth skips stale login error" \
     "$(awk 'BEGIN { IGNORECASE=1 } /^Location:/ { sub(/^[^:]+:[[:space:]]*/, ""); sub(/\r$/, ""); print; exit }' "$TMP_DIR/headers")" \
     "/_radmin_/"
+save_session_cookie "$TMP_DIR/headers" "$NOCO_OAUTH_SECOND_COOKIE"
 request GET "$ADMIN_HOST" /_api_/authz/v1/session "$NOCO_OAUTH_SECOND_COOKIE"
 assert_eq "second NocoBase OAuth creates session" "$STATUS" "200"
 assert_json "second NocoBase OAuth keeps source" '.data.source' "nocobase"
@@ -559,9 +607,10 @@ print(value.path + "?" + value.query)
 PY
 )
 STATUS=$(curl -sS --max-time 5 --resolve "$ADMIN_HOST:$HTTP_PORT:127.0.0.1" \
-    -c "$DINGTALK_COOKIE" -o /dev/null -w '%{http_code}' \
+    -D "$TMP_DIR/headers" -o /dev/null -w '%{http_code}' \
     "http://$ADMIN_HOST:$HTTP_PORT$DINGTALK_CALLBACK_PATH")
 assert_eq "DingTalk callback creates session" "$STATUS" "302"
+save_session_cookie "$TMP_DIR/headers" "$DINGTALK_COOKIE"
 request GET "$ADMIN_HOST" /_api_/authz/v1/session "$DINGTALK_COOKIE"
 assert_json "DingTalk session source" '.data.source' "dingtalk"
 assert_json "DingTalk missing email uses stable username" '.data.username | startswith("dingtalk_") | tostring' "true"
@@ -583,9 +632,10 @@ print(value.path + "?" + value.query)
 PY
 )
 STATUS=$(curl -sS --max-time 5 --resolve "$ADMIN_HOST:$HTTP_PORT:127.0.0.1" \
-    -c "$WECHAT_COOKIE" -o /dev/null -w '%{http_code}' \
+    -D "$TMP_DIR/headers" -o /dev/null -w '%{http_code}' \
     "http://$ADMIN_HOST:$HTTP_PORT$WECHAT_CALLBACK_PATH")
 assert_eq "WeChat callback creates session" "$STATUS" "302"
+save_session_cookie "$TMP_DIR/headers" "$WECHAT_COOKIE"
 request GET "$ADMIN_HOST" /_api_/authz/v1/session "$WECHAT_COOKIE"
 assert_json "WeChat session source" '.data.source' "wechat"
 assert_json "WeChat identity uses stable username" '.data.username | startswith("wechat_") | tostring' "true"
@@ -687,7 +737,7 @@ request PATCH "$ADMIN_HOST" /_api_/authz/v1/remote-users/nocobase "$ADMIN_COOKIE
 assert_eq "admin disables remote identity" "$STATUS" "200"
 request GET "$ADMIN_HOST" /_api_/authz/v1/session "$REMOTE_COOKIE"
 assert_eq "disabled remote identity session revoked" "$STATUS" "401"
-login "$ADMIN_HOST" remote@example.test remote123 "$REMOTE_COOKIE" nocobase
+login "$ADMIN_HOST" remote@example.test remote123 "$REMOTE_COOKIE" nocobase false
 request GET "$ADMIN_HOST" /_api_/authz/v1/session "$REMOTE_COOKIE"
 assert_eq "disabled remote identity cannot sign in again" "$STATUS" "401"
 request GET "$ADMIN_HOST" /_api_/authz/v1/users "$ADMIN_COOKIE"
@@ -743,7 +793,7 @@ request GET "$DYNAMIC_HOST" / "$DYNAMIC_COOKIE"
 assert_eq "dynamic port allowed by policy" "$STATUS" "200"
 assert_eq "dynamic proxy body" "$BODY" "$MOCK_BODY"
 request GET "$ADMIN_HOST" /_api_/authz/v1/applications "$ADMIN_COOKIE"
-assert_json "HTTP service discovery finds mock port" ".data[] | select(.port == $UPSTREAM_PORT and .discovered == true) | .port | tostring" "$UPSTREAM_PORT"
+assert_json "HTTP service discovery finds mock port" ".data[] | select(.port == $UPSTREAM_PORT and .source == \"127.0.0.1\") | .port | tostring" "$UPSTREAM_PORT"
 request POST "$DYNAMIC_HOST" / "$DYNAMIC_COOKIE"
 assert_eq "second selected method allowed" "$STATUS" "200"
 assert_eq "multi-method proxy body" "$BODY" "$MOCK_BODY"
@@ -785,17 +835,31 @@ login fixed.test.example bob bob654321 "$APP_COOKIE"
 request GET fixed.test.example / "$APP_COOKIE"
 assert_eq "fixed application proxy" "$STATUS" "200"
 
+STATUS=$(curl -skS --max-time 5 --resolve "fixed.test.example:$HTTPS_PORT:127.0.0.1" \
+    -H "Cookie: $(cookie_header "$APP_COOKIE")" -o "$TMP_DIR/https-proxy-body" -w '%{http_code}' \
+    "https://fixed.test.example:$HTTPS_PORT/")
+assert_eq "HTTPS gateway proxies to HTTP upstream" "$STATUS" "200"
+assert_eq "HTTPS HTTP-upstream proxy body" "$(<"$TMP_DIR/https-proxy-body")" "$MOCK_BODY"
+
 request POST "$ADMIN_HOST" /_api_/authz/v1/applications "$ADMIN_COOKIE" "$CSRF" "{\"domain\":\"ws-fixed.test.example\",\"port\":$WS_PORT,\"enabled\":true,\"websocket\":false,\"note\":\"websocket default test\"}"
 assert_eq "create WebSocket application" "$STATUS" "201"
 request GET "$ADMIN_HOST" /_api_/authz/v1/authorization "$ADMIN_COOKIE"
 assert_json "WebSocket compatibility field is stored" '.data.bindings[] | select(.domain == "ws-fixed.test.example") | .websocket | tostring' "0"
 WS_STATUS=$(curl -sS --max-time 5 --http1.1 --resolve "ws-fixed.test.example:$HTTP_PORT:127.0.0.1" \
-    -b "$ADMIN_COOKIE" -D "$TMP_DIR/websocket-headers" -o "$TMP_DIR/websocket-body" -w '%{http_code}' \
+    -H "Cookie: $(cookie_header "$ADMIN_COOKIE")" -D "$TMP_DIR/websocket-headers" -o "$TMP_DIR/websocket-body" -w '%{http_code}' \
     -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
     -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
     "http://ws-fixed.test.example:$HTTP_PORT/" || true)
 assert_eq "WebSocket handshake through default binding" "$WS_STATUS" "101"
 assert_contains "WebSocket upgrade response" "$(cat "$TMP_DIR/websocket-headers")" "101 Switching Protocols"
+WS_STATUS=$(curl -skS --max-time 5 --http1.1 --resolve "ws-fixed.test.example:$HTTPS_PORT:127.0.0.1" \
+    -H "Cookie: $(cookie_header "$ADMIN_COOKIE")" -D "$TMP_DIR/https-websocket-headers" -o /dev/null -w '%{http_code}' \
+    -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+    -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+    "https://ws-fixed.test.example:$HTTPS_PORT/" || true)
+assert_eq "HTTPS default WebSocket proxy" "$WS_STATUS" "101"
+assert_contains "HTTPS WebSocket upgrade response" \
+    "$(cat "$TMP_DIR/https-websocket-headers")" "101 Switching Protocols"
 
 request POST "$ADMIN_HOST" /_api_/authz/v1/applications "$ADMIN_COOKIE" "$CSRF" "{\"domain\":\"ws-fixed.test.example\",\"port\":$WS_PORT,\"enabled\":true}"
 assert_eq "duplicate domain binding rejected clearly" "$STATUS" "409"
@@ -817,7 +881,7 @@ request PATCH "$ADMIN_HOST" "/_api_/authz/v1/users/$BOB_ID" "$ADMIN_COOKIE" "$CS
 assert_eq "disable user" "$STATUS" "200"
 request GET "$ADMIN_HOST" /_api_/authz/v1/session "$BOB_COOKIE"
 assert_eq "disabled user session revoked" "$STATUS" "401"
-login "$ADMIN_HOST" bob bob654321 "$BOB_COOKIE"
+login "$ADMIN_HOST" bob bob654321 "$BOB_COOKIE" local false
 request GET "$ADMIN_HOST" /_api_/authz/v1/session "$BOB_COOKIE"
 assert_eq "disabled local user cannot sign in again" "$STATUS" "401"
 
@@ -846,17 +910,6 @@ assert_eq "HTTPS login succeeds" "$STATUS" "302"
 SECURE_COOKIE=$(awk 'BEGIN { IGNORECASE=1 } /^Set-Cookie:/ { print }' "$TMP_DIR/secure-headers")
 assert_contains "HTTPS session cookie is Secure" "$SECURE_COOKIE" "; Secure"
 assert_contains "session cookie uses root domain" "$SECURE_COOKIE" "; Domain=.test.example"
-
-STATUS=$(curl -skS --max-time 5 --resolve "$DYNAMIC_HOST:$HTTPS_PORT:127.0.0.1" \
-    -c "$TMP_DIR/https-dynamic.cookie" -o /dev/null -w '%{http_code}' \
-    -X POST "https://$DYNAMIC_HOST:$HTTPS_PORT/_authz/login" \
-    --data-urlencode 'username=admin' --data-urlencode 'password=admin123')
-assert_eq "HTTPS dynamic login succeeds" "$STATUS" "302"
-STATUS=$(curl -skS --max-time 5 --resolve "$DYNAMIC_HOST:$HTTPS_PORT:127.0.0.1" \
-    -b "$TMP_DIR/https-dynamic.cookie" -o "$TMP_DIR/https-proxy-body" -w '%{http_code}' \
-    "https://$DYNAMIC_HOST:$HTTPS_PORT/")
-assert_eq "HTTPS gateway proxies to HTTP upstream" "$STATUS" "200"
-assert_eq "HTTPS HTTP-upstream proxy body" "$(<"$TMP_DIR/https-proxy-body")" "$MOCK_BODY"
 
 STATUS=$(curl -sS --max-time 5 --resolve "$ADMIN_HOST:$HTTP_PORT:127.0.0.1" \
     -H 'X-Forwarded-Proto: https' -D "$TMP_DIR/forwarded-secure-headers" \
