@@ -213,7 +213,26 @@ function _M.authorization(s)
 end
 
 function _M.applications()
-    return discovery.list(authz.config)
+    local applications = db.query([[SELECT id, domain, port, note, menu_name, websocket
+        FROM bindings WHERE enabled = 1 ORDER BY domain]]) or {}
+    local known_ports = {}
+    for _, application in ipairs(applications) do
+        known_ports[tonumber(application.port)] = true
+        application.note = application.menu_name ~= "" and application.menu_name or application.domain
+    end
+    for _, application in ipairs(discovery.list(authz.config)) do
+        if not known_ports[tonumber(application.port)] then
+            application.note = "local:" .. tostring(application.port)
+            applications[#applications + 1] = application
+        end
+    end
+    table.sort(applications, function(left, right)
+        if tonumber(left.port) == tonumber(right.port) then
+            return tostring(left.domain or "") < tostring(right.domain or "")
+        end
+        return tonumber(left.port) < tonumber(right.port)
+    end)
+    return applications
 end
 
 function _M.create_user(data)
@@ -386,20 +405,39 @@ local function valid_host(domain)
         [[^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$]]) ~= nil
 end
 
-local function normalize_host(value)
-    return tostring(value or ""):lower():gsub("%s+", ""):gsub(":%d+$", "")
+local function valid_domain_prefix(prefix)
+    return ngx.re.match(prefix, [[^[a-z0-9]([a-z0-9-]*[a-z0-9])?$]]) ~= nil
+end
+
+local function instance_base_host()
+    local host = tostring(ngx.var.host or ""):lower()
+    host = host:gsub("^a%-", ""):gsub("^%d+%-", "")
+    return host
+end
+
+local function normalize_binding_domain(value)
+    local domain = tostring(value or ""):lower():gsub("%s+", ""):gsub(":%d+$", "")
+    if valid_host(domain) then return domain end
+    if not valid_domain_prefix(domain) then return nil end
+    local generated = domain .. "-" .. instance_base_host()
+    return valid_host(generated) and generated or nil
 end
 
 function _M.create_application(data)
-    local domain = normalize_host(data.domain)
+    local domain = normalize_binding_domain(data.domain)
     local port = tonumber(data.port)
-    if not valid_host(domain) then return nil, "域名格式不合法", 422 end
+    if not domain then return nil, "请输入最后一级域名前缀，例如 name1", 422 end
     if not port or port < authz.config.port_min or port > authz.config.port_max then
         return nil, "端口必须在 " .. authz.config.port_min .. "-" .. authz.config.port_max, 422
     end
+    local existing = db.query("SELECT id FROM bindings WHERE domain = ?", domain)
+    if existing and existing[1] then
+        return nil, "域名绑定已存在: " .. domain, 409
+    end
     local ok, err = db.exec(
-        "INSERT INTO bindings(domain, port, enabled, note, created_at) VALUES(?,?,?,?,?)",
-        domain, port, data.enabled == false and 0 or 1, tostring(data.note or ""), os.time())
+        "INSERT INTO bindings(domain, port, enabled, websocket, note, menu_name, created_at) VALUES(?,?,?,?,?,?,?)",
+        domain, port, data.enabled == false and 0 or 1, data.websocket == true and 1 or 0,
+        tostring(data.note or ""), tostring(data.menu_name or ""), os.time())
     if not ok then return db_error("创建应用失败", err) end
     bump_rev()
     return { message = "应用已创建" }, nil, 201
@@ -410,8 +448,8 @@ function _M.update_application(id, data)
     if not rows or not rows[1] then return nil, "应用不存在", 404 end
     local fields, values = {}, {}
     if data.domain ~= nil then
-        local domain = normalize_host(data.domain)
-        if not valid_host(domain) then return nil, "域名格式不合法", 422 end
+        local domain = normalize_binding_domain(data.domain)
+        if not domain then return nil, "请输入最后一级域名前缀，例如 name1", 422 end
         local duplicate = db.query("SELECT id FROM bindings WHERE domain = ? AND id != ?", domain, id)
         if duplicate and duplicate[1] then return nil, "域名已存在", 409 end
         fields[#fields + 1] = "domain = ?"
@@ -431,9 +469,19 @@ function _M.update_application(id, data)
         fields[#fields + 1] = "note = ?"
         values[#values + 1] = note
     end
+    if data.menu_name ~= nil then
+        local menu_name = tostring(data.menu_name)
+        if #menu_name > 128 then return nil, "菜单名称不能超过 128 个字符", 422 end
+        fields[#fields + 1] = "menu_name = ?"
+        values[#values + 1] = menu_name
+    end
     if data.enabled ~= nil then
         fields[#fields + 1] = "enabled = ?"
         values[#values + 1] = (data.enabled == true or data.enabled == 1) and 1 or 0
+    end
+    if data.websocket ~= nil then
+        fields[#fields + 1] = "websocket = ?"
+        values[#values + 1] = (data.websocket == true or data.websocket == 1) and 1 or 0
     end
     if #fields == 0 then return nil, "没有可更新字段", 422 end
     values[#values + 1] = id

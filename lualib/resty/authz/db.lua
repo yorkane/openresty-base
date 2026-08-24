@@ -257,7 +257,9 @@ CREATE TABLE IF NOT EXISTS bindings(
   domain     TEXT UNIQUE NOT NULL,
   port       INTEGER NOT NULL,
   enabled    INTEGER NOT NULL DEFAULT 1,
+  websocket  INTEGER NOT NULL DEFAULT 0,
   note       TEXT NOT NULL DEFAULT '',
+  menu_name  TEXT NOT NULL DEFAULT '',
   created_at INTEGER NOT NULL
 );
 ]]
@@ -299,6 +301,8 @@ function _M.init(opts)
     ensure_column("remote_users", "created_at", "created_at INTEGER NOT NULL DEFAULT 0")
     ensure_column("remote_users", "last_login_at", "last_login_at INTEGER")
     ensure_column("remote_users", "updated_at", "updated_at INTEGER NOT NULL DEFAULT 0")
+    ensure_column("bindings", "menu_name", "menu_name TEXT NOT NULL DEFAULT ''")
+    ensure_column("bindings", "websocket", "websocket INTEGER NOT NULL DEFAULT 0")
     local ok, err = _M.exec("UPDATE remote_users SET remote_roles = roles WHERE remote_roles = ''")
     if not ok then error("remote role migration failed: " .. tostring(err)) end
     ok, err = _M.exec("UPDATE users SET updated_at = created_at WHERE updated_at = 0")

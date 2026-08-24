@@ -68,8 +68,21 @@ function _M.list(config)
     local now = ngx.now()
     if cache.items and cache.expires_at > now then return cache.items end
 
+    local ports = {}
+    for value in tostring(config.discovery_ports or ""):gmatch("[^,%s]+") do
+        local port = tonumber(value)
+        if port and port >= config.port_min and port <= config.port_max
+            and port ~= config.http_port and port ~= config.https_port then
+            ports[port] = true
+        end
+    end
+    for _, port in ipairs(listening_ports(config)) do ports[port] = true end
+
     local items = {}
-    for _, port in ipairs(listening_ports(config)) do
+    local sorted_ports = {}
+    for port in pairs(ports) do sorted_ports[#sorted_ports + 1] = port end
+    table.sort(sorted_ports)
+    for _, port in ipairs(sorted_ports) do
         if is_http_service(port, config) then items[#items + 1] = item(port) end
     end
     cache.items = items

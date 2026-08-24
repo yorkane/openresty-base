@@ -2,7 +2,7 @@ const { createApp, computed, onBeforeUnmount, onMounted, ref } = Vue
 
 const builtInApps = {
   users: 'apps/users.html?v=6',
-  authorization: 'apps/authorization.html?v=6'
+  authorization: 'apps/authorization.html?v=7'
 }
 const allowedApps = new Set(Object.values(builtInApps))
 
@@ -37,7 +37,7 @@ const app = createApp({
       }
       applications.value.forEach(application => {
         const appUrl = applicationUrl(application)
-        const applicationLabel = application.note || application.domain || `127.0.0.1:${application.port}`
+        const applicationLabel = application.note || application.menu_name || application.domain || `local:${application.port}`
         items.push({
           app: appUrl,
           title: applicationLabel,

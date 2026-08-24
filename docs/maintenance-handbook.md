@@ -1,6 +1,6 @@
 # OpenResty Authz Gateway 维护手册
 
-> 面向后续维护 Agent。本文记录截至 2026-08-24 已验证的系统设计、开发约束、测试基线与部署方式。
+> 面向后续维护 Agent。本文记录截至 2026-08-25 已验证的系统设计、开发约束、测试基线与部署方式。
 > 修改前先读根目录 `AGENTS.MD`；涉及身份源时再读 `docs/sso-jwt-auth.md`。
 
 ## 1. 系统定位与入口
@@ -44,11 +44,11 @@ Browser
 两个网关入口使用相同控制面：
 
 - HTTP 入口默认 6080，代理 `http://127.0.0.1:<port>`；
-- HTTPS 入口默认 6443，代理 `https://127.0.0.1:<port>`；
-- 目标端口优先取启用的精确域名绑定，否则解析 `<port>-任意域名`；
+- HTTPS 入口默认 6443，在网关终止 TLS 后代理 `http://127.0.0.1:<port>`；
+- 目标端口优先取启用的精确域名绑定，否则解析 `<port>-任意域名`；显式绑定记录包含 `menu_name` 和 `websocket` 配置；
 - 可代理端口下限强制不小于 2000；目标为网关自身端口时返回 508；
 - 上游收到 `X-Authz-User`、`X-Authz-Source`、`X-Authz-Identity`。
-- 动态代理保留 HTTP/1.1 Upgrade；通过 `X-Forwarded-Host` 转发外部 Origin Host，并关闭缓冲、延长读写超时，支持 code-server WebSocket。
+- 只有绑定启用 WebSocket 且请求带有 `Upgrade: websocket` 时，动态代理才转发升级头；此时通过 `X-Forwarded-Host` 转发外部 Origin Host，并关闭缓冲、延长读写超时。普通 HTTP 绑定会清空升级头。
 
 Admin 菜单应用列表不依赖 `bindings` 表：`/_api_/authz/v1/applications` 读取 `/proc/net/tcp` 和
 `/proc/net/tcp6` 的监听端口，在 `AUTHZ_PORT_MIN/MAX` 范围内排除网关端口，再向 `127.0.0.1` 发送
@@ -96,7 +96,7 @@ SQLite 默认位于 `/data/authz/authz.db`，`/data` 必须持久化。
 | `remote_users` | 主键 `(provider, subject)`；唯一 `(provider, username)`；创建/最近登录/修改时间 |
 | `sessions` | token、username、source、csrf、expires_at |
 | `policies` | `ptype/v0/v1/v2` 唯一；存 p/g 规则 |
-| `bindings` | domain 唯一；port、enabled、note |
+| `bindings` | domain 唯一；port、enabled、websocket、note、menu_name |
 
 `remote_users.synced_at` 是保留的内部存储列名；管理 API 只输出语义明确的 `recorded_at`，避免把
 单向身份记录误解为双向同步协议。
@@ -311,6 +311,25 @@ curl -fsS http://127.0.0.1:6080/_authz/login >/dev/null
 
 不要默认容器名。历史实例用过 `authz-gw`，Compose 默认名是 `openresty-gateway`。
 
+日常重建优先使用仓库脚本：
+
+```bash
+bash scripts/restart_gateway.sh          # 使用当前镜像，应用新的 .env
+bash scripts/restart_gateway.sh --build  # 按当前 Docker 架构重建镜像后部署
+```
+
+脚本会拒绝非 `host` 网络，执行 `openresty -t`，并检查登录页、session API、Admin 入口和 HTTPS 登录页。
+`.env`、网络、挂载和镜像变化都要重建容器；仅执行 `docker restart` 不会更新容器创建时的环境变量。
+主配置或公共 `server.conf.template` 变化必须 `--build`；`admin/` 和 `lualib/` 是挂载目录，修改它们通常无需重新构建镜像。
+
+### 10.1 本次代理排障经验
+
+1. 先确认上游服务本身：`curl -i http://127.0.0.1:2077/` 返回 `200` 才说明本机 code-server HTTP 服务正常；本机 HTTPS 失败不代表网关故障。
+2. 再确认网关入口：`6443` 对外提供 HTTPS，但上游仍是 HTTP，不能设置上游 TLS 参数。
+3. 未登录时，绑定已解析但返回 `302` 到 `/_authz/login` 是预期认证结果；它证明请求已经进入认证链路。
+4. WebSocket 必须按绑定打开；不同前缀可以共用同一端口，但同一最终域名重复创建返回 `409`。
+5. 管理菜单优先使用已配置绑定的 `menu-name`，其次是绑定域名；没有绑定时才使用自动发现的 `local:<port>`。
+
 ## 11. 已解决故障与防回归点
 
 - Admin UI 统一使用 `/_radmin_/`，不要恢复 `/admin/`；旧路径曾与认证跳转和 Cookie 问题混杂。
@@ -327,6 +346,7 @@ curl -fsS http://127.0.0.1:6080/_authz/login >/dev/null
 - Admin 入口启用 SSI，个性化壳输出 `Cache-Control: no-store`；普通静态资源通过 `expires max` 输出长期缓存头。
 - Dockerfile 使用 Buildx 多阶段构建，`RESTY_J` 默认 8；源码下载单独缓存，GitHub Actions 使用 GHA cache。不要退回 `DOCKER_BUILDKIT=0`。
 - 发布或部署镜像时优先使用 GitHub Actions 推送到 GHCR 的镜像；只有调试 Dockerfile、验证未发布改动或 CI 不可用时才本地构建。
+- Docker Desktop for Mac 必须开启 Host Networking；否则容器内的 `127.0.0.1` 不代表宿主机端口，自动发现和代理测试都会产生误导性结果。
 
 ## 12. 维护交付清单
 

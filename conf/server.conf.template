@@ -111,14 +111,14 @@ location / {
     set $authz_user   "";
     set $authz_source "";
     set $authz_identity "";
+    set $authz_websocket "0";
+    set $authz_upgrade "";
+    set $authz_connection "";
     access_by_lua_block {
         require("resty.authz").access()
     }
     proxy_pass $authz_target;
     proxy_http_version 1.1;
-    proxy_ssl_verify off;
-    proxy_ssl_server_name on;
-    proxy_ssl_name $host;
     proxy_set_header Host              $host;
     proxy_set_header X-Real-IP         $remote_addr;
     proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
@@ -127,8 +127,8 @@ location / {
     proxy_set_header X-Authz-Source    $authz_source;
     proxy_set_header X-Authz-Identity  $authz_identity;
     proxy_set_header X-Forwarded-Host  $authz_forwarded_host;
-    proxy_set_header Upgrade           $http_upgrade;
-    proxy_set_header Connection        $connection_upgrade;
+    proxy_set_header Upgrade           $authz_upgrade;
+    proxy_set_header Connection        $authz_connection;
     proxy_buffering off;
     proxy_read_timeout 3600s;
     proxy_send_timeout 3600s;

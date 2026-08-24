@@ -90,6 +90,7 @@ function _M.init()
     c.discovery_ttl = math.max(5, tonumber(os.getenv("AUTHZ_DISCOVERY_TTL")) or 30)
     c.discovery_connect_timeout = math.max(20, tonumber(os.getenv("AUTHZ_DISCOVERY_CONNECT_TIMEOUT_MS")) or 100)
     c.discovery_read_timeout = math.max(20, tonumber(os.getenv("AUTHZ_DISCOVERY_READ_TIMEOUT_MS")) or 200)
+    c.discovery_ports = tostring(os.getenv("AUTHZ_DISCOVERY_PORTS") or "")
     c.db_cache_ttl = math.max(1, tonumber(os.getenv("AUTHZ_DB_CACHE_TTL")) or 30)
     c.db_cache_lru_size = math.max(50, tonumber(os.getenv("AUTHZ_DB_CACHE_LRU_SIZE")) or 500)
     c.cache_dict = "authz_cache"
@@ -305,10 +306,10 @@ local function load_policies()
 end
 
 local function load_bindings()
-    local rows = db.query("SELECT domain, port, enabled FROM bindings") or {}
+    local rows = db.query("SELECT domain, port, enabled, websocket FROM bindings") or {}
     local map = {}
     for _, b in ipairs(rows) do
-        map[b.domain] = { port = b.port, enabled = b.enabled }
+        map[b.domain] = { port = b.port, enabled = b.enabled, websocket = b.websocket == 1 }
     end
     return map
 end
@@ -342,11 +343,11 @@ end
 -- 返回 port 或 nil, err_html
 -- ────────────────────────────────────────────────────────────────
 
-local function resolve_port(host)
+local function resolve_target(host)
     ensure_cache()
     -- 1. 显式绑定 (精确匹配, 已 lowercase)
     local b = host and cache.bindings[host]
-    if b and b.enabled == 1 then return b.port end
+    if b and b.enabled == 1 then return b.port, b.websocket end
 
     -- 2. 数字前缀: <port>-<任意多级域名>
     if host then
@@ -354,7 +355,7 @@ local function resolve_port(host)
         if m then
             local port = tonumber(m[1])
             if port and port >= _M.config.port_min and port <= _M.config.port_max then
-                return port
+                return port, false
             end
         end
     end
@@ -383,7 +384,7 @@ function _M.access()
     db.open(_M.config.db_path)
 
     local host = ngx.var.host -- 已 lowercase, 不含端口
-    local port = resolve_port(host)
+    local port, websocket = resolve_target(host)
     if not port then
         return serve_404(host)
     end
@@ -427,6 +428,11 @@ function _M.access()
     ngx.var.authz_source = s.source
     ngx.var.authz_identity = principal
     ngx.var.authz_target = ngx.var.scheme .. "://127.0.0.1:" .. port
+    local requested_upgrade = tostring(ngx.var.http_upgrade or "")
+    local websocket_request = websocket and requested_upgrade:lower() == "websocket"
+    ngx.var.authz_websocket = websocket_request and "1" or "0"
+    ngx.var.authz_upgrade = websocket_request and requested_upgrade or ""
+    ngx.var.authz_connection = websocket_request and "upgrade" or ""
 end
 
 return _M

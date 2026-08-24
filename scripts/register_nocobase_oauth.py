@@ -74,6 +74,15 @@ def require_url(value, name, allow_http):
 def main():
     parser = argparse.ArgumentParser(description="Register the Authz Gateway as a NocoBase OAuth client")
     parser.add_argument("--env-file", default=".env")
+    parser.add_argument(
+        "--host-url",
+        help="公网网关 Origin；会写入 AUTHZ_HOST_URL 并生成 callback URI",
+    )
+    parser.add_argument(
+        "--new-client",
+        action="store_true",
+        help="按 Host URL 生成新的 Client ID，避免复用旧回调配置",
+    )
     parser.add_argument("--allow-http", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
@@ -82,7 +91,11 @@ def main():
         raise ValueError(f"environment file not found: {env_path}")
     values = parse_env(env_path)
     noco_url = require_url(values.get("AUTHZ_NOCO_URL", ""), "AUTHZ_NOCO_URL", args.allow_http)
-    host_url = require_url(values.get("AUTHZ_HOST_URL", ""), "AUTHZ_HOST_URL", args.allow_http)
+    host_url = require_url(
+        args.host_url or values.get("AUTHZ_HOST_URL", ""),
+        "AUTHZ_HOST_URL",
+        args.allow_http,
+    )
     api_key = values.get("AUTHZ_NOCO_API_KEY", "")
     if not api_key:
         raise ValueError("AUTHZ_NOCO_API_KEY is required")
@@ -91,6 +104,8 @@ def main():
     client_id = values.get("AUTHZ_NOCO_OAUTH_CLIENT_ID") or (
         "openresty-authz-" + hashlib.sha256(host_url.encode()).hexdigest()[:12]
     )
+    if args.new_client:
+        client_id = "openresty-authz-" + hashlib.sha256(host_url.encode()).hexdigest()[:12]
     configured_secret = values.get("AUTHZ_NOCO_OAUTH_CLIENT_SECRET", "")
 
     query = urllib.parse.urlencode({
@@ -135,6 +150,7 @@ def main():
         })
 
     update_env(env_path, {
+        "AUTHZ_HOST_URL": host_url,
         "AUTHZ_NOCO_OAUTH_ENABLED": "true",
         "AUTHZ_NOCO_OAUTH_CLIENT_ID": client_id,
         "AUTHZ_NOCO_OAUTH_CLIENT_SECRET": client_secret,

@@ -28,7 +28,14 @@
 所有代理流量需登录 + Casbin 策略授权；后端收到 `X-Authz-User` 头。管理菜单会读取本机监听端口，
 在配置的端口范围内用 `127.0.0.1` 和短超时 HTTP `HEAD` 探测，只列出实际 HTTP 服务；入口变化会定时刷新，
 并按 `<port>-当前域名` 生成动态入口，右侧 iframe 满屏加载对应服务。扫描结果默认缓存 30 秒，网关自身端口会排除。
-代理使用 HTTP/1.1 Upgrade，保留外部 Origin Host，并关闭响应缓冲、延长读写超时，可直接承载 code-server 等 WebSocket 应用。
+代理默认按普通 HTTP 处理；只有显式绑定开启 WebSocket 且请求带有 `Upgrade: websocket` 时，才转发升级头、关闭响应缓冲并延长读写超时，可承载 code-server 等 WebSocket 应用。
+
+管理端的“新增域名绑定”支持以下配置：
+
+- 只填写最后一级域名前缀，例如 `name1`；当前实例为 `m.ws.example.com` 时保存为 `name1-m.ws.example.com`；
+- 不同前缀可以绑定同一个端口，最终域名必须唯一，重复提交返回 `409`；
+- 可填写 `menu-name` 覆盖左侧菜单名称；配置绑定后，该端口不再依赖主动探测的菜单名称；
+- WebSocket 是绑定级开关，普通 HTTP 绑定会清空升级头。
 
 ### 管理界面
 
@@ -77,6 +84,16 @@ docker run -d --name gw --network host \
 添加 `ports` 映射。若改为普通 bridge 网络，容器内的 `127.0.0.1` 只代表网关容器自身，无法访问
 宿主机监听的端口。
 
+### 部署与排障经验
+
+- 只修改 `.env` 时必须重新创建容器：`bash scripts/restart_gateway.sh`；`docker restart` 不会更新容器创建时的环境变量。
+- 修改 `conf/nginx.conf.template` 或 `conf/server.conf.template` 时必须重新构建镜像并重建容器：`bash scripts/restart_gateway.sh --build`；Darwin Apple Silicon 自动使用 `linux/arm64`。
+- 修改已挂载的 `admin/` 或 `lualib/` 通常无需重建镜像，但应执行 `openresty -t`；修改挂载、网络或环境变量必须重建容器。
+- `6443` 是网关的 HTTPS 入口，TLS 在网关终止，本机应用通常仍使用 HTTP 上游；不要为该路径配置 `proxy_ssl_*`。
+- 测试本机 code-server 时先运行 `curl -i http://127.0.0.1:2077/`，返回 `200` 才说明后端 HTTP 正常；直接访问本机 `https://127.0.0.1:2077/` 失败是正常的协议不匹配。
+- 未带会话访问已解析的绑定域名时返回 `302` 到 `/_authz/login` 是预期认证结果，不能用未登录 curl 判断 iframe 或 WebSocket 是否正常。
+- `scripts/restart_gateway.sh` 会检查 Compose 配置、host 网络、OpenResty 配置、登录页、session API 和 Admin 入口。
+
 镜像将项目 `lualib/` 整体复制到 `/usr/local/openresty/site/lualib/`。Compose 默认把
 `${LUALIB_DIR:-./lualib}` 整目录只读挂载到同一路径，并同时挂载
 `${ADMIN_UI_DIR:-./admin}`；修改 Lua 后端或管理前端时无需重复构建镜像。
@@ -94,6 +111,7 @@ docker run -d --name gw --network host \
 | `AUTHZ_ADMIN_PASSWORD` | `admin123` | 首次 seed 的 admin 密码 |
 | `AUTHZ_PORT_MIN` / `AUTHZ_PORT_MAX` | `2000` / `20000` | 数字前缀端口范围 |
 | `AUTHZ_HTTP_PORT` / `AUTHZ_HTTPS_PORT` | `6080` / `6443` | 入口端口 |
+| `AUTHZ_DISCOVERY_PORTS` | 空 | Docker Desktop 无法从监听表发现时，追加探测端口，例如 `2077,3080` |
 | `NGINX_WORKER_PROCESSES` | `4` | Nginx worker 数量，可按 CPU 核数和并发量调整 |
 | `AUTHZ_DISCOVERY_TTL` | `30` | 本机 HTTP 服务发现缓存秒数 |
 | `AUTHZ_DISCOVERY_CONNECT_TIMEOUT_MS` / `AUTHZ_DISCOVERY_READ_TIMEOUT_MS` | `100` / `200` | 本机 HTTP 服务探测超时 |
@@ -314,7 +332,7 @@ GitHub Actions 每周一 UTC 02:00 自动检测最新版本并构建，推送到
 | 平台 | 支持 |
 |------|------|
 | `linux/amd64` | ✅ |
-| `linux/arm64` | ❌（暂未支持） |
+| `linux/arm64` | ✅ 本地 Buildx 构建；Darwin Apple Silicon 使用该架构 |
 
 ## 配置 Secrets
 

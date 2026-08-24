@@ -8,6 +8,7 @@ TMP_DIR=$(mktemp -d)
 PASS=0
 MOCK_PID=""
 NOCO_PID=""
+WS_PID=""
 
 free_port() {
     python3 - <<'PY'
@@ -23,6 +24,7 @@ HTTP_PORT=$(free_port)
 HTTPS_PORT=$(free_port)
 UPSTREAM_PORT=$(free_port)
 NOCO_PORT=$(free_port)
+WS_PORT=$(free_port)
 DYNAMIC_HOST="${UPSTREAM_PORT}-dynamic.test.example"
 POLICY_OBJECT="/${UPSTREAM_PORT}/*"
 
@@ -31,6 +33,7 @@ cleanup() {
     docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
     if [[ -n "$MOCK_PID" ]]; then kill "$MOCK_PID" >/dev/null 2>&1 || true; fi
     if [[ -n "$NOCO_PID" ]]; then kill "$NOCO_PID" >/dev/null 2>&1 || true; fi
+    if [[ -n "$WS_PID" ]]; then kill "$WS_PID" >/dev/null 2>&1 || true; fi
     rm -rf "$TMP_DIR" || true
 }
 trap cleanup EXIT
@@ -77,6 +80,8 @@ MOCK_PID=$!
 python3 "$REPO_DIR/test/mock_nocobase.py" "$NOCO_PORT" \
     "http://admin.test.example:$HTTP_PORT/_authz/oauth/callback" >"$TMP_DIR/nocobase.log" 2>&1 &
 NOCO_PID=$!
+python3 "$REPO_DIR/test/mock_websocket.py" "$WS_PORT" >"$TMP_DIR/websocket.log" 2>&1 &
+WS_PID=$!
 for _ in $(seq 1 30); do
     curl -fsS --max-time 1 "http://127.0.0.1:$UPSTREAM_PORT/" >/dev/null 2>&1 && break
     sleep 0.1
@@ -737,6 +742,8 @@ POLICY_ID=$(jq -er --arg object "$POLICY_OBJECT" '.data.policies[] | select(.v0 
 request GET "$DYNAMIC_HOST" / "$DYNAMIC_COOKIE"
 assert_eq "dynamic port allowed by policy" "$STATUS" "200"
 assert_eq "dynamic proxy body" "$BODY" "$MOCK_BODY"
+request GET "$ADMIN_HOST" /_api_/authz/v1/applications "$ADMIN_COOKIE"
+assert_json "HTTP service discovery finds mock port" ".data[] | select(.port == $UPSTREAM_PORT and .discovered == true) | .port | tostring" "$UPSTREAM_PORT"
 request POST "$DYNAMIC_HOST" / "$DYNAMIC_COOKIE"
 assert_eq "second selected method allowed" "$STATUS" "200"
 assert_eq "multi-method proxy body" "$BODY" "$MOCK_BODY"
@@ -777,6 +784,22 @@ APP_ID=$(jq -er '.data.bindings[] | select(.domain == "fixed.test.example") | .i
 login fixed.test.example bob bob654321 "$APP_COOKIE"
 request GET fixed.test.example / "$APP_COOKIE"
 assert_eq "fixed application proxy" "$STATUS" "200"
+
+request POST "$ADMIN_HOST" /_api_/authz/v1/applications "$ADMIN_COOKIE" "$CSRF" "{\"domain\":\"ws-fixed.test.example\",\"port\":$WS_PORT,\"enabled\":true,\"websocket\":true,\"note\":\"websocket test\"}"
+assert_eq "create WebSocket application" "$STATUS" "201"
+request GET "$ADMIN_HOST" /_api_/authz/v1/authorization "$ADMIN_COOKIE"
+assert_json "WebSocket binding is enabled" '.data.bindings[] | select(.domain == "ws-fixed.test.example") | .websocket | tostring' "1"
+WS_STATUS=$(curl -sS --max-time 5 --http1.1 --resolve "ws-fixed.test.example:$HTTP_PORT:127.0.0.1" \
+    -b "$ADMIN_COOKIE" -D "$TMP_DIR/websocket-headers" -o "$TMP_DIR/websocket-body" -w '%{http_code}' \
+    -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+    -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+    "http://ws-fixed.test.example:$HTTP_PORT/" || true)
+assert_eq "WebSocket handshake through enabled binding" "$WS_STATUS" "101"
+assert_contains "WebSocket upgrade response" "$(cat "$TMP_DIR/websocket-headers")" "101 Switching Protocols"
+
+request POST "$ADMIN_HOST" /_api_/authz/v1/applications "$ADMIN_COOKIE" "$CSRF" "{\"domain\":\"ws-fixed.test.example\",\"port\":$WS_PORT,\"enabled\":true}"
+assert_eq "duplicate domain binding rejected clearly" "$STATUS" "409"
+assert_json "duplicate domain binding error" '.error.code' "request_failed"
 
 request PATCH "$ADMIN_HOST" "/_api_/authz/v1/applications/$APP_ID" "$ADMIN_COOKIE" "$CSRF" '{"enabled":false}'
 assert_eq "disable application" "$STATUS" "200"
@@ -823,6 +846,17 @@ assert_eq "HTTPS login succeeds" "$STATUS" "302"
 SECURE_COOKIE=$(awk 'BEGIN { IGNORECASE=1 } /^Set-Cookie:/ { print }' "$TMP_DIR/secure-headers")
 assert_contains "HTTPS session cookie is Secure" "$SECURE_COOKIE" "; Secure"
 assert_contains "session cookie uses root domain" "$SECURE_COOKIE" "; Domain=.test.example"
+
+STATUS=$(curl -skS --max-time 5 --resolve "$DYNAMIC_HOST:$HTTPS_PORT:127.0.0.1" \
+    -c "$TMP_DIR/https-dynamic.cookie" -o /dev/null -w '%{http_code}' \
+    -X POST "https://$DYNAMIC_HOST:$HTTPS_PORT/_authz/login" \
+    --data-urlencode 'username=admin' --data-urlencode 'password=admin123')
+assert_eq "HTTPS dynamic login succeeds" "$STATUS" "302"
+STATUS=$(curl -skS --max-time 5 --resolve "$DYNAMIC_HOST:$HTTPS_PORT:127.0.0.1" \
+    -b "$TMP_DIR/https-dynamic.cookie" -o "$TMP_DIR/https-proxy-body" -w '%{http_code}' \
+    "https://$DYNAMIC_HOST:$HTTPS_PORT/")
+assert_eq "HTTPS gateway proxies to HTTP upstream" "$STATUS" "200"
+assert_eq "HTTPS HTTP-upstream proxy body" "$(<"$TMP_DIR/https-proxy-body")" "$MOCK_BODY"
 
 STATUS=$(curl -sS --max-time 5 --resolve "$ADMIN_HOST:$HTTP_PORT:127.0.0.1" \
     -H 'X-Forwarded-Proto: https' -D "$TMP_DIR/forwarded-secure-headers" \
