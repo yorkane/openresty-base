@@ -79,12 +79,21 @@ if [[ "$BUILD_IMAGE" == 1 ]]; then
 
     RESTY_J="$(docker compose config --format json | jq -r '.services.gateway.build.args.RESTY_J // "8"')"
     printf '构建本地镜像 %s (%s)...\n' "$IMAGE_NAME" "$PLATFORM"
-    docker buildx build \
-        --platform "$PLATFORM" \
-        --load \
-        --build-arg "RESTY_J=$RESTY_J" \
-        --tag "$IMAGE_NAME" \
-        .
+    if docker buildx version >/dev/null 2>&1; then
+        docker buildx build \
+            --platform "$PLATFORM" \
+            --load \
+            --build-arg "RESTY_J=$RESTY_J" \
+            --tag "$IMAGE_NAME" \
+            .
+    else
+        printf '未找到 docker buildx，回退到 docker build。\n'
+        docker build \
+            --platform "$PLATFORM" \
+            --build-arg "RESTY_J=$RESTY_J" \
+            --tag "$IMAGE_NAME" \
+            .
+    fi
 fi
 
 printf '按当前 .env 重建服务...\n'
