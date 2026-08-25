@@ -118,6 +118,8 @@ assert_not_contains "upstream Host does not expose public domain" "$SERVER_TEMPL
     'proxy_set_header Host              $host;'
 assert_contains "WebSocket buffering disabled" "$SERVER_TEMPLATE" 'proxy_buffering off;'
 assert_contains "WebSocket idle timeout extended" "$SERVER_TEMPLATE" 'proxy_read_timeout 3600s;'
+assert_contains "API key is stripped before proxying" "$SERVER_TEMPLATE" \
+    'proxy_set_header X-Authz-Key       "";'
 AUTHZ_INIT_SOURCE=$(cat "$REPO_DIR/lualib/resty/authz/init.lua")
 assert_contains "gateway always uses HTTP upstream" "$AUTHZ_INIT_SOURCE" \
     'ngx.var.authz_target = "http://127.0.0.1:" .. port'
@@ -297,6 +299,20 @@ connection.close()
 PY
 )
 assert_eq "local user timestamps migrated and seeded" "$USER_TIMESTAMP_MIGRATION" "yes"
+API_KEY_SCHEMA=$(python3 - "$TMP_DIR/data/authz/authz.db" <<'PY'
+import sqlite3
+import sys
+
+connection = sqlite3.connect(sys.argv[1])
+columns = {row[1] for row in connection.execute("PRAGMA table_info(api_keys)")}
+policy = connection.execute("""SELECT 1 FROM policies
+    WHERE ptype = 'p' AND v0 = 'role:api' AND v1 = '/*' AND v2 = '*'""").fetchone()
+valid = columns == {"id", "name", "token_hash", "role", "enabled", "created_at", "updated_at"}
+print("yes" if valid and policy else "no")
+connection.close()
+PY
+)
+assert_eq "API key schema and api role policy seeded" "$API_KEY_SCHEMA" "yes"
 LEGACY_POLICY=$(python3 - "$TMP_DIR/data/authz/authz.db" <<'PY'
 import sqlite3
 import sys
@@ -331,10 +347,11 @@ save_session_cookie() {
 }
 
 request() {
-    local method=$1 host=$2 path=$3 cookie=${4:-} csrf=${5:-} data=${6:-}
+    local method=$1 host=$2 path=$3 cookie=${4:-} csrf=${5:-} data=${6:-} api_key=${7:-}
     local args=(--silent --show-error --max-time 5 --request "$method" --resolve "$host:$HTTP_PORT:127.0.0.1" -H 'Accept: application/json' -D "$TMP_DIR/headers" -o "$TMP_DIR/body" -w '%{http_code}')
     [[ -n "$cookie" ]] && args+=(-H "Cookie: $(cookie_header "$cookie")")
     [[ -n "$csrf" ]] && args+=(-H "X-CSRF-Token: $csrf")
+    [[ -n "$api_key" ]] && args+=(-H "x-authz-key: $api_key")
     if [[ -n "$data" ]]; then args+=(-H 'Content-Type: application/json' --data "$data"); fi
     STATUS=$(curl "${args[@]}" "http://$host:$HTTP_PORT$path")
     BODY=$(<"$TMP_DIR/body")
@@ -467,6 +484,75 @@ request GET "$ADMIN_HOST" /_api_/authz/v1/applications "$ADMIN_COOKIE"
 assert_eq "applications API" "$STATUS" "200"
 assert_json "applications API returns a list" '.data | type' "array"
 assert_json "applications API discovers local HTTP service" ".data | map(select(.port == $UPSTREAM_PORT)) | length" "1"
+
+request GET "$ADMIN_HOST" /_api_/authz/v1/api-keys
+assert_eq "API key management requires a session" "$STATUS" "401"
+request POST "$ADMIN_HOST" /_api_/authz/v1/api-keys "$ADMIN_COOKIE" "$CSRF" '{"name":"agent-test"}'
+assert_eq "admin creates an API key" "$STATUS" "201"
+API_KEY_ID=$(jq -er '.data.id' "$TMP_DIR/body")
+API_KEY_TOKEN=$(jq -er '.data.token' "$TMP_DIR/body")
+jq '.data.token = "[REDACTED]"' "$TMP_DIR/body" >"$TMP_DIR/body-redacted"
+mv "$TMP_DIR/body-redacted" "$TMP_DIR/body"
+BODY=$(<"$TMP_DIR/body")
+[[ "$API_KEY_TOKEN" =~ ^ak_[a-f0-9]{64}$ ]] || fail "created API key has an invalid format"
+pass "raw API key is returned once with a stable format"
+assert_json "API key has fixed api role" '.data.role' "api"
+
+request GET "$ADMIN_HOST" /_api_/authz/v1/api-keys "$ADMIN_COOKIE"
+assert_eq "admin lists API keys" "$STATUS" "200"
+assert_json "API key list never returns raw token" '.data[0] | has("token") | tostring' "false"
+assert_json "API key list never returns token hash" '.data[0] | has("token_hash") | tostring' "false"
+request GET "$ADMIN_HOST" /_api_/authz/v1/session "" "" "" "$API_KEY_TOKEN"
+assert_eq "API role cannot impersonate a browser session" "$STATUS" "403"
+request GET "$ADMIN_HOST" /_api_/authz/v1/users "" "" "" "$API_KEY_TOKEN"
+assert_eq "API role cannot manage users or roles" "$STATUS" "403"
+request POST "$ADMIN_HOST" /_api_/authz/v1/policies "" "" '{"ptype":"p","v0":"role:api","v1":"/*","v2":"*"}' "$API_KEY_TOKEN"
+assert_eq "API role cannot modify core authorization" "$STATUS" "403"
+request GET "$ADMIN_HOST" /_api_/authz/v1/api-keys "" "" "" "$API_KEY_TOKEN"
+assert_eq "API role cannot manage API keys" "$STATUS" "403"
+request GET "$ADMIN_HOST" /_api_/authz/v1/session "$ADMIN_COOKIE" "" "" "ak_invalid"
+assert_eq "invalid API key never falls back to an admin cookie" "$STATUS" "401"
+
+request POST "$ADMIN_HOST" /_api_/authz/v1/applications "" "" \
+    "{\"domain\":\"agent.test.example\",\"port\":$UPSTREAM_PORT,\"menu_name\":\"Agent test\"}" "$API_KEY_TOKEN"
+assert_eq "API role creates a domain binding without CSRF" "$STATUS" "201"
+request GET "$ADMIN_HOST" /_api_/authz/v1/authorization "$ADMIN_COOKIE"
+API_BINDING_ID=$(jq -er '.data.bindings[] | select(.domain == "agent.test.example") | .id' "$TMP_DIR/body")
+request GET agent.test.example /identity "" "" "" "$API_KEY_TOKEN"
+assert_eq "API key accesses a proxied HTTP service" "$STATUS" "200"
+assert_json "upstream receives API key display name" '.user' "agent-test"
+assert_json "upstream receives API key source" '.source' "api-key"
+assert_json "upstream receives API key principal" ".identity" "api-key:$API_KEY_ID"
+assert_json "raw API key is stripped from upstream" '.authz_key == null | tostring' "true"
+request POST "$ADMIN_HOST" /_api_/authz/v1/policies "$ADMIN_COOKIE" "$CSRF" \
+    "{\"ptype\":\"p\",\"v0\":\"role:api\",\"v1\":\"/$UPSTREAM_PORT/blocked\",\"v2\":\"GET\",\"eft\":\"deny\"}"
+assert_eq "admin can constrain the API role with a deny policy" "$STATUS" "201"
+request GET "$ADMIN_HOST" /_api_/authz/v1/authorization "$ADMIN_COOKIE"
+API_DENY_POLICY_ID=$(jq -er --arg object "/$UPSTREAM_PORT/blocked" \
+    '.data.policies[] | select(.v0 == "role:api" and .v1 == $object) | .id' "$TMP_DIR/body")
+request GET agent.test.example /blocked "" "" "" "$API_KEY_TOKEN"
+assert_eq "API key obeys role:api Casbin deny policy" "$STATUS" "403"
+request DELETE "$ADMIN_HOST" "/_api_/authz/v1/policies/$API_DENY_POLICY_ID" "$ADMIN_COOKIE" "$CSRF"
+assert_eq "admin removes the API role deny policy" "$STATUS" "200"
+request PATCH "$ADMIN_HOST" "/_api_/authz/v1/applications/$API_BINDING_ID" "" "" \
+    '{"menu_name":"forbidden"}' "$API_KEY_TOKEN"
+assert_eq "API role cannot modify an existing binding" "$STATUS" "403"
+
+request PATCH "$ADMIN_HOST" "/_api_/authz/v1/api-keys/$API_KEY_ID" "$ADMIN_COOKIE" "$CSRF" '{"enabled":false}'
+assert_eq "admin disables an API key" "$STATUS" "200"
+request GET agent.test.example /identity "" "" "" "$API_KEY_TOKEN"
+assert_eq "disabled API key is rejected immediately" "$STATUS" "401"
+request PATCH "$ADMIN_HOST" "/_api_/authz/v1/api-keys/$API_KEY_ID" "$ADMIN_COOKIE" "$CSRF" '{"enabled":true}'
+assert_eq "admin re-enables an API key" "$STATUS" "200"
+request GET agent.test.example / "" "" "" "$API_KEY_TOKEN"
+assert_eq "re-enabled API key invalidates authorization cache" "$STATUS" "200"
+request DELETE "$ADMIN_HOST" "/_api_/authz/v1/api-keys/$API_KEY_ID" "$ADMIN_COOKIE" "$CSRF"
+assert_eq "admin deletes an API key" "$STATUS" "200"
+request GET agent.test.example / "" "" "" "$API_KEY_TOKEN"
+assert_eq "deleted API key is rejected immediately" "$STATUS" "401"
+request DELETE "$ADMIN_HOST" "/_api_/authz/v1/applications/$API_BINDING_ID" "$ADMIN_COOKIE" "$CSRF"
+assert_eq "admin removes the API-created binding" "$STATUS" "200"
+unset API_KEY_TOKEN
 
 request GET "$ADMIN_HOST" '/_authz/login?next=/_radmin_/'
 assert_eq "login page with OAuth provider" "$STATUS" "200"
@@ -666,6 +752,8 @@ assert_json "invalid JSON error code" '.error.code' "invalid_body"
 
 request POST "$ADMIN_HOST" /_api_/authz/v1/users "$ADMIN_COOKIE" "$CSRF" '{"username":"invalid-role","password":"password123","roles":["auditor"]}'
 assert_eq "unknown user role rejected" "$STATUS" "422"
+request POST "$ADMIN_HOST" /_api_/authz/v1/users "$ADMIN_COOKIE" "$CSRF" '{"username":"api-human","password":"password123","roles":["api"]}'
+assert_eq "api role cannot be assigned to a human user" "$STATUS" "422"
 
 request POST "$ADMIN_HOST" /_api_/authz/v1/users "$ADMIN_COOKIE" "$CSRF" '{"username":"bob","password":"bob123456","roles":["user"]}'
 assert_eq "create user" "$STATUS" "201"
@@ -784,7 +872,7 @@ assert_eq "authorization API" "$STATUS" "200"
 assert_json "minimum dynamic port clamped" '.data.port_min | tostring' "2000"
 assert_json "local user policy identity option" '.data.policy_users[] | select(.username == "admin" and .source == "local") | .identity' "user:local:admin"
 assert_json "policy role options" '.data.policy_roles | index("user") != null | tostring' "true"
-assert_json "policy role catalog" '.data.policy_roles | join(",")' "admin,staff,user,viewer"
+assert_json "policy role catalog includes service api role" '.data.policy_roles | join(",")' "admin,staff,user,viewer,api"
 assert_json "remote identity is a policy subject" '.data.policy_users[] | select(.username == "remote_user" and .source == "nocobase") | .identity' "user:nocobase:remote_user"
 assert_json "local same-name identity is listed separately" '.data.policy_users[] | select(.username == "bob" and .source == "local") | .identity' "user:local:bob"
 assert_json "remote same-name identity is listed separately" '.data.policy_users[] | select(.username == "bob" and .source == "nocobase") | .identity' "user:nocobase:bob"

@@ -52,6 +52,7 @@
 - 授权管理支持域名绑定增删/启停及 Casbin 策略编辑
 - `/_radmin_/` 由服务端会话保护，未登录自动跳转到 `/_authz/login?next=...`
 - 管理端统一调用 `/_api_/authz/v1/*` JSON API；旧 `/_authz/api/*` 与 `*/save` 接口已退役
+- 应用可使用 `x-authz-key` 访问代理目标并新建绑定；完整契约见 [核心 API（Agent 使用手册）](docs/core-api.md)
 
 首次启动自动 seed：`admin / admin123`（务必尽快改密）。默认仅
 `role:admin` 对 `/*` 全放行，其他角色默认拒绝。
@@ -153,8 +154,8 @@ docker run -d --name gw --network host \
   请求头或请求头值。
 - `lualib/resty/authz/db.lua` 是 SQLite 数据层；只读查询通过 vendored `resty.mlcache` 的 L1/L2/L3
   分层缓存，成功写入会递增共享的数据库 revision，使其他 worker 的旧查询键失效。
-- 数字前缀动态端口默认允许 `2000` 起步，角色固定为 `admin`、`staff`、`user`、`viewer`；HTTP 方法使用
-  完整方法目录，并支持多选策略。
+- 数字前缀动态端口默认允许 `2000` 起步；人类角色固定为 `admin`、`staff`、`user`、`viewer`，应用
+  Key 固定使用独立 `api` 角色；HTTP 方法使用完整方法目录，并支持多选策略。
 
 #### 身份与授权
 
@@ -163,6 +164,7 @@ docker run -d --name gw --network host \
 - 本地用户和本地角色优先于远程记录；远程身份只单向同步用户名、来源、角色快照和时间信息，不回写身份源。
 - 启用状态由本机管理员控制，只有管理员主动删除后远程身份才会被清除；远程用户不能修改本地密码。
 - 普通 `viewer` 用户只能查看自己的会话/身份信息，不能读取或修改 Casbin 授权策略。
+- `api` 角色只能新建域名绑定并按 Casbin 策略请求代理目标，不能管理用户、角色、策略、API Key 或核心认证。
 - 本系统不再同步 APISIX routes、用户、角色或策略；与外部系统保持松耦合、单向记录。
 
 #### 管理前端
@@ -194,6 +196,9 @@ bash test/test_klib_router_ctxvar.sh  # 真实 OpenResty Router 回归
 bash test/test_authz_gateway.sh      # 隔离 Authz/API/动态代理回归
 bash test/run_tests.sh <image>       # 镜像基础功能回归
 ```
+
+基础镜像测试会按 Docker daemon 架构选择 `linux/arm64` 或 `linux/amd64`，不会在 Apple Silicon 上强制拉取
+amd64 镜像覆盖本地构建标签。
 
 验证发布镜像时显式指定镜像：
 
@@ -357,6 +362,7 @@ GHCR 推送使用内置 `GITHUB_TOKEN`，无需额外配置。
 ├── docker-entrypoint.sh        # 证书生成 + conf 渲染 + 启动
 ├── docs/
 │   ├── thirdparty-oauth-login.md # NocoBase OAuth 唯一配置依据
+│   ├── core-api.md                # 核心 API 与 Agent/API Key 使用契约
 │   ├── maintenance-handbook.md  # 生产维护、测试与故障排查
 │   └── sso-jwt-auth.md           # 历史 JWT/SSO 参考
 ├── admin/                       # Vue 3 + Quasar UMD 管理界面
@@ -375,6 +381,7 @@ GHCR 推送使用内置 `GITHUB_TOKEN`，无需额外配置。
 │           ├── init.lua        # 入口: 配置/端口解析/认证授权
 │           ├── app.lua         # 登录、管理入口跳转、旧接口退役响应
 │           ├── api/            # /_api_/authz/v1 JSON API
+│           ├── api_key.lua     # x-authz-key 摘要校验与服务主体
 │           ├── db.lua          # SQLite FFI 封装 + schema
 │           ├── nocobase.lua    # NocoBase 登录/角色查询与身份快照
 │           ├── casbin.lua      # mini-casbin (p/g, deny优先)

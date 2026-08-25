@@ -19,6 +19,7 @@
 
 local db = require "resty.authz.db"
 local identity = require "resty.authz.identity"
+local api_key = require "resty.authz.api_key"
 local session = require "resty.authz.session"
 local casbin_mod = require "resty.authz.casbin"
 
@@ -333,6 +334,13 @@ local function ensure_cache()
             lines[#lines + 1] = "g, " .. principal .. ", role:" .. role
         end
     end
+    local api_keys = db.query("SELECT id, role FROM api_keys WHERE enabled = 1") or {}
+    for _, key in ipairs(api_keys) do
+        local principal = api_key.principal(key.id)
+        if principal and key.role == "api" then
+            lines[#lines + 1] = "g, " .. principal .. ", role:api"
+        end
+    end
     cache.enforcer = casbin_mod.new_enforcer(lines)
     cache.bindings = load_bindings()
     cache.rev = rev
@@ -399,10 +407,20 @@ function _M.access()
         return ngx.exit(508)
     end
 
-    -- 会话认证
-    local token = session.get_request_token()
-    local s = token and session.get(token) or nil
-    if not s then
+    -- x-authz-key 优先于浏览器会话；显式提交无效 Key 时禁止回退 Cookie。
+    local key_presented, current = api_key.authenticate_request()
+    local machine_request = key_presented
+    if not key_presented then
+        local token = session.get_request_token()
+        current = token and session.get(token) or nil
+    end
+    if not current then
+        if machine_request then
+            ngx.status = ngx.HTTP_UNAUTHORIZED
+            ngx.header.content_type = "application/json; charset=UTF-8"
+            ngx.say('{"error":{"code":"invalid_api_key","message":"API key is invalid or disabled"}}')
+            return ngx.exit(ngx.HTTP_UNAUTHORIZED)
+        end
         local next_url = ngx.var.request_uri or "/"
         ngx.status = ngx.HTTP_MOVED_TEMPORARILY
         ngx.header["Location"] = "/_authz/login?next=" .. ngx.escape_uri(next_url)
@@ -412,9 +430,14 @@ function _M.access()
     -- Casbin 授权: obj = "/<port><uri>", act = HTTP method
     ensure_cache()
     local obj = "/" .. port .. (ngx.var.uri or "")
-    local principal = identity.key(s.source, s.username)
+    local principal = machine_request and current.identity or identity.key(current.source, current.username)
     if not principal or not cache.enforcer:enforce(principal, obj, ngx.req.get_method()) then
         ngx.status = ngx.HTTP_FORBIDDEN
+        if machine_request then
+            ngx.header.content_type = "application/json; charset=UTF-8"
+            ngx.say('{"error":{"code":"forbidden","message":"API role is not allowed to access this target"}}')
+            return ngx.exit(ngx.HTTP_FORBIDDEN)
+        end
         ngx.header.content_type = "text/html; charset=utf-8"
         ngx.say("<html><body style='font-family:sans-serif;text-align:center;padding-top:80px'>" ..
             "<h1>403</h1><p>身份 <b>" .. (principal or "invalid") ..
@@ -424,8 +447,8 @@ function _M.access()
     end
 
     -- 传递给 proxy_pass 与后端
-    ngx.var.authz_user = s.username
-    ngx.var.authz_source = s.source
+    ngx.var.authz_user = current.username
+    ngx.var.authz_source = current.source
     ngx.var.authz_identity = principal
     -- TLS terminates at the gateway; local services are always HTTP upstreams.
     ngx.var.authz_target = "http://127.0.0.1:" .. port

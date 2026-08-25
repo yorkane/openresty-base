@@ -113,10 +113,12 @@ user:nocobase:kate
 user:dingtalk:kate
 ```
 
-同名不同来源必须保留独立角色、启用状态、会话和用户直授权。角色目录固定为
-`admin`、`staff`、`user`、`viewer`：
+同名不同来源必须保留独立角色、启用状态、会话和用户直授权。人类角色目录固定为
+`admin`、`staff`、`user`、`viewer`；服务主体另有不可分配给用户的 `api` 角色：
 
 - `admin` 可访问用户、应用绑定和 Casbin 管理 API；
+- `api-key:<id>` 固定继承 `role:api`，只能新建绑定并请求代理目标；
+- `api` 不能修改/删除绑定，不能管理用户、角色、策略、API Key 或核心认证；
 - 非 admin 只能读取自身 session/profile；
 - 默认仅 `role:admin` 拥有 `/*`，其他角色默认拒绝；
 - viewer 不得看到 Authorization/Casbin 数据；
@@ -147,7 +149,16 @@ Content-Type: application/json; charset=UTF-8
 
 约定状态码：无会话 401、无权限或 CSRF 失败 403、不存在 404、请求格式错误 400、业务校验
 422、冲突 409。所有修改请求使用 JSON body，并从 session API 取得 CSRF，通过
-`X-CSRF-Token` 发送；仅登录 POST 不要求 CSRF。
+`X-CSRF-Token` 发送；仅登录 POST 和 API Key 新建 binding 不要求 CSRF。稳定接口清单、请求体与
+Agent 调用契约见 [核心 API](core-api.md)。
+
+API Key 安全约束：
+
+- Header 固定为 `x-authz-key: ak_<64 hex>`，显式无效 Key 不得回退浏览器 Cookie；
+- 数据库 `api_keys` 只保存 SHA-256 摘要，明文只在创建响应中出现一次；
+- Key 固定使用 `api` 角色，不提供角色修改或角色创建接口；
+- 代理前必须通过 `proxy_set_header X-Authz-Key ""` 清除凭据；
+- Key 启用、禁用、删除和策略变更都必须 bump cache revision，并有跨 worker HTTP 回归。
 
 策略规则：
 
@@ -183,7 +194,8 @@ NocoBase OAuth 的 `/api/idpOAuth/me` 只提供标准身份 claim，不使用 Ba
 - 回调必须精确校验 RFC 9207 `iss`；
 - token 使用 `client_secret_basic`，并同时携带 PKCE verifier；
 - 公网 Client 通过 `oidcStates:create` collection API 一次性注册，不安装 NocoBase 插件；
-- 注册 API Key 不注入运行容器，配置以 `docs/thirdparty-oauth-login.md` 为准。
+- NocoBase Client 注册 API Key 不注入运行容器，配置以 `docs/thirdparty-oauth-login.md` 为准；它与
+  Authz Gateway 的 `x-authz-key` 应用凭据不是同一种密钥。
 
 同一 Client ID、Secret 和回调 URI 必须同时注入 NocoBase 与网关。环境变量改变必须重建容器，
 普通 `docker restart` 不会改变容器环境。详细配置见 `docs/sso-jwt-auth.md`。

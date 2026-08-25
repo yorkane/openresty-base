@@ -2,6 +2,7 @@
 -- 通用工具: 随机 token / 密码哈希 / HTML 转义
 
 local hmac_mod = require "resty.hmac"
+local sha256 = require "resty.sha256"
 local str_util = require "resty.string"
 local random = require "resty.random"
 
@@ -43,6 +44,17 @@ function _M.random_token(nbytes)
         t = random.bytes(nbytes or 32)
     end
     return str_util.to_hex(t)
+end
+
+function _M.sha256_hex(value)
+    if type(value) ~= "string" then return nil, "value must be a string" end
+    local digest = sha256:new()
+    if not digest then return nil, "sha256 init failed" end
+    local ok = digest:update(value)
+    if not ok then return nil, "sha256 update failed" end
+    local result = digest:final()
+    if not result then return nil, "sha256 final failed" end
+    return str_util.to_hex(result)
 end
 
 function _M.escape_html(s)

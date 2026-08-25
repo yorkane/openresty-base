@@ -13,6 +13,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "user": self.headers.get("X-Authz-User"),
                 "source": self.headers.get("X-Authz-Source"),
                 "identity": self.headers.get("X-Authz-Identity"),
+                "authz_key": self.headers.get("X-Authz-Key"),
                 "host": self.headers.get("Host"),
             }, separators=(",", ":")).encode()
             self.send_response(200)

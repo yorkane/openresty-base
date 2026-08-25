@@ -11,6 +11,22 @@ CONTAINER_PORT=8080
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 PASS=0; FAIL=0
 
+DOCKER_ARCH="$(docker info --format '{{.Architecture}}')"
+case "$DOCKER_ARCH" in
+    aarch64|arm64)
+        PLATFORM="linux/arm64"
+        EXPECTED_FFI_ARCH="arm64"
+        ;;
+    x86_64|amd64)
+        PLATFORM="linux/amd64"
+        EXPECTED_FFI_ARCH="x64"
+        ;;
+    *)
+        echo "Unsupported Docker architecture: $DOCKER_ARCH" >&2
+        exit 1
+        ;;
+esac
+
 # ── 颜色 ──────────────────────────────────────────────────────────────
 GREEN='\033[0;32m'; RED='\033[0;31m'; CYAN='\033[0;36m'; NC='\033[0m'
 
@@ -24,16 +40,17 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if docker image inspect "$IMAGE" >/dev/null 2>&1; then
-    info "Using local image: $IMAGE"
+if docker image inspect "$IMAGE" >/dev/null 2>&1 && \
+        [[ "$(docker image inspect "$IMAGE" --format '{{.Architecture}}')" == "${PLATFORM#linux/}" ]]; then
+    info "Using local image: $IMAGE ($PLATFORM)"
 else
-    info "Pulling image: $IMAGE"
-    docker pull "$IMAGE" --quiet
+    info "Pulling image: $IMAGE ($PLATFORM)"
+    docker pull --platform "$PLATFORM" "$IMAGE" --quiet
 fi
 
 info "Starting container $CONTAINER on a random local port ..."
 docker run -d --name "$CONTAINER" \
-    --platform linux/amd64 \
+    --platform "$PLATFORM" \
     -p "127.0.0.1::${CONTAINER_PORT}" \
     -v "${REPO_DIR}:/repo" \
     "$IMAGE" \
@@ -88,7 +105,7 @@ assert_contains "resty.lrucache"            "$BASE/core"  "resty.lrucache: OK"
 echo ""
 info "=== 4. LuaJIT FFI ==="
 assert_contains "ffi load"                  "$BASE/ffi"   "ffi: OK"
-assert_contains "ffi.arch amd64"            "$BASE/ffi"   "arch: x64"
+assert_contains "ffi.arch $EXPECTED_FFI_ARCH" "$BASE/ffi" "arch: $EXPECTED_FFI_ARCH"
 
 echo ""
 info "=== 5. FancyIndex 目录浏览 ==="

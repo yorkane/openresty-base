@@ -7,6 +7,7 @@
 --   sessions  服务端会话
 --   policies  casbin 策略行 p/g
 --   bindings  域名 -> 本机端口 绑定
+--   api_keys  应用 API Key（只保存 SHA-256 摘要）
 
 local ffi = require "ffi"
 local mlcache = require "resty.mlcache"
@@ -262,6 +263,15 @@ CREATE TABLE IF NOT EXISTS bindings(
   menu_name  TEXT NOT NULL DEFAULT '',
   created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS api_keys(
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  name       TEXT UNIQUE NOT NULL,
+  token_hash TEXT UNIQUE NOT NULL,
+  role       TEXT NOT NULL DEFAULT 'api' CHECK(role = 'api'),
+  enabled    INTEGER NOT NULL DEFAULT 1,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
 ]]
 
 function _M.init(opts)
@@ -363,17 +373,19 @@ function _M.init(opts)
     end
 
     ok, err = _M.exec([[DELETE FROM policies WHERE v0 NOT LIKE 'role:%' AND v0 NOT LIKE 'user:%'
+        AND v0 NOT LIKE 'api-key:%'
         AND EXISTS(SELECT 1 FROM policies existing
             WHERE existing.ptype = policies.ptype
             AND existing.v0 = 'user:local:' || policies.v0
             AND existing.v1 = policies.v1 AND existing.v2 = policies.v2)]])
     if not ok then error("duplicate policy migration failed: " .. tostring(err)) end
     ok, err = _M.exec([[UPDATE policies SET v0 = 'user:local:' || v0
-        WHERE v0 NOT LIKE 'role:%' AND v0 NOT LIKE 'user:%']])
+        WHERE v0 NOT LIKE 'role:%' AND v0 NOT LIKE 'user:%' AND v0 NOT LIKE 'api-key:%']])
     if not ok then error("policy identity migration failed: " .. tostring(err)) end
 
-    -- 默认拒绝: 仅管理员拥有全权, 普通用户必须显式授权
+    -- 默认拒绝: 管理员拥有全权；API 服务主体可请求代理目标，但控制面仍由 API guard 限制。
     _M.exec([[INSERT OR IGNORE INTO policies(ptype, v0, v1, v2) VALUES('p','role:admin','/*','*')]])
+    _M.exec([[INSERT OR IGNORE INTO policies(ptype, v0, v1, v2) VALUES('p','role:api','/*','*')]])
 
     -- 默认管理员 (仅在 users 为空时创建)
     local users = _M.query("SELECT COUNT(*) AS c FROM users")

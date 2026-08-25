@@ -8,9 +8,12 @@ local discovery = require "resty.authz.discovery"
 
 local _M = {}
 
-local ROLE_CATALOG = { "admin", "staff", "user", "viewer" }
-local ROLE_SET = {}
-for _, role in ipairs(ROLE_CATALOG) do ROLE_SET[role] = true end
+local HUMAN_ROLE_CATALOG = { "admin", "staff", "user", "viewer" }
+local POLICY_ROLE_CATALOG = { "admin", "staff", "user", "viewer", "api" }
+local HUMAN_ROLE_SET = {}
+local POLICY_ROLE_SET = {}
+for _, role in ipairs(HUMAN_ROLE_CATALOG) do HUMAN_ROLE_SET[role] = true end
+for _, role in ipairs(POLICY_ROLE_CATALOG) do POLICY_ROLE_SET[role] = true end
 
 local HTTP_METHODS = {
     "*", "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "CONNECT", "TRACE"
@@ -67,7 +70,7 @@ local function normalize_roles(value)
     for _, item in ipairs(input) do
         for role in tostring(item):gmatch("[^,%s]+") do
             role = role:lower()
-            if not ROLE_SET[role] then
+            if not HUMAN_ROLE_SET[role] then
                 return nil, "角色仅支持 admin、staff、user、viewer"
             end
             if not seen[role] then
@@ -82,6 +85,9 @@ local function normalize_roles(value)
 end
 
 function _M.roles_for(identity)
+    if type(identity) == "table" and identity.kind == "api_key" then
+        return { "api" }
+    end
     local username = type(identity) == "table" and identity.username or identity
     local source = type(identity) == "table" and identity.source or "local"
     local rows
@@ -155,7 +161,7 @@ function _M.list_users(s)
         roles = _M.roles_for(s),
         admin = true,
         csrf = s.csrf,
-        available_roles = ROLE_CATALOG,
+        available_roles = HUMAN_ROLE_CATALOG,
         users = users,
         remote_users = remote_users
     }
@@ -205,7 +211,7 @@ function _M.authorization(s)
         bindings = db.query("SELECT * FROM bindings ORDER BY domain") or {},
         policies = policies,
         policy_users = policy_users,
-        policy_roles = ROLE_CATALOG,
+        policy_roles = POLICY_ROLE_CATALOG,
         http_methods = HTTP_METHODS,
         port_min = authz.config.port_min,
         port_max = authz.config.port_max
@@ -443,6 +449,99 @@ function _M.create_application(data)
     return { message = "应用已创建" }, nil, 201
 end
 
+local function valid_api_key_name(value)
+    local name = tostring(value or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    if not ngx.re.match(name, [[^[A-Za-z0-9][A-Za-z0-9_.-]{1,63}$]], "jo") then
+        return nil
+    end
+    return name
+end
+
+local function api_key_by_id(id)
+    local rows = db.query([[SELECT id, name, role, enabled, created_at, updated_at
+        FROM api_keys WHERE id = ?]], id)
+    return rows and rows[1]
+end
+
+function _M.list_api_keys()
+    return db.query([[SELECT id, name, role, enabled, created_at, updated_at
+        FROM api_keys ORDER BY id]]) or {}
+end
+
+function _M.create_api_key(data)
+    local name = valid_api_key_name(data.name)
+    if not name then return nil, "名称需为 2-64 位字母、数字、点、下划线或连字符", 422 end
+    local duplicate = db.query("SELECT id FROM api_keys WHERE name = ?", name)
+    if duplicate and duplicate[1] then return nil, "API Key 名称已存在", 409 end
+    if data.role ~= nil and tostring(data.role) ~= "api" then
+        return nil, "API Key 角色固定为 api", 422
+    end
+
+    local random_part = util.random_token(32)
+    if not random_part then return nil, "生成 API Key 失败", 500 end
+    local token = "ak_" .. random_part
+    local token_hash, hash_err = util.sha256_hex(token)
+    if not token_hash then return nil, tostring(hash_err), 500 end
+    local now = os.time()
+    local ok, err = db.exec([[INSERT INTO api_keys
+        (name, token_hash, role, enabled, created_at, updated_at)
+        VALUES(?, ?, 'api', 1, ?, ?)]], name, token_hash, now, now)
+    if not ok then return db_error("创建 API Key 失败", err) end
+    local rows = db.query([[SELECT id, name, role, enabled, created_at, updated_at
+        FROM api_keys WHERE token_hash = ?]], token_hash)
+    local created = rows and rows[1]
+    if not created then return nil, "创建 API Key 后读取失败", 500 end
+    bump_rev()
+    return {
+        id = created.id,
+        name = created.name,
+        role = created.role,
+        enabled = created.enabled,
+        created_at = created.created_at,
+        updated_at = created.updated_at,
+        token = token,
+    }, nil, 201
+end
+
+function _M.update_api_key(id, data)
+    id = tonumber(id)
+    local current = id and api_key_by_id(id)
+    if not current then return nil, "API Key 不存在", 404 end
+    if data.role ~= nil then return nil, "API Key 角色固定为 api", 422 end
+
+    local fields, values = {}, {}
+    if data.name ~= nil then
+        local name = valid_api_key_name(data.name)
+        if not name then return nil, "名称需为 2-64 位字母、数字、点、下划线或连字符", 422 end
+        local duplicate = db.query("SELECT id FROM api_keys WHERE name = ? AND id != ?", name, id)
+        if duplicate and duplicate[1] then return nil, "API Key 名称已存在", 409 end
+        fields[#fields + 1] = "name = ?"
+        values[#values + 1] = name
+    end
+    if data.enabled ~= nil then
+        fields[#fields + 1] = "enabled = ?"
+        values[#values + 1] = (data.enabled == true or data.enabled == 1) and 1 or 0
+    end
+    if #fields == 0 then return nil, "没有可更新字段", 422 end
+    fields[#fields + 1] = "updated_at = ?"
+    values[#values + 1] = os.time()
+    values[#values + 1] = id
+    local ok, err = db.exec("UPDATE api_keys SET " .. table.concat(fields, ", ") .. " WHERE id = ?",
+        unpack(values))
+    if not ok then return db_error("更新 API Key 失败", err) end
+    bump_rev()
+    return api_key_by_id(id)
+end
+
+function _M.delete_api_key(id)
+    id = tonumber(id)
+    if not id or not api_key_by_id(id) then return nil, "API Key 不存在", 404 end
+    local ok, err = db.exec("DELETE FROM api_keys WHERE id = ?", id)
+    if not ok then return db_error("删除 API Key 失败", err) end
+    bump_rev()
+    return { message = "API Key 已删除" }
+end
+
 function _M.update_application(id, data)
     local rows = db.query("SELECT id FROM bindings WHERE id = ?", id)
     if not rows or not rows[1] then return nil, "应用不存在", 404 end
@@ -517,7 +616,7 @@ function _M.create_policy(data)
     end
     if ptype == "p" then
         if v0:sub(1, 5) == "role:" then
-            if not ROLE_SET[v0:sub(6)] then return nil, "策略角色不受支持", 422 end
+            if not POLICY_ROLE_SET[v0:sub(6)] then return nil, "策略角色不受支持", 422 end
         else
             if v0:sub(1, 5) ~= "user:" then v0 = identity_key.key("local", v0) or "" end
             if not validate_identity(v0) then return nil, "策略用户不存在或已禁用", 422 end
@@ -533,7 +632,9 @@ function _M.create_policy(data)
         if data.eft == "deny" then v2 = v2 .. "|deny" end
     else
         v1 = tostring(data.v1 or ""):gsub("%s+", "")
-        if not ROLE_SET[v1:gsub("^role:", "")] then return nil, "角色仅支持 admin、staff、user、viewer", 422 end
+        if not HUMAN_ROLE_SET[v1:gsub("^role:", "")] then
+            return nil, "用户角色仅支持 admin、staff、user、viewer", 422
+        end
         v1 = "role:" .. v1:gsub("^role:", "")
         if v0:sub(1, 5) ~= "user:" then v0 = identity_key.key("local", v0) or "" end
         if not validate_identity(v0) then return nil, "角色分配用户不存在或已禁用", 422 end

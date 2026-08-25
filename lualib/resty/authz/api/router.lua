@@ -83,7 +83,7 @@ end))
 
 register("POST", "/authz/v1/applications", guard.wrap(with_body(function(_, data)
     return service.create_application(data)
-end), { admin = true, csrf = true }))
+end), { admin = true, csrf = true, api_key = true }))
 
 register("PATCH", "/authz/v1/applications/:id", guard.wrap(with_body(function(params, data)
     return service.update_application(tonumber(params.id), data)
@@ -91,6 +91,22 @@ end), { admin = true, csrf = true }))
 
 register("DELETE", "/authz/v1/applications/:id", guard.wrap(function(params)
     return guard.result(service.delete_application(tonumber(params.id)))
+end, { admin = true, csrf = true }))
+
+register("GET", "/authz/v1/api-keys", guard.wrap(function()
+    return { data = array_data(service.list_api_keys()) }
+end, { admin = true }))
+
+register("POST", "/authz/v1/api-keys", guard.wrap(with_body(function(_, data)
+    return service.create_api_key(data)
+end), { admin = true, csrf = true }))
+
+register("PATCH", "/authz/v1/api-keys/:id", guard.wrap(with_body(function(params, data)
+    return service.update_api_key(tonumber(params.id), data)
+end), { admin = true, csrf = true }))
+
+register("DELETE", "/authz/v1/api-keys/:id", guard.wrap(function(params)
+    return guard.result(service.delete_api_key(tonumber(params.id)))
 end, { admin = true, csrf = true }))
 
 register("POST", "/authz/v1/policies", guard.wrap(with_body(function(_, data)

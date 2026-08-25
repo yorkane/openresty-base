@@ -126,6 +126,7 @@ location / {
     proxy_set_header X-Authz-User      $authz_user;
     proxy_set_header X-Authz-Source    $authz_source;
     proxy_set_header X-Authz-Identity  $authz_identity;
+    proxy_set_header X-Authz-Key       "";
     proxy_set_header X-Forwarded-Host  $authz_forwarded_host;
     proxy_set_header Upgrade           $authz_upgrade;
     proxy_set_header Connection        $authz_connection;

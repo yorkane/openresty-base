@@ -80,7 +80,7 @@
       const bindings = ref([])
       const policies = ref([])
       const policyUsers = ref([])
-      const policyRoles = ref(['admin', 'staff', 'user', 'viewer'])
+      const policyRoles = ref(['admin', 'staff', 'user', 'viewer', 'api'])
       const policyMethods = ref(['*', 'GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'CONNECT', 'TRACE'])
       const locale = ref(window.adminI18n.getLocale())
       const t = computed(() => window.adminI18n.messages[locale.value].authorization)
@@ -189,7 +189,7 @@
             bindings.value = data.bindings || []
             policies.value = data.policies || []
             policyUsers.value = data.policy_users || []
-            policyRoles.value = data.policy_roles || ['admin', 'staff', 'user', 'viewer']
+            policyRoles.value = data.policy_roles || ['admin', 'staff', 'user', 'viewer', 'api']
             policyMethods.value = data.http_methods || ['*', 'GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'CONNECT', 'TRACE']
             csrf.value = data.csrf || ''
             isAdmin.value = Boolean(data.admin)
