@@ -69,15 +69,23 @@ http {
         ''      close;
     }
 
-    map $http_origin $authz_forwarded_host {
+    map $http_x_forwarded_host $authz_request_host {
         default $http_x_forwarded_host;
-        ~^https?://([^/]+) $1;
+        ""      $http_host;
+    }
+
+    # Some outer proxies preserve the hostname but replace the public port.
+    # Restore the Origin authority only when its hostname matches the request
+    # hostname; a genuinely cross-origin hostname keeps the request Host.
+    map "$http_origin|$authz_request_host" $authz_forwarded_host {
+        default $authz_request_host;
+        ~*^https?://([^/:]+)(:\d+)?\|\1(?::\d+)?$ $1$2;
     }
 
     server {
         listen ${HTTP_PORT};
         server_name _;
-        include server.conf.template;
+        include server.conf;
     }
 
     server {
@@ -87,6 +95,6 @@ http {
         ssl_certificate     ${CERT_FILE};
         ssl_certificate_key ${CERT_KEY};
         ssl_protocols TLSv1.2 TLSv1.3;
-        include server.conf.template;
+        include server.conf;
     }
 }

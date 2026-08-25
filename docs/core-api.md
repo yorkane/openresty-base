@@ -126,8 +126,11 @@ SQLite 只保存 SHA-256 摘要，丢失明文后不能恢复，应删除旧 Key
 
 ### `GET /applications`
 
-会话用户读取已启用绑定与发现到的本机 HTTP 服务。返回数组中的常用字段为 `id`、`domain`、`port`、
-`menu_name`、`note`、`enabled`、`websocket`；主动探测项还包含 `source`。
+会话用户读取已启用绑定与发现到的本机 HTTP 服务。显式绑定除 `id`、`domain`、`target_ip`、`port`、
+`menu_name`、`note`、`enabled`、`websocket` 外，还返回下表中的绑定级代理字段；主动探测项还包含 `source`。
+应用列表同时返回 `label` 与 `binding`：显式绑定的 `label` 为 `menu_name`（未配置时回退为域名），
+`binding` 为 `true`，`note` 保留绑定备注；主动探测项的 `label` 为 `local:<port>`，`binding` 为 `false`。
+Admin 左侧菜单悬浮在显式绑定名称上时显示 `note`，不会把主动探测项的连接信息当作绑定备注。
 
 ### `POST /applications`
 
@@ -137,7 +140,7 @@ SQLite 只保存 SHA-256 摘要，丢失明文后不能恢复，应删除旧 Key
 curl -sS -X POST "${GATEWAY}/_api_/authz/v1/applications" \
   -H "x-authz-key: ${AUTHZ_KEY}" \
   -H "Content-Type: application/json" \
-  -d '{"domain":"code","port":2077,"menu_name":"Code Server","enabled":true}'
+  -d '{"domain":"code","target_ip":"192.168.1.20","port":2077,"menu_name":"Code Server","enabled":true}'
 ```
 
 请求字段：
@@ -145,18 +148,38 @@ curl -sS -X POST "${GATEWAY}/_api_/authz/v1/applications" \
 | 字段 | 必填 | 说明 |
 |---|---:|---|
 | `domain` | 是 | 推荐只填最后一级前缀，例如 `code`；也接受完整域名 |
-| `port` | 是 | 本机 HTTP 端口，必须位于配置的允许范围 |
+| `target_ip` | 否 | HTTP 上游的 IPv4 或 IPv6 地址，默认 `127.0.0.1`；不接受 URL、协议或主机名 |
+| `port` | 是 | 上游 HTTP 端口，必须位于配置的允许范围 |
 | `menu_name` | 否 | 左侧菜单显示名称，最多 128 字符 |
 | `note` | 否 | 备注，最多 256 字符 |
 | `enabled` | 否 | 默认 `true` |
 | `websocket` | 否 | 兼容字段；当前所有已解析目标默认支持 WebSocket 升级 |
+| `upstream_host` | 否 | 发送给上游的 `Host`；留空时使用外部请求 Host，模拟本机时使用目标 IP + 端口 |
+| `forwarded_host` | 否 | `X-Forwarded-Host`；留空时跟随有效上游 Host |
+| `forwarded_proto` | 否 | `""`（自动）、`http` 或 `https` |
+| `forwarded_port` | 否 | `0`/留空表示自动，否则为 1-65535 |
+| `origin_mode` | 否 | `auto`（默认）、`preserve`、`rewrite`、`remove` 或 `custom` |
+| `custom_origin` | 否 | `origin_mode=custom` 时必填，只接受无 path/query 的 `http(s)://authority` |
+| `simulate_local` | 否 | 默认 `false`；启用本机 HTTP 请求头模拟 |
+| `local_ip` | 否 | 模拟来源 IP，默认 `127.0.0.1`，也可使用网关局域网 IPv4/IPv6 |
 
 前缀会按当前实例域名生成完整入口。例如实例基域名为 `m.ws.example.com`，`domain: "code"` 保存为
 `code-m.ws.example.com`。域名必须唯一，重复返回 `409`。
 
 ### `PATCH /applications/:id`
 
-仅 `admin` 角色。可修改 `domain`、`port`、`menu_name`、`note`、`enabled`、`websocket`。
+仅 `admin` 角色。可修改创建接口中的全部字段。
+
+显式绑定始终代理到 `http://<target_ip>:<port>`。数字前缀免配置入口仍固定使用
+`http://127.0.0.1:<port>`；主动发现也只扫描本机 `127.0.0.1`。
+
+`target_ip` 不改变现有 Casbin 对象格式，授权仍按 `/<port><path>` 判断；不同 IP 上相同端口的绑定共享同一端口策略。
+`admin`/`api` Key 能创建指向内网地址的绑定，应只发放给允许访问目标网络的可信应用。
+
+代理头字段拒绝 CR/LF、URL path 和非法 authority，避免 Header 注入。`simulate_local` 会把默认 Host/Origin
+指向 `http://<target_ip>:<port>`，把 `X-Real-IP` 与 `X-Forwarded-For` 改为 `local_ip`，并移除客户端
+`Forwarded`；显式填写的 Host/Forwarded/Origin 配置优先。它不会伪造 TCP peer，远端上游实际看到的
+TCP 来源仍是网关主机地址。
 
 ### `DELETE /applications/:id`
 
@@ -178,13 +201,21 @@ curl -sS -X POST "${GATEWAY}/_api_/authz/v1/applications" \
 | `DELETE` | `/remote-users/:provider` | admin 用户/Key | 按 body 中 `subject` 删除远程身份快照 |
 | `GET` | `/authorization` | admin 用户/Key | 绑定、策略、策略主体、角色与 HTTP 方法目录 |
 | `POST` | `/policies` | admin 用户/Key | 新建 Casbin `p` 或人类用户的 `g` 规则 |
+| `PATCH` | `/policies/:id` | admin 用户/Key | 完整更新已有 Casbin `p` 或 `g` 规则 |
 | `DELETE` | `/policies/:id` | admin 用户/Key | 删除策略 |
 
 表中 admin 用户执行修改时仍需 CSRF，admin Key 不需要。`DELETE /session` 和 `PUT /me/password` 是
 浏览器用户会话专用接口；admin Key 可通过 `/users/:id/password` 管理本地用户密码。
 
-策略对象格式为 `/<port><path-pattern>`，例如 `/2077/*`；动作支持标准 HTTP 方法或 `*`。`p.v0` 可为
+策略对象格式为 `/<port><path-pattern>`，例如 `/2077/*` 或 `/2077/api/*`；管理端先选择绑定端口，
+再单独编辑路径并组合成该对象。动作支持标准 HTTP 方法或 `*`。`p.v0` 可为
 `user:<source>:<username>` 或 `role:<role>`。`deny` 优先于 `allow`。
+
+管理端从绑定创建策略时还会提交 `binding_id`。服务端验证该绑定存在且端口与 `v1` 一致，但 Casbin
+仍按兼容的端口 + 路径对象授权。`GET /authorization` 为每条 `p` 策略补充 `object_kind`、
+`object_port`、`object_path` 和 `binding_matches`，供调用方展示菜单名、域名、目标 IP、端口以及
+未绑定/同端口多绑定状态。`binding_matches` 多于一条意味着该策略会同时作用于这些同端口绑定。
+`PATCH /policies/:id` 使用与新建相同的完整字段和校验规则；校验失败不会覆盖原策略。
 
 ## 7. Agent 安全要求
 

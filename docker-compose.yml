@@ -1,17 +1,18 @@
 # openresty-base Authz Gateway
 #
 # 功能: 动态端口反向代理 + 本地认证授权 (SQLite + mini-casbin)
-#   - http  入口 AUTHZ_HTTP_PORT(默认6080)  → 本机 http 服务
-#   - https 入口 AUTHZ_HTTPS_PORT(默认6443) → 本机 https 服务 (自签证书)
+#   - http  入口 AUTHZ_HTTP_PORT(默认6080)  → HTTP 上游
+#   - https 入口 AUTHZ_HTTPS_PORT(默认6443) → 网关终止 TLS 后代理 HTTP 上游
 #   - 数字前缀子域名免配置: 3000-任意域名 → 本机3000端口 (范围 AUTHZ_PORT_MIN~MAX)
 #   - 管理界面: http://<host>:6080/_radmin_/  (首次启动 admin/admin123, 登录后改密)
 #
 # 使用:
 #   cp .env.example .env && vim .env      # 至少修改 AUTHZ_ADMIN_PASSWORD
-#   docker compose up -d --build
+#   docker compose up -d
 #   docker compose logs -f
 #
 # 注意: 使用 host 网络，让网关可以直接访问宿主机 127.0.0.1 上的服务
+#       conf/ 以只读方式挂载，模板变化重启容器即可，无需重新构建镜像
 
 services:
   gateway:
@@ -47,6 +48,7 @@ services:
       AUTHZ_SESSION_TTL: ${AUTHZ_SESSION_TTL:-604800}
       AUTHZ_COOKIE_SECURE: ${AUTHZ_COOKIE_SECURE:-false}
       AUTHZ_COOKIE_DOMAIN: ${AUTHZ_COOKIE_DOMAIN:-}
+      AUTHZ_HOST_URL: ${AUTHZ_HOST_URL:-}
       AUTHZ_LOGIN_ATTEMPTS: ${AUTHZ_LOGIN_ATTEMPTS:-10}
       AUTHZ_LOGIN_WINDOW: ${AUTHZ_LOGIN_WINDOW:-60}
       AUTHZ_NOCO_ENABLED: ${AUTHZ_NOCO_ENABLED:-false}
@@ -97,7 +99,9 @@ services:
       AUTHZ_OAUTH_SEND_TIMEOUT_MS: ${AUTHZ_OAUTH_SEND_TIMEOUT_MS:-10000}
       AUTHZ_OAUTH_READ_TIMEOUT_MS: ${AUTHZ_OAUTH_READ_TIMEOUT_MS:-15000}
       AUTHZ_DNS_RESOLVER: ${AUTHZ_DNS_RESOLVER:-}
+      OPENRESTY_TEMPLATE_DIR: /etc/openresty/templates
     volumes:
       - ${DATA_DIR:-./data}:/data
       - ${ADMIN_UI_DIR:-./admin}:/usr/local/openresty/nginx/html/admin:ro
       - ${LUALIB_DIR:-./lualib}:/usr/local/openresty/site/lualib:ro
+      - ${NGINX_TEMPLATE_DIR:-./conf}:/etc/openresty/templates:ro

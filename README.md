@@ -15,14 +15,14 @@
 
 | 入口 | 上游 | 说明 |
 |------|------|------|
-| `6080` (http) | `http://127.0.0.1:<port>` | 代理本机 http 服务 |
-| `6443` (https) | `https://127.0.0.1:<port>` | 自签默认证书，代理本机 https 服务 |
+| `6080` (http) | `http://<target_ip>:<port>` | 代理本机或其他 IP 的 HTTP 服务 |
+| `6443` (https) | `http://<target_ip>:<port>` | 网关终止 TLS，再代理 HTTP 上游 |
 
 ### 域名 → 端口解析规则
 
 1. **数字前缀子域名**（免配置）：`3000-任意域名` → 本机 `3000` 端口，
    支持多级子域名（`3000-a.b.c.example.com`），端口范围默认 `2000-20000`
-2. **显式绑定**：管理界面配置固定域名映射（存 SQLite）
+2. **显式绑定**：管理界面配置固定域名到目标 IP + 端口的映射（存 SQLite，目标 IP 默认 `127.0.0.1`）
 3. 其余域名 → 404
 
 所有代理流量需登录 + Casbin 策略授权；后端收到 `X-Authz-User` 头。管理菜单会读取本机监听端口，
@@ -33,9 +33,13 @@
 管理端的“新增域名绑定”支持以下配置：
 
 - 只填写最后一级域名前缀，例如 `name1`；当前实例为 `m.ws.example.com` 时保存为 `name1-m.ws.example.com`；
+- 目标 IP 默认 `127.0.0.1`，也可填写其他机器的 IPv4 或 IPv6 地址，所有上游统一使用 HTTP；
 - 不同前缀可以绑定同一个端口，最终域名必须唯一，重复提交返回 `409`；
 - 可填写 `menu-name` 覆盖左侧菜单名称；配置绑定后，该端口不再依赖主动探测的菜单名称；
+- 域名绑定的 `note` 会在左侧菜单名称悬浮时显示；自动探测的 `local:<port>` 仅显示名称，不显示绑定备注；
 - WebSocket 默认对所有已解析目标开启；`bindings.websocket` 字段保留用于兼容历史数据，不再作为升级请求的阻断开关。
+- “高级代理配置”可覆盖上游 `Host`、`X-Forwarded-Host`、`X-Forwarded-Proto`、`X-Forwarded-Port`，并选择保持、重写、移除或自定义 `Origin`；留空时继续使用外部访问域名。
+- “模拟本机访问”默认把 `Host`/`Origin` 改为目标 HTTP 地址，并将 `X-Real-IP`、`X-Forwarded-For` 设置为 `127.0.0.1`；也可填写网关的局域网 IP。该选项只模拟 HTTP 请求头，不能改变真实 TCP 来源地址。
 
 ### 管理界面
 
@@ -74,6 +78,8 @@ docker run -d --name gw --network host \
   -v /data/gw:/data \
   -v "$PWD/admin:/usr/local/openresty/nginx/html/admin:ro" \
   -v "$PWD/lualib:/usr/local/openresty/site/lualib:ro" \
+  -v "$PWD/conf:/etc/openresty/templates:ro" \
+  -e OPENRESTY_TEMPLATE_DIR=/etc/openresty/templates \
   -e AUTHZ_ADMIN_PASSWORD=your-secret \
   ghcr.io/yorkane/openresty-base:latest
 
@@ -88,17 +94,20 @@ docker run -d --name gw --network host \
 
 ### 部署与排障经验
 
-- 只修改 `.env` 时必须重新创建容器：`bash scripts/restart_gateway.sh`；`docker restart` 不会更新容器创建时的环境变量。
-- 修改 `conf/nginx.conf.template` 或 `conf/server.conf.template` 时必须重新构建镜像并重建容器：`bash scripts/restart_gateway.sh --build`；Darwin Apple Silicon 自动使用 `linux/arm64`。
+- 修改 `.env`、`conf/nginx.conf.template` 或 `conf/server.conf.template` 后执行 `bash scripts/restart_gateway.sh`；Compose 会挂载 `conf/`，入口脚本在每次容器启动时重新生成最终配置，不需要重建镜像。
+- 只修改模板时也可执行 `docker restart openresty-gateway`；只执行 `docker restart` 不会更新容器创建时的环境变量。Darwin Apple Silicon 本地构建自动使用 `linux/arm64`。
+- 只有修改 Dockerfile、`docker-entrypoint.sh`、镜像依赖或原生模块时才使用 `bash scripts/restart_gateway.sh --build`。
 - 修改已挂载的 `admin/` 或 `lualib/` 通常无需重建镜像，但应执行 `openresty -t`；修改挂载、网络或环境变量必须重建容器。
 - `6443` 是网关的 HTTPS 入口，TLS 在网关终止，本机应用通常仍使用 HTTP 上游；不要为该路径配置 `proxy_ssl_*`。
+- 网关向上游保留外部 `Host`；带严格 Host/Origin 校验的应用还需把绑定域名加入自身可信列表，例如 pi-web 设置 `PI_WEB_ALLOWED_HOSTS=pi-m.ws.example.com`。
+- 若上游只接受内部 Host 或本地来源，可在该绑定的“高级代理配置”中精确覆盖相关头，或启用“模拟本机访问”；不要为解决单个应用兼容问题修改全局代理默认值。
 - 测试本机 code-server 时先运行 `curl -i http://127.0.0.1:2077/`，返回 `200` 才说明后端 HTTP 正常；直接访问本机 `https://127.0.0.1:2077/` 失败是正常的协议不匹配。
 - 未带会话访问已解析的绑定域名时返回 `302` 到 `/_authz/login` 是预期认证结果，不能用未登录 curl 判断 iframe 或 WebSocket 是否正常。
 - `scripts/restart_gateway.sh` 会检查 Compose 配置、host 网络、OpenResty 配置、登录页、session API 和 Admin 入口。
 
 镜像将项目 `lualib/` 整体复制到 `/usr/local/openresty/site/lualib/`。Compose 默认把
 `${LUALIB_DIR:-./lualib}` 整目录只读挂载到同一路径，并同时挂载
-`${ADMIN_UI_DIR:-./admin}`；修改 Lua 后端或管理前端时无需重复构建镜像。
+`${ADMIN_UI_DIR:-./admin}` 和 `${NGINX_TEMPLATE_DIR:-./conf}`；修改 Lua 后端、管理前端或 Nginx 模板时无需重复构建镜像。
 由于宿主机 `admin/` 挂载会覆盖镜像内的预生成 `.br` 文件，开发挂载场景依靠动态 Brotli；生产静态资源
 应优先使用 CI 构建的镜像，以便 `brotli_static` 直接命中预压缩文件。
 
@@ -119,11 +128,11 @@ docker run -d --name gw --network host \
 | `AUTHZ_DISCOVERY_CONNECT_TIMEOUT_MS` / `AUTHZ_DISCOVERY_READ_TIMEOUT_MS` | `100` / `200` | 本机 HTTP 服务探测超时 |
 | `AUTHZ_DB_CACHE_TTL` | `30` | SQLite 查询的 mlcache TTL（秒） |
 | `AUTHZ_DB_CACHE_LRU_SIZE` | `500` | 每个 worker 的 mlcache L1 条目数 |
-| `AUTHZ_HOST_URL` | 空 | 浏览器访问网关的 HTTPS Origin，用于生成 OAuth 回调 |
+| `AUTHZ_HOST_URL` | 空 | 浏览器访问网关的 HTTPS Origin，用于生成 OAuth 回调，并在请求 Host 不可用时回退推导 Cookie 父域 |
 | `AUTHZ_CERT_DIR` | `/data/certs` | 自签证书目录（10 年有效） |
 | `AUTHZ_SESSION_TTL` | `604800` | 会话有效期（秒） |
 | `AUTHZ_COOKIE_SECURE` | `false` | 生产入口始终为 HTTPS 时强制 Cookie `Secure` |
-| `AUTHZ_COOKIE_DOMAIN` | 空 | 动态端口 iframe 跨子域共享会话时设置，例如 `.example.com` |
+| `AUTHZ_COOKIE_DOMAIN` | 从请求 Host 动态推导 | 可选的 Cookie 父域提示，支持逗号分隔多个值；仅匹配当前 Host 时生效，例如 `.ws.example.com,.w.wtvdev.com` |
 | `AUTHZ_LOGIN_ATTEMPTS` / `AUTHZ_LOGIN_WINDOW` | `10` / `60` | 单 IP 登录尝试限流 |
 | `AUTHZ_NOCO_ENABLED` | `false` | 在密码登录表单启用 NocoBase 身份来源 |
 | `AUTHZ_NOCO_URL` | 空 | NocoBase 站点根地址（启用远程认证时必须为 HTTPS） |
@@ -183,7 +192,7 @@ docker run -d --name gw --network host \
 - Dockerfile 使用 Buildx 多阶段构建，默认 `RESTY_J=8`；源码下载和编译层必须保持可缓存，容器内不配置代理。
 - `ngx_brotli` 静态编译进 OpenResty；动态 Brotli/Gzip 默认等级均为 5，Admin 静态资源在镜像构建时使用 Brotli
   等级 11 预压缩，并通过 `brotli_static on` 提供。
-- Compose 的 `/data`、`admin/`、`lualib/` 挂载路径必须与镜像内路径一致，避免镜像和开发挂载行为不一致。
+- Compose 的 `/data`、`admin/`、`lualib/` 和运行时 `conf/` 模板挂载路径必须与镜像约定一致，避免镜像和开发挂载行为不一致。
 
 ### 数据持久化
 

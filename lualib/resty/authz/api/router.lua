@@ -113,6 +113,10 @@ register("POST", "/authz/v1/policies", guard.wrap(with_body(function(_, data)
     return service.create_policy(data)
 end), { admin = true, csrf = true }))
 
+register("PATCH", "/authz/v1/policies/:id", guard.wrap(with_body(function(params, data)
+    return service.update_policy(tonumber(params.id), data)
+end), { admin = true, csrf = true }))
+
 register("DELETE", "/authz/v1/policies/:id", guard.wrap(function(params)
     return guard.result(service.delete_policy(tonumber(params.id)))
 end, { admin = true, csrf = true }))

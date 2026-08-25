@@ -1,7 +1,7 @@
 #!/bin/sh
 # openresty-base gateway entrypoint
 # 1. 生成自签默认证书 (如缺失)
-# 2. envsubst 渲染 nginx.conf
+# 2. envsubst 渲染 nginx.conf 与 server.conf
 # 3. 启动 openresty
 
 set -e
@@ -19,6 +19,9 @@ CERT_KEY="$CERT_DIR/default.key"
 OPENSSL_BIN="/usr/local/openresty/openssl3/bin/openssl"
 OPENSSL_CONF_FILE="/usr/local/openresty/nginx/conf/openssl.cnf"
 NGINX_CONF_DIR="/usr/local/openresty/nginx/conf"
+TEMPLATE_DIR="${OPENRESTY_TEMPLATE_DIR:-$NGINX_CONF_DIR}"
+NGINX_TEMPLATE_FILE="$TEMPLATE_DIR/nginx.conf.template"
+SERVER_TEMPLATE_FILE="$TEMPLATE_DIR/server.conf.template"
 
 mkdir -p "$(dirname "$DB_PATH")" "$CERT_DIR" /var/log/openresty
 
@@ -32,11 +35,29 @@ if [ ! -s "$CERT_FILE" ] || [ ! -s "$CERT_KEY" ]; then
         -addext "subjectAltName=DNS:*" >/dev/null 2>&1
 fi
 
-# ── 渲染 nginx.conf ─────────────────────────────────────────────
+# ── 渲染运行时 Nginx 配置 ──────────────────────────────────────
 export HTTP_PORT HTTPS_PORT WORKER_PROCESSES CERT_FILE CERT_KEY DNS_RESOLVER
-envsubst '${HTTP_PORT} ${HTTPS_PORT} ${WORKER_PROCESSES} ${CERT_FILE} ${CERT_KEY} ${DNS_RESOLVER}' \
-    < "$NGINX_CONF_DIR/nginx.conf.template" \
-    > "$NGINX_CONF_DIR/nginx.conf"
+TEMPLATE_VARIABLES='${HTTP_PORT} ${HTTPS_PORT} ${WORKER_PROCESSES} ${CERT_FILE} ${CERT_KEY} ${DNS_RESOLVER}'
+
+for template_file in "$NGINX_TEMPLATE_FILE" "$SERVER_TEMPLATE_FILE"; do
+    if [ ! -s "$template_file" ]; then
+        echo "error: missing runtime template: $template_file" >&2
+        exit 1
+    fi
+done
+
+render_template() {
+    input_file="$1"
+    output_file="$2"
+    temporary_file="${output_file}.tmp.$$"
+    envsubst "$TEMPLATE_VARIABLES" < "$input_file" > "$temporary_file"
+    mv "$temporary_file" "$output_file"
+}
+
+render_template "$SERVER_TEMPLATE_FILE" "$NGINX_CONF_DIR/server.conf"
+render_template "$NGINX_TEMPLATE_FILE" "$NGINX_CONF_DIR/nginx.conf"
+
+echo "==> rendered nginx configuration from $TEMPLATE_DIR"
 
 echo "==> starting openresty gateway (http:$HTTP_PORT https:$HTTPS_PORT)"
 

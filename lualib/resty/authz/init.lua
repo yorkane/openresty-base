@@ -22,6 +22,7 @@ local identity = require "resty.authz.identity"
 local api_key = require "resty.authz.api_key"
 local session = require "resty.authz.session"
 local casbin_mod = require "resty.authz.casbin"
+local target = require "resty.authz.target"
 
 local _M = {}
 _M.config = {}
@@ -99,7 +100,7 @@ function _M.init()
     c.login_attempts = math.max(1, tonumber(os.getenv("AUTHZ_LOGIN_ATTEMPTS")) or 10)
     c.login_window = math.max(1, tonumber(os.getenv("AUTHZ_LOGIN_WINDOW")) or 60)
     session.secure = env_bool("AUTHZ_COOKIE_SECURE", false)
-    session.cookie_domain = tostring(os.getenv("AUTHZ_COOKIE_DOMAIN") or "")
+    session.configure_cookie_domain(os.getenv("AUTHZ_COOKIE_DOMAIN"), os.getenv("AUTHZ_HOST_URL"))
     c.noco_enabled = env_bool("AUTHZ_NOCO_ENABLED", false)
     c.noco_oauth_enabled = env_bool("AUTHZ_NOCO_OAUTH_ENABLED", false)
     c.noco_base_url = tostring(os.getenv("AUTHZ_NOCO_URL") or ""):gsub("/+$", "")
@@ -277,7 +278,7 @@ end
 local cache = {
     rev = -1,
     enforcer = nil,        -- casbin enforcer
-    bindings = nil,        -- { [domain_lower] = {port=..., enabled=...} }
+    bindings = nil,        -- { [domain_lower] = {target_ip=..., port=..., enabled=...} }
 }
 
 local function current_rev()
@@ -307,10 +308,27 @@ local function load_policies()
 end
 
 local function load_bindings()
-    local rows = db.query("SELECT domain, port, enabled, websocket FROM bindings") or {}
+    local rows = db.query([[SELECT domain, target_ip, port, enabled, websocket,
+        upstream_host, forwarded_host, forwarded_proto, forwarded_port, origin_mode,
+        custom_origin, simulate_local, local_ip FROM bindings]]) or {}
     local map = {}
     for _, b in ipairs(rows) do
-        map[b.domain] = { port = b.port, enabled = b.enabled, websocket = b.websocket == 1 }
+        map[b.domain] = {
+            target_ip = target.normalize_ip(b.target_ip) or "127.0.0.1",
+            port = b.port,
+            enabled = b.enabled,
+            websocket = b.websocket == 1,
+            upstream_host = target.normalize_authority(b.upstream_host, true) or "",
+            forwarded_host = target.normalize_authority(b.forwarded_host, true) or "",
+            forwarded_proto = (b.forwarded_proto == "http" or b.forwarded_proto == "https")
+                and b.forwarded_proto or "",
+            forwarded_port = tonumber(b.forwarded_port) or 0,
+            origin_mode = ({ auto = true, preserve = true, rewrite = true,
+                remove = true, custom = true })[b.origin_mode] and b.origin_mode or "auto",
+            custom_origin = target.normalize_origin(b.custom_origin, true) or "",
+            simulate_local = tonumber(b.simulate_local) == 1,
+            local_ip = target.normalize_ip(b.local_ip) or "127.0.0.1",
+        }
     end
     return map
 end
@@ -349,14 +367,14 @@ end
 
 -- ────────────────────────────────────────────────────────────────
 -- 目标解析: 显式绑定 > 数字前缀 > 404
--- 返回 port 或 nil, err_html
+-- 返回 port、WebSocket 兼容值、target_ip、显式绑定，或 nil
 -- ────────────────────────────────────────────────────────────────
 
 local function resolve_target(host)
     ensure_cache()
     -- 1. 显式绑定 (精确匹配, 已 lowercase)
     local b = host and cache.bindings[host]
-    if b and b.enabled == 1 then return b.port, b.websocket end
+    if b and b.enabled == 1 then return b.port, b.websocket, b.target_ip, b end
 
     -- 2. 数字前缀: <port>-<任意多级域名>
     if host then
@@ -364,11 +382,80 @@ local function resolve_target(host)
         if m then
             local port = tonumber(m[1])
             if port and port >= _M.config.port_min and port <= _M.config.port_max then
-                return port, false
+                return port, false, "127.0.0.1", nil
             end
         end
     end
     return nil
+end
+
+local function authority_port(authority)
+    authority = tostring(authority or "")
+    return tonumber(authority:match("^%[[^%]]+%]:(%d+)$") or authority:match("^[^:]+:(%d+)$"))
+end
+
+local function request_forwarded_for()
+    local existing = tostring(ngx.var.http_x_forwarded_for or "")
+    local remote = tostring(ngx.var.remote_addr or "")
+    if existing == "" then return remote end
+    if remote == "" then return existing end
+    return existing .. ", " .. remote
+end
+
+local function apply_proxy_headers(binding, target_ip, port)
+    binding = binding or {}
+    local target_authority = target.url_host(target_ip) .. ":" .. tostring(port)
+    local request_host = target.normalize_authority(ngx.var.authz_forwarded_host, true)
+    if not request_host or request_host == "" then
+        request_host = target.normalize_authority(ngx.var.http_host, true)
+    end
+    if not request_host or request_host == "" then request_host = target_authority end
+
+    local simulate_local = binding.simulate_local == true
+    local upstream_host = binding.upstream_host or ""
+    if upstream_host == "" then
+        upstream_host = simulate_local and target_authority or request_host
+    end
+    local forwarded_host = binding.forwarded_host or ""
+    if forwarded_host == "" then forwarded_host = upstream_host end
+
+    local forwarded_proto = binding.forwarded_proto or ""
+    if forwarded_proto == "" then
+        forwarded_proto = simulate_local and "http" or tostring(ngx.var.scheme or "http")
+    end
+    local forwarded_port = tonumber(binding.forwarded_port) or 0
+    if forwarded_port < 1 or forwarded_port > 65535 then
+        forwarded_port = authority_port(forwarded_host) or
+            (simulate_local and port or (forwarded_proto == "https" and 443 or 80))
+    end
+
+    local incoming_origin = tostring(ngx.var.http_origin or "")
+    local origin_mode = binding.origin_mode or "auto"
+    local origin
+    if origin_mode == "remove" then
+        origin = ""
+    elseif origin_mode == "custom" then
+        origin = binding.custom_origin or ""
+    elseif origin_mode == "rewrite" or (origin_mode == "auto" and simulate_local) then
+        origin = incoming_origin ~= "" and (forwarded_proto .. "://" .. forwarded_host) or ""
+    else
+        origin = incoming_origin
+    end
+
+    ngx.var.authz_upstream_host = upstream_host
+    ngx.var.authz_proxy_forwarded_host = forwarded_host
+    ngx.var.authz_forwarded_proto = forwarded_proto
+    ngx.var.authz_forwarded_port = tostring(forwarded_port)
+    ngx.var.authz_origin = origin
+    if simulate_local then
+        ngx.var.authz_real_ip = binding.local_ip or "127.0.0.1"
+        ngx.var.authz_forwarded_for = binding.local_ip or "127.0.0.1"
+        ngx.var.authz_forwarded = ""
+    else
+        ngx.var.authz_real_ip = tostring(ngx.var.remote_addr or "")
+        ngx.var.authz_forwarded_for = request_forwarded_for()
+        ngx.var.authz_forwarded = tostring(ngx.var.http_forwarded or "")
+    end
 end
 
 local function serve_404(host)
@@ -393,17 +480,19 @@ function _M.access()
     db.open(_M.config.db_path)
 
     local host = ngx.var.host -- 已 lowercase, 不含端口
-    local port, websocket = resolve_target(host)
+    local port, websocket, target_ip, binding = resolve_target(host)
     if not port then
         return serve_404(host)
     end
 
-    if tonumber(ngx.var.server_port) == port then
+    local server_ip = target.normalize_ip(ngx.var.server_addr)
+    if tonumber(ngx.var.server_port) == port and
+        (target.is_loopback(target_ip) or (server_ip and server_ip == target_ip)) then
         ngx.status = 508
         ngx.header.content_type = "text/html; charset=utf-8"
         ngx.say([[<!doctype html><html lang="zh"><head><meta charset="utf-8">
 <title>508 Loop Detected</title></head><body style="font-family:sans-serif;text-align:center;padding-top:80px">
-<h1>508</h1><p>目标端口 ]] .. port .. [[ 是网关自身监听端口，已阻止循环代理。</p>
+<h1>508</h1><p>目标 ]] .. target_ip .. ":" .. port .. [[ 是网关自身监听地址，已阻止循环代理。</p>
 <p>管理界面请访问 <code>/_radmin_/</code>。</p></body></html>]])
         return ngx.exit(508)
     end
@@ -451,8 +540,9 @@ function _M.access()
     ngx.var.authz_user = current.username
     ngx.var.authz_source = current.source
     ngx.var.authz_identity = principal
-    -- TLS terminates at the gateway; local services are always HTTP upstreams.
-    ngx.var.authz_target = "http://127.0.0.1:" .. port
+    -- TLS terminates at the gateway; configured services are always HTTP upstreams.
+    ngx.var.authz_target = "http://" .. target.url_host(target_ip) .. ":" .. port
+    apply_proxy_headers(binding, target_ip, port)
     local requested_upgrade = tostring(ngx.var.http_upgrade or "")
     -- WebSocket 代理默认对所有已解析目标开启；bindings.websocket 仅保留
     -- 为历史配置兼容，不再作为升级请求的阻断条件。

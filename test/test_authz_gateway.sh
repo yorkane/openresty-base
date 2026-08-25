@@ -7,6 +7,7 @@ CONTAINER_NAME="authz-gateway-test-$$"
 TMP_DIR=$(mktemp -d)
 PASS=0
 MOCK_PID=""
+REMOTE_PID=""
 NOCO_PID=""
 WS_PID=""
 
@@ -25,6 +26,18 @@ HTTPS_PORT=$(free_port)
 UPSTREAM_PORT=$(free_port)
 NOCO_PORT=$(free_port)
 WS_PORT=$(free_port)
+REMOTE_PORT=$(free_port)
+REMOTE_IP=$(python3 - <<'PY'
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+try:
+    s.connect(("192.0.2.1", 9))
+    print(s.getsockname()[0])
+finally:
+    s.close()
+PY
+)
+[[ "$REMOTE_IP" != 127.* ]] || { printf 'FAIL: no non-loopback IPv4 address available\n' >&2; exit 1; }
 DYNAMIC_HOST="${UPSTREAM_PORT}-dynamic.test.example"
 POLICY_OBJECT="/${UPSTREAM_PORT}/*"
 
@@ -32,6 +45,7 @@ cleanup() {
     docker exec "$CONTAINER_NAME" chmod -R a+rwx /data >/dev/null 2>&1 || true
     docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
     if [[ -n "$MOCK_PID" ]]; then kill "$MOCK_PID" >/dev/null 2>&1 || true; fi
+    if [[ -n "$REMOTE_PID" ]]; then kill "$REMOTE_PID" >/dev/null 2>&1 || true; fi
     if [[ -n "$NOCO_PID" ]]; then kill "$NOCO_PID" >/dev/null 2>&1 || true; fi
     if [[ -n "$WS_PID" ]]; then kill "$WS_PID" >/dev/null 2>&1 || true; fi
     rm -rf "$TMP_DIR" || true
@@ -77,6 +91,8 @@ assert_json() {
 
 python3 "$REPO_DIR/test/mock_http.py" "$UPSTREAM_PORT" >"$TMP_DIR/mock.log" 2>&1 &
 MOCK_PID=$!
+python3 "$REPO_DIR/test/mock_http.py" "$REMOTE_PORT" 0.0.0.0 hello-from-remote-ip >"$TMP_DIR/remote.log" 2>&1 &
+REMOTE_PID=$!
 python3 "$REPO_DIR/test/mock_nocobase.py" "$NOCO_PORT" \
     "http://admin.test.example:$HTTP_PORT/_authz/oauth/callback" >"$TMP_DIR/nocobase.log" 2>&1 &
 NOCO_PID=$!
@@ -88,6 +104,11 @@ for _ in $(seq 1 30); do
 done
 curl -fsS --max-time 2 "http://127.0.0.1:$UPSTREAM_PORT/" >/dev/null || fail "mock upstream did not start"
 MOCK_BODY=$(curl -fsS --max-time 2 "http://127.0.0.1:$UPSTREAM_PORT/")
+for _ in $(seq 1 30); do
+    curl -fsS --max-time 1 "http://$REMOTE_IP:$REMOTE_PORT/" >/dev/null 2>&1 && break
+    sleep 0.1
+done
+REMOTE_BODY=$(curl -fsS --max-time 2 "http://$REMOTE_IP:$REMOTE_PORT/") || fail "remote IP mock upstream did not start"
 for _ in $(seq 1 30); do
     STATUS=$(curl -sS --max-time 1 -o /dev/null -w '%{http_code}' \
         "http://127.0.0.1:$NOCO_PORT/api/auth:check" 2>/dev/null || true)
@@ -109,22 +130,31 @@ pass "lua-resty-mlcache is vendored in the image"
 
 SERVER_TEMPLATE=$(cat "$REPO_DIR/conf/server.conf.template")
 assert_eq "HTTP and HTTPS share server template" \
-    "$(grep -c 'include server.conf.template;' "$REPO_DIR/conf/nginx.conf.template")" "2"
+    "$(grep -c 'include server.conf;' "$REPO_DIR/conf/nginx.conf.template")" "2"
+ENTRYPOINT_SOURCE=$(cat "$REPO_DIR/docker-entrypoint.sh")
+assert_contains "entrypoint renders shared server configuration" "$ENTRYPOINT_SOURCE" \
+    'render_template "$SERVER_TEMPLATE_FILE" "$NGINX_CONF_DIR/server.conf"'
 assert_contains "WebSocket origin host forwarding" "$SERVER_TEMPLATE" \
-    'proxy_set_header X-Forwarded-Host  $authz_forwarded_host;'
-assert_contains "upstream Host uses local proxy target" "$SERVER_TEMPLATE" \
+    'proxy_set_header X-Forwarded-Host  $authz_proxy_forwarded_host;'
+assert_contains "upstream Host preserves external request host" "$SERVER_TEMPLATE" \
+    'proxy_set_header Host              $authz_upstream_host;'
+assert_contains "binding controls forwarded protocol" "$SERVER_TEMPLATE" \
+    'proxy_set_header X-Forwarded-Proto $authz_forwarded_proto;'
+assert_contains "binding controls forwarded port" "$SERVER_TEMPLATE" \
+    'proxy_set_header X-Forwarded-Port  $authz_forwarded_port;'
+assert_contains "binding controls upstream Origin" "$SERVER_TEMPLATE" \
+    'proxy_set_header Origin            $authz_origin;'
+assert_not_contains "upstream Host does not use internal proxy target" "$SERVER_TEMPLATE" \
     'proxy_set_header Host              $proxy_host;'
-assert_not_contains "upstream Host does not expose public domain" "$SERVER_TEMPLATE" \
-    'proxy_set_header Host              $host;'
 assert_contains "WebSocket buffering disabled" "$SERVER_TEMPLATE" 'proxy_buffering off;'
 assert_contains "WebSocket idle timeout extended" "$SERVER_TEMPLATE" 'proxy_read_timeout 3600s;'
 assert_contains "API key is stripped before proxying" "$SERVER_TEMPLATE" \
     'proxy_set_header X-Authz-Key       "";'
 AUTHZ_INIT_SOURCE=$(cat "$REPO_DIR/lualib/resty/authz/init.lua")
 assert_contains "gateway always uses HTTP upstream" "$AUTHZ_INIT_SOURCE" \
-    'ngx.var.authz_target = "http://127.0.0.1:" .. port'
+    'ngx.var.authz_target = "http://" .. target.url_host(target_ip) .. ":" .. port'
 assert_not_contains "gateway does not derive upstream scheme from listener" "$AUTHZ_INIT_SOURCE" \
-    'ngx.var.scheme .. "://127.0.0.1:" .. port'
+    'ngx.var.scheme .. "://"'
 NGINX_TEMPLATE=$(cat "$REPO_DIR/conf/nginx.conf.template")
 assert_contains "database cache shared dictionary configured" "$NGINX_TEMPLATE" \
     'lua_shared_dict authz_db_cache 10m;'
@@ -193,6 +223,19 @@ connection.execute("""CREATE TABLE policies(
 connection.execute("""INSERT INTO policies(ptype, v0, v1, v2)
     VALUES ('p', 'legacy_user', '/2999/*', 'GET')
 """)
+connection.execute("""CREATE TABLE bindings(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    domain TEXT UNIQUE NOT NULL,
+    port INTEGER NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    websocket INTEGER NOT NULL DEFAULT 0,
+    note TEXT NOT NULL DEFAULT '',
+    menu_name TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL
+)""")
+connection.execute("""INSERT INTO bindings(domain, port, enabled, created_at)
+    VALUES ('legacy.test.example', 2998, 0, 1)
+""")
 connection.execute("""CREATE TABLE api_keys(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT UNIQUE NOT NULL,
@@ -205,13 +248,19 @@ connection.execute("""CREATE TABLE api_keys(
 connection.commit()
 connection.close()
 PY
+mkdir -p "$TMP_DIR/templates"
+cp "$REPO_DIR/conf/nginx.conf.template" "$TMP_DIR/templates/nginx.conf.template"
+{
+    printf '# runtime-template-v1\n'
+    cat "$REPO_DIR/conf/server.conf.template"
+} > "$TMP_DIR/templates/server.conf.template"
 docker run -d \
     --name "$CONTAINER_NAME" \
     --network host \
     -e NGINX_WORKER_PROCESSES=1 \
     -e AUTHZ_HTTP_PORT="$HTTP_PORT" \
     -e AUTHZ_HTTPS_PORT="$HTTPS_PORT" \
-    -e AUTHZ_COOKIE_DOMAIN=.test.example \
+    -e "AUTHZ_HOST_URL=http://admin.test.example:$HTTP_PORT" \
     -e AUTHZ_ADMIN_PASSWORD=admin123 \
     -e AUTHZ_DB_CACHE_TTL=30 \
     -e AUTHZ_DB_CACHE_LRU_SIZE=500 \
@@ -251,10 +300,11 @@ docker run -d \
     -e AUTHZ_WECHAT_AUTHORIZE_URL="http://127.0.0.1:$NOCO_PORT/wechat/authorize" \
     -e AUTHZ_WECHAT_TOKEN_URL="http://127.0.0.1:$NOCO_PORT/wechat/token" \
     -e AUTHZ_WECHAT_USERINFO_URL="http://127.0.0.1:$NOCO_PORT/wechat/userinfo" \
+    -e OPENRESTY_TEMPLATE_DIR=/etc/openresty/templates \
     -v "$TMP_DIR/data:/data" \
     -v "$REPO_DIR/admin:/usr/local/openresty/nginx/html/admin:ro" \
-    -v "$REPO_DIR/conf/nginx.conf.template:/usr/local/openresty/nginx/conf/nginx.conf.template:ro" \
-    -v "$REPO_DIR/conf/server.conf.template:/usr/local/openresty/nginx/conf/server.conf.template:ro" \
+    -v "$TMP_DIR/templates:/etc/openresty/templates:ro" \
+    -v "$REPO_DIR/docker-entrypoint.sh:/docker-entrypoint.sh:ro" \
     -v "$REPO_DIR/lualib:/usr/local/openresty/site/lualib:ro" \
     "$IMAGE" >/dev/null
 
@@ -264,6 +314,25 @@ for _ in $(seq 1 80); do
     sleep 0.1
 done
 [[ "$STATUS" == "401" ]] || fail "gateway did not become ready"
+docker exec "$CONTAINER_NAME" grep -q '^# runtime-template-v1$' \
+    /usr/local/openresty/nginx/conf/server.conf || fail "entrypoint did not render mounted server template"
+pass "entrypoint renders mounted server template"
+
+{
+    printf '# runtime-template-v2\n'
+    cat "$REPO_DIR/conf/server.conf.template"
+} > "$TMP_DIR/templates/server.conf.template.next"
+mv "$TMP_DIR/templates/server.conf.template.next" "$TMP_DIR/templates/server.conf.template"
+docker restart "$CONTAINER_NAME" >/dev/null
+for _ in $(seq 1 80); do
+    STATUS=$(curl -sS --max-time 2 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$HTTP_PORT/_api_/authz/v1/session" 2>/dev/null || true)
+    [[ "$STATUS" == "401" ]] && break
+    sleep 0.1
+done
+[[ "$STATUS" == "401" ]] || fail "gateway did not become ready after runtime template change"
+docker exec "$CONTAINER_NAME" grep -q '^# runtime-template-v2$' \
+    /usr/local/openresty/nginx/conf/server.conf || fail "server template was not re-rendered after restart"
+pass "server template changes apply without rebuilding the image"
 MIGRATED_SOURCE=$(python3 - "$TMP_DIR/data/authz/authz.db" <<'PY'
 import sqlite3
 import sys
@@ -308,6 +377,23 @@ connection.close()
 PY
 )
 assert_eq "local user timestamps migrated and seeded" "$USER_TIMESTAMP_MIGRATION" "yes"
+BINDING_TARGET_MIGRATION=$(python3 - "$TMP_DIR/data/authz/authz.db" <<'PY'
+import sqlite3
+import sys
+
+connection = sqlite3.connect(sys.argv[1])
+columns = {row[1] for row in connection.execute("PRAGMA table_info(bindings)")}
+expected = {"target_ip", "upstream_host", "forwarded_host", "forwarded_proto",
+            "forwarded_port", "origin_mode", "custom_origin", "simulate_local", "local_ip"}
+row = connection.execute("""SELECT target_ip, upstream_host, forwarded_host, forwarded_proto,
+    forwarded_port, origin_mode, custom_origin, simulate_local, local_ip
+    FROM bindings WHERE domain = 'legacy.test.example'""").fetchone()
+defaults = ("127.0.0.1", "", "", "", 0, "auto", "", 0, "127.0.0.1")
+print("yes" if expected.issubset(columns) and row == defaults else "no")
+connection.close()
+PY
+)
+assert_eq "legacy bindings receive safe proxy defaults" "$BINDING_TARGET_MIGRATION" "yes"
 API_KEY_SCHEMA=$(python3 - "$TMP_DIR/data/authz/authz.db" <<'PY'
 import sqlite3
 import sys
@@ -387,7 +473,9 @@ login() {
 }
 
 ADMIN_HOST=admin.test.example
+SECOND_BASE_HOST=app-m.w.wtvdev.com
 ADMIN_COOKIE="$TMP_DIR/admin.cookie"
+SECOND_BASE_COOKIE="$TMP_DIR/second-base.cookie"
 BOB_COOKIE="$TMP_DIR/bob.cookie"
 DYNAMIC_COOKIE="$TMP_DIR/dynamic.cookie"
 APP_COOKIE="$TMP_DIR/app.cookie"
@@ -412,6 +500,18 @@ assert_eq "unauthenticated admin UI redirects" "$STATUS" "302"
 login "$ADMIN_HOST" admin admin123 "$ADMIN_COOKIE"
 HTTP_LOGIN_COOKIE=$(awk 'BEGIN { IGNORECASE=1 } /^Set-Cookie:/ { sub(/^[^:]+:[[:space:]]*/, ""); sub(/^[^;]+/, ""); sub(/\r$/, ""); print; exit }' "$TMP_DIR/login-headers")
 assert_not_contains "HTTP session cookie is not Secure" "$HTTP_LOGIN_COOKIE" "; Secure"
+LOGIN_COOKIES=$(cat "$TMP_DIR/login-headers")
+assert_contains "cookie domain derives from request host" "$LOGIN_COOKIES" "; Domain=.test.example"
+assert_contains "login clears legacy host-only session cookie" "$LOGIN_COOKIES" "authz_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"
+assert_contains "login clears deeper legacy domain cookie" "$LOGIN_COOKIES" "; Domain=.admin.test.example"
+
+login "$SECOND_BASE_HOST" admin admin123 "$SECOND_BASE_COOKIE"
+SECOND_BASE_ACTIVE_COOKIE=$(awk 'BEGIN { IGNORECASE=1 } /^Set-Cookie:/ { sub(/\r$/, ""); print; exit }' "$TMP_DIR/login-headers")
+SECOND_BASE_COOKIES=$(cat "$TMP_DIR/login-headers")
+assert_contains "second base domain uses its request-scoped cookie parent" "$SECOND_BASE_ACTIVE_COOKIE" "; Domain=.w.wtvdev.com"
+assert_not_contains "configured fallback does not override another base domain" "$SECOND_BASE_ACTIVE_COOKIE" "; Domain=.test.example"
+assert_contains "second base login clears its deeper legacy domain" "$SECOND_BASE_COOKIES" "; Domain=.app-m.w.wtvdev.com"
+assert_contains "second base login clears its broader legacy parent" "$SECOND_BASE_COOKIES" "; Domain=.wtvdev.com"
 for _ in $(seq 1 20); do
     request GET "$ADMIN_HOST" /_api_/authz/v1/session "$ADMIN_COOKIE"
     [[ "$STATUS" == "200" ]] && break
@@ -419,13 +519,27 @@ for _ in $(seq 1 20); do
 done
 assert_eq "session becomes available after login" "$STATUS" "200"
 
+DUPLICATE_STATUS=$(curl -sS --max-time 5 --resolve "$ADMIN_HOST:$HTTP_PORT:127.0.0.1" \
+    -H "Cookie: authz_session=0000000000000000000000000000000000000000000000000000000000000000; $(cookie_header "$ADMIN_COOKIE")" \
+    -D "$TMP_DIR/duplicate-cookie-headers" -o "$TMP_DIR/duplicate-cookie-body" -w '%{http_code}' \
+    "http://$ADMIN_HOST:$HTTP_PORT/_api_/authz/v1/session")
+assert_eq "duplicate session cookies select the valid session" "$DUPLICATE_STATUS" "200"
+DUPLICATE_COOKIES=$(cat "$TMP_DIR/duplicate-cookie-headers")
+assert_contains "duplicate session cookies are normalized to root domain" "$DUPLICATE_COOKIES" "; Domain=.test.example"
+assert_contains "duplicate session cleanup expires host-only cookie" "$DUPLICATE_COOKIES" "authz_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"
+assert_contains "duplicate session cleanup expires deeper domain" "$DUPLICATE_COOKIES" "; Domain=.admin.test.example"
+
 request GET "$ADMIN_HOST" /_radmin_/ "$ADMIN_COOKIE"
 assert_eq "authenticated admin UI" "$STATUS" "200"
 assert_contains "admin UI loads shell" "$BODY" "app-frame"
 assert_contains "admin UI assembles menu with SSI" "$BODY" "id=\"admin-menu\""
 assert_not_contains "admin SSI menu has no inline style" "$BODY" "<style>"
 assert_not_contains "admin UI does not iframe menu" "$BODY" "menu-frame"
-assert_contains "admin shell is not cached" "$(cat "$TMP_DIR/headers")" "Cache-Control: no-store"
+assert_contains "menu shows binding notes on hover" "$BODY" '<q-tooltip v-if="item.note"'
+assert_not_contains "admin shell has no no-store HTTP header" "$(cat "$TMP_DIR/headers")" "Cache-Control: no-store"
+assert_contains "admin shell declares browser no-cache" "$BODY" 'http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate"'
+assert_contains "admin shell declares no-cache pragma" "$BODY" 'http-equiv="Pragma" content="no-cache"'
+assert_contains "admin shell declares expired HTML" "$BODY" 'http-equiv="Expires" content="0"'
 request GET "$ADMIN_HOST" '/_radmin_/app.css?v=6' "$ADMIN_COOKIE"
 assert_eq "admin shared CSS asset" "$STATUS" "200"
 assert_contains "shared CSS contains SSI menu styles" "$BODY" "#admin-menu .menu-shell"
@@ -435,6 +549,7 @@ assert_eq "admin API client asset" "$STATUS" "200"
 assert_contains "admin client uses new API root" "$BODY" "/_api_/authz/v1"
 assert_contains "admin API errors expose status" "$BODY" "error.status = response.status"
 assert_contains "binding API supports edit" "$BODY" "values.action === 'edit'"
+assert_contains "policy API supports edit" "$BODY" 'mutation('\''PATCH'\'', `/policies/${values.id}`'
 STATIC_STATUS=$(curl -sS --max-time 5 --resolve "$ADMIN_HOST:$HTTP_PORT:127.0.0.1" \
     -H 'Accept-Encoding: gzip' -H "Cookie: $(cookie_header "$ADMIN_COOKIE")" -D "$TMP_DIR/static-headers" \
     -o /dev/null -w '%{http_code}' "http://$ADMIN_HOST:$HTTP_PORT/_radmin_/api.js?v=7")
@@ -451,13 +566,15 @@ assert_contains "admin static asset permanent cache" \
     "$(awk 'BEGIN { IGNORECASE=1 } /^Cache-Control:/ { sub(/^[^:]+:[[:space:]]*/, ""); sub(/\r$/, ""); print; exit }' "$TMP_DIR/static-headers")" "max-age=315360000"
 assert_contains "admin static asset expires max" \
     "$(awk 'BEGIN { IGNORECASE=1 } /^Expires:/ { sub(/^[^:]+:[[:space:]]*/, ""); sub(/\r$/, ""); print; exit }' "$TMP_DIR/static-headers")" "2037"
-request GET "$ADMIN_HOST" /_radmin_/app.js "$ADMIN_COOKIE"
+request GET "$ADMIN_HOST" '/_radmin_/app.js?v=9' "$ADMIN_COOKIE"
 assert_contains "admin redirect is limited to API 401" "$BODY" "error?.status === 401"
+assert_contains "menu separates application label and note" "$BODY" "application.label || application.menu_name || application.domain"
+assert_contains "menu sends binding notes to tooltip" "$BODY" "note: application.binding ? application.note : ''"
 assert_contains "authorization menu is admin gated" "$BODY" "if (isAdmin.value)"
 assert_contains "menu reads admin status from session" "$BODY" "isAdmin.value = Boolean(session.admin)"
 assert_contains "menu loads local applications" "$BODY" "window.adminApi.applications"
 assert_contains "menu refreshes local applications" "$BODY" "setInterval(loadApplications, 30000)"
-assert_contains "built-in app URLs are versioned" "$BODY" "apps/authorization.html?v=7"
+assert_contains "built-in app URLs are versioned" "$BODY" "apps/authorization.html?v=14"
 request GET "$ADMIN_HOST" /_radmin_/apps/users.html "$ADMIN_COOKIE"
 assert_contains "user roles use controlled multi-select" "$BODY" 'multiple use-chips emit-value map-options'
 assert_contains "user role fallback catalog" "$BODY" "['admin', 'staff', 'user', 'viewer']"
@@ -472,15 +589,40 @@ assert_contains "user timestamps include seconds" "$BODY" "second: '2-digit'"
 assert_contains "profile page loads current session first" "$BODY" "const current = await window.adminApi.session()"
 assert_contains "non-admin profile uses only session identity" "$BODY" "if (!current.admin)"
 request GET "$ADMIN_HOST" /_radmin_/apps/authorization.html "$ADMIN_COOKIE"
-assert_contains "admin application HTML is not cached" "$(cat "$TMP_DIR/headers")" "Cache-Control: no-store"
+assert_not_contains "admin application has no no-store HTTP header" "$(cat "$TMP_DIR/headers")" "Cache-Control: no-store"
+assert_contains "admin application declares browser no-cache" "$BODY" 'http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate"'
+assert_not_contains "policy form hides the policy type switch" "$BODY" 'v-model="policyForm.ptype"'
+assert_not_contains "policy form removes role assignment" "$BODY" 'roleAssignment'
+assert_contains "policy form always submits P policies" "$BODY" "reactive({ ptype: 'p'"
 assert_contains "policy subject uses select options" "$BODY" 'policySubjectOptions'
 assert_contains "policy object uses binding options" "$BODY" 'policyObjectOptions'
+assert_not_contains "policy object does not allow text input" "$BODY" 'v-model="policyForm.objectTarget" dark dense outlined use-input'
+assert_not_contains "policy object does not create typed targets" "$BODY" '@new-value="addPolicyObjectTarget"'
+assert_contains "policy object exposes an editable path" "$BODY" 'v-model.trim="policyForm.objectPath"'
+assert_contains "policy object combines binding and path" "$BODY" 'v1: policyObjectValue.value'
+assert_contains "policy selector retains existing direct ports" "$BODY" 'value: `port:${port}`'
+assert_contains "policy selector identifies an exact binding" "$BODY" 'value: `binding:${binding.id}`'
+assert_contains "policy submission includes the selected binding ID" "$BODY" 'values.binding_id = selected.bindingId'
+assert_contains "policy table displays binding target details" "$BODY" 'class="policy-object-target"'
+assert_contains "policy table marks shared port bindings" "$BODY" "props.row.object_kind === 'shared'"
+assert_contains "policy table exposes an edit action" "$BODY" '@click="openEditPolicy(props.row)"'
+assert_contains "policy edit action is limited to P policies" "$BODY" "isAdmin && props.row.ptype === 'p'"
+assert_contains "policy edit dialog prefills existing values" "$BODY" 'function openEditPolicy (policy)'
 assert_contains "policy HTTP method uses select options" "$BODY" ':options="httpActions"'
 assert_contains "policy HTTP method supports multi-select" "$BODY" 'multiple use-chips emit-value map-options :options="httpActions"'
+assert_contains "policy effect exposes allow radio" "$BODY" 'v-model="policyForm.eft" val="allow"'
+assert_contains "policy effect exposes deny radio" "$BODY" 'v-model="policyForm.eft" val="deny"'
 assert_contains "policy methods include CONNECT" "$BODY" "'CONNECT'"
 assert_contains "policy methods include TRACE" "$BODY" "'TRACE'"
 assert_contains "binding page supports editing" "$BODY" "openEditBinding"
 assert_contains "binding form supports saving" "$BODY" "saveBindingForm"
+assert_contains "binding form defaults to local target IP" "$BODY" "target_ip: '127.0.0.1'"
+assert_contains "binding table displays target IP" "$BODY" 'body-cell-target_ip'
+assert_contains "binding form exposes upstream Host" "$BODY" 'bindingForm.upstream_host'
+assert_contains "binding form exposes forwarded Host" "$BODY" 'bindingForm.forwarded_host'
+assert_contains "binding form exposes Origin policy" "$BODY" 'bindingForm.origin_mode'
+assert_contains "binding form supports local request simulation" "$BODY" 'bindingForm.simulate_local'
+assert_contains "binding form keeps proxy settings compact" "$BODY" 'q-expansion-item v-model="bindingAdvancedOpen"'
 request GET "$ADMIN_HOST" /_api_/authz/v1/session "$ADMIN_COOKIE"
 assert_eq "session API" "$STATUS" "200"
 assert_json "session username" '.data.username' "admin"
@@ -982,10 +1124,20 @@ assert_eq "delete source-specific user policy" "$STATUS" "200"
 
 request POST "$ADMIN_HOST" /_api_/authz/v1/policies "$ADMIN_COOKIE" "$CSRF" "{\"ptype\":\"p\",\"v0\":\"role:user\",\"v1\":\"$POLICY_OBJECT\",\"v2\":[\"POST\",\"GET\"],\"eft\":\"allow\"}"
 assert_eq "create access policy" "$STATUS" "201"
+CUSTOM_PATH_OBJECT="/$UPSTREAM_PORT/api/*"
+request POST "$ADMIN_HOST" /_api_/authz/v1/policies "$ADMIN_COOKIE" "$CSRF" "{\"ptype\":\"p\",\"v0\":\"role:viewer\",\"v1\":\"$CUSTOM_PATH_OBJECT\",\"v2\":[\"GET\"],\"eft\":\"allow\"}"
+assert_eq "create access policy with an editable binding path" "$STATUS" "201"
+request GET "$ADMIN_HOST" /_api_/authz/v1/authorization "$ADMIN_COOKIE"
+assert_json "custom binding path is stored as the final policy object" ".data.policies[] | select(.v0 == \"role:viewer\" and .v1 == \"$CUSTOM_PATH_OBJECT\") | .v1" "$CUSTOM_PATH_OBJECT"
+CUSTOM_PATH_POLICY_ID=$(jq -er --arg object "$CUSTOM_PATH_OBJECT" '.data.policies[] | select(.v0 == "role:viewer" and .v1 == $object) | .id' "$TMP_DIR/body")
+request DELETE "$ADMIN_HOST" "/_api_/authz/v1/policies/$CUSTOM_PATH_POLICY_ID" "$ADMIN_COOKIE" "$CSRF"
+assert_eq "delete custom binding path policy" "$STATUS" "200"
 request POST "$ADMIN_HOST" /_api_/authz/v1/policies "$ADMIN_COOKIE" "$CSRF" "{\"ptype\":\"p\",\"v0\":\"role:user\",\"v1\":\"$POLICY_OBJECT\",\"v2\":[\"GET\",\"BREW\"],\"eft\":\"allow\"}"
 assert_eq "unknown HTTP method rejected" "$STATUS" "422"
 request POST "$ADMIN_HOST" /_api_/authz/v1/policies "$ADMIN_COOKIE" "$CSRF" "{\"ptype\":\"p\",\"v0\":\"role:auditor\",\"v1\":\"$POLICY_OBJECT\",\"v2\":\"GET\",\"eft\":\"allow\"}"
 assert_eq "unknown policy role rejected" "$STATUS" "422"
+request POST "$ADMIN_HOST" /_api_/authz/v1/policies "$ADMIN_COOKIE" "$CSRF" '{"ptype":"p","v0":"role:user","v1":"/not-a-port/public/*","v2":"GET","eft":"allow"}'
+assert_eq "malformed policy object is rejected" "$STATUS" "422"
 request GET "$ADMIN_HOST" /_api_/authz/v1/authorization "$ADMIN_COOKIE"
 assert_eq "authorization API" "$STATUS" "200"
 assert_json "minimum dynamic port clamped" '.data.port_min | tostring' "2000"
@@ -1012,7 +1164,7 @@ request GET "$DYNAMIC_HOST" /identity "$DYNAMIC_COOKIE"
 assert_json "upstream receives raw username" '.user' "bob"
 assert_json "upstream receives identity source" '.source' "local"
 assert_json "upstream receives canonical identity" '.identity' "user:local:bob"
-assert_json "upstream receives local target Host" '.host' "127.0.0.1:$UPSTREAM_PORT"
+assert_json "upstream receives external dynamic Host" '.host' "$DYNAMIC_HOST:$HTTP_PORT"
 login "$DYNAMIC_HOST" remote@example.test remote123 "$REMOTE_DYNAMIC_COOKIE" nocobase
 request GET "$DYNAMIC_HOST" / "$REMOTE_DYNAMIC_COOKIE"
 assert_eq "mapped remote role authorizes application" "$STATUS" "200"
@@ -1027,25 +1179,147 @@ assert_eq "deleted remote identity is recreated by authentication" "$STATUS" "20
 request GET "$ADMIN_HOST" /_api_/authz/v1/users "$ADMIN_COOKIE"
 assert_json "recreated remote identity starts enabled" '.data.remote_users[] | select(.provider == "nocobase" and .subject == "42") | .enabled | tostring' "1"
 
+request POST "$ADMIN_HOST" /_api_/authz/v1/applications "$ADMIN_COOKIE" "$CSRF" "{\"domain\":\"invalid-target.test.example\",\"target_ip\":\"http://127.0.0.1\",\"port\":$UPSTREAM_PORT}"
+assert_eq "binding rejects a URL as target IP" "$STATUS" "422"
 request POST "$ADMIN_HOST" /_api_/authz/v1/applications "$ADMIN_COOKIE" "$CSRF" "{\"domain\":\"fixed.test.example\",\"port\":$UPSTREAM_PORT,\"enabled\":true,\"note\":\"test\"}"
 assert_eq "create application" "$STATUS" "201"
+request GET "$ADMIN_HOST" /_api_/authz/v1/applications "$ADMIN_COOKIE"
+assert_json "binding application keeps its menu label" '.data[] | select(.domain == "fixed.test.example") | .label' "fixed.test.example"
+assert_json "binding application exposes its note" '.data[] | select(.domain == "fixed.test.example") | .note' "test"
+assert_json "binding application is marked explicit" '.data[] | select(.domain == "fixed.test.example") | .binding | tostring' "true"
+request GET "$ADMIN_HOST" /_api_/authz/v1/applications "$ADMIN_COOKIE"
+assert_json "applications API exposes target IP" '.data[] | select(.domain == "fixed.test.example") | .target_ip' "127.0.0.1"
 request GET "$ADMIN_HOST" /_api_/authz/v1/authorization "$ADMIN_COOKIE"
 APP_ID=$(jq -er '.data.bindings[] | select(.domain == "fixed.test.example") | .id' "$TMP_DIR/body")
-request PATCH "$ADMIN_HOST" "/_api_/authz/v1/applications/$APP_ID" "$ADMIN_COOKIE" "$CSRF" "{\"domain\":\"edited.test.example\",\"port\":$NOCO_PORT,\"enabled\":true,\"note\":\"edited\"}"
+assert_json "binding defaults to the local target IP" '.data.bindings[] | select(.domain == "fixed.test.example") | .target_ip' "127.0.0.1"
+assert_json "binding defaults to request Host forwarding" '.data.bindings[] | select(.domain == "fixed.test.example") | .upstream_host' ""
+assert_json "binding defaults to automatic Origin handling" '.data.bindings[] | select(.domain == "fixed.test.example") | .origin_mode' "auto"
+assert_json "binding defaults to normal client identity" '.data.bindings[] | select(.domain == "fixed.test.example") | .simulate_local | tostring' "0"
+assert_json "existing port policy is associated with its binding" ".data.policies[] | select(.v0 == \"role:user\" and .v1 == \"$POLICY_OBJECT\") | .object_kind" "binding"
+assert_json "associated policy exposes the binding domain" ".data.policies[] | select(.v0 == \"role:user\" and .v1 == \"$POLICY_OBJECT\") | .binding_matches[0].domain" "fixed.test.example"
+assert_json "associated policy exposes the binding target" ".data.policies[] | select(.v0 == \"role:user\" and .v1 == \"$POLICY_OBJECT\") | .binding_matches[0].target_ip" "127.0.0.1"
+request POST "$ADMIN_HOST" /_api_/authz/v1/policies "$ADMIN_COOKIE" "$CSRF" "{\"ptype\":\"p\",\"v0\":\"role:viewer\",\"v1\":\"/$REMOTE_PORT/public/*\",\"binding_id\":$APP_ID,\"v2\":\"GET\",\"eft\":\"allow\"}"
+assert_eq "policy binding and object port mismatch is rejected" "$STATUS" "422"
+BOUND_PATH_OBJECT="/$UPSTREAM_PORT/public/*"
+request POST "$ADMIN_HOST" /_api_/authz/v1/policies "$ADMIN_COOKIE" "$CSRF" "{\"ptype\":\"p\",\"v0\":\"role:viewer\",\"v1\":\"$BOUND_PATH_OBJECT\",\"binding_id\":$APP_ID,\"v2\":\"GET\",\"eft\":\"allow\"}"
+assert_eq "create policy for the selected binding" "$STATUS" "201"
+request GET "$ADMIN_HOST" /_api_/authz/v1/authorization "$ADMIN_COOKIE"
+assert_json "selected binding policy keeps its path" ".data.policies[] | select(.v0 == \"role:viewer\" and .v1 == \"$BOUND_PATH_OBJECT\") | .object_path" "/public/*"
+assert_json "selected binding policy resolves to one binding" ".data.policies[] | select(.v0 == \"role:viewer\" and .v1 == \"$BOUND_PATH_OBJECT\") | .binding_matches | length | tostring" "1"
+assert_json "selected binding policy exposes target address" ".data.policies[] | select(.v0 == \"role:viewer\" and .v1 == \"$BOUND_PATH_OBJECT\") | .binding_matches[0] | \"\(.target_ip):\(.port)\"" "127.0.0.1:$UPSTREAM_PORT"
+BOUND_PATH_POLICY_ID=$(jq -er --arg object "$BOUND_PATH_OBJECT" '.data.policies[] | select(.v0 == "role:viewer" and .v1 == $object) | .id' "$TMP_DIR/body")
+UPDATED_BOUND_PATH_OBJECT="/$UPSTREAM_PORT/private/*"
+request PATCH "$ADMIN_HOST" "/_api_/authz/v1/policies/$BOUND_PATH_POLICY_ID" "$ADMIN_COOKIE" "$CSRF" "{\"ptype\":\"p\",\"v0\":\"role:viewer\",\"v1\":\"$UPDATED_BOUND_PATH_OBJECT\",\"binding_id\":$APP_ID,\"v2\":[\"PATCH\",\"POST\"],\"eft\":\"deny\"}"
+assert_eq "update selected binding policy" "$STATUS" "200"
+request GET "$ADMIN_HOST" /_api_/authz/v1/authorization "$ADMIN_COOKIE"
+assert_json "updated policy stores the new path" ".data.policies[] | select(.id == $BOUND_PATH_POLICY_ID) | .v1" "$UPDATED_BOUND_PATH_OBJECT"
+assert_json "updated policy normalizes methods" ".data.policies[] | select(.id == $BOUND_PATH_POLICY_ID) | .action" "POST,PATCH"
+assert_json "updated policy stores deny effect" ".data.policies[] | select(.id == $BOUND_PATH_POLICY_ID) | .effect" "deny"
+assert_json "updated policy retains binding details" ".data.policies[] | select(.id == $BOUND_PATH_POLICY_ID) | .binding_matches[0].domain" "fixed.test.example"
+request PATCH "$ADMIN_HOST" "/_api_/authz/v1/policies/$BOUND_PATH_POLICY_ID" "$ADMIN_COOKIE" "$CSRF" "{\"ptype\":\"p\",\"v0\":\"role:viewer\",\"v1\":\"/$REMOTE_PORT/private/*\",\"binding_id\":$APP_ID,\"v2\":\"GET\",\"eft\":\"allow\"}"
+assert_eq "policy edit rejects binding and port mismatch" "$STATUS" "422"
+request GET "$ADMIN_HOST" /_api_/authz/v1/authorization "$ADMIN_COOKIE"
+assert_json "rejected policy edit preserves previous object" ".data.policies[] | select(.id == $BOUND_PATH_POLICY_ID) | .v1" "$UPDATED_BOUND_PATH_OBJECT"
+request DELETE "$ADMIN_HOST" "/_api_/authz/v1/policies/$BOUND_PATH_POLICY_ID" "$ADMIN_COOKIE" "$CSRF"
+assert_eq "delete selected binding policy" "$STATUS" "200"
+request PATCH "$ADMIN_HOST" "/_api_/authz/v1/applications/$APP_ID" "$ADMIN_COOKIE" "$CSRF" "{\"domain\":\"edited.test.example\",\"target_ip\":\"$REMOTE_IP\",\"port\":$REMOTE_PORT,\"enabled\":true,\"note\":\"edited\"}"
 assert_eq "edit binding fields" "$STATUS" "200"
 request GET "$ADMIN_HOST" /_api_/authz/v1/authorization "$ADMIN_COOKIE"
 assert_json "edited binding domain" '.data.bindings[] | select(.domain == "edited.test.example") | .domain' "edited.test.example"
-assert_json "edited binding port" '.data.bindings[] | select(.domain == "edited.test.example") | .port | tostring' "$NOCO_PORT"
+assert_json "edited binding target IP" '.data.bindings[] | select(.domain == "edited.test.example") | .target_ip' "$REMOTE_IP"
+assert_json "edited binding port" '.data.bindings[] | select(.domain == "edited.test.example") | .port | tostring' "$REMOTE_PORT"
 assert_json "edited binding note" '.data.bindings[] | select(.domain == "edited.test.example") | .note' "edited"
+request GET edited.test.example / "$ADMIN_COOKIE"
+assert_eq "binding proxies another IP" "$STATUS" "200"
+assert_eq "remote IP proxy body" "$BODY" "$REMOTE_BODY"
+request GET edited.test.example /identity "$ADMIN_COOKIE"
+assert_json "remote upstream receives external binding Host" '.host' "edited.test.example:$HTTP_PORT"
+request PATCH "$ADMIN_HOST" "/_api_/authz/v1/applications/$APP_ID" "$ADMIN_COOKIE" "$CSRF" '{"target_ip":"999.1.1.1"}'
+assert_eq "edit binding rejects invalid target IP" "$STATUS" "422"
 request PATCH "$ADMIN_HOST" "/_api_/authz/v1/applications/$APP_ID" "$ADMIN_COOKIE" "$CSRF" "{\"port\":1999}"
 assert_eq "edit binding rejects port below minimum" "$STATUS" "422"
-request PATCH "$ADMIN_HOST" "/_api_/authz/v1/applications/$APP_ID" "$ADMIN_COOKIE" "$CSRF" "{\"domain\":\"fixed.test.example\",\"port\":$UPSTREAM_PORT,\"enabled\":true,\"note\":\"test\"}"
+request PATCH "$ADMIN_HOST" "/_api_/authz/v1/applications/$APP_ID" "$ADMIN_COOKIE" "$CSRF" "{\"domain\":\"fixed.test.example\",\"target_ip\":\"127.0.0.1\",\"port\":$UPSTREAM_PORT,\"enabled\":true,\"note\":\"test\"}"
 assert_eq "restore edited binding" "$STATUS" "200"
 request GET "$ADMIN_HOST" /_api_/authz/v1/authorization "$ADMIN_COOKIE"
 APP_ID=$(jq -er '.data.bindings[] | select(.domain == "fixed.test.example") | .id' "$TMP_DIR/body")
+
+request PATCH "$ADMIN_HOST" "/_api_/authz/v1/applications/$APP_ID" "$ADMIN_COOKIE" "$CSRF" '{"upstream_host":null,"forwarded_host":null,"forwarded_proto":null,"forwarded_port":null,"origin_mode":null,"custom_origin":null,"simulate_local":null,"local_ip":null}'
+assert_eq "binding accepts null as an automatic proxy value" "$STATUS" "200"
+request PATCH "$ADMIN_HOST" "/_api_/authz/v1/applications/$APP_ID" "$ADMIN_COOKIE" "$CSRF" '{"upstream_host":"http://bad.example"}'
+assert_eq "binding rejects URL syntax in upstream Host" "$STATUS" "422"
+request PATCH "$ADMIN_HOST" "/_api_/authz/v1/applications/$APP_ID" "$ADMIN_COOKIE" "$CSRF" '{"upstream_host":"safe.example\nX-Bad: yes"}'
+assert_eq "binding rejects header injection in upstream Host" "$STATUS" "422"
+request PATCH "$ADMIN_HOST" "/_api_/authz/v1/applications/$APP_ID" "$ADMIN_COOKIE" "$CSRF" '{"forwarded_proto":"ftp"}'
+assert_eq "binding rejects unsupported forwarded protocol" "$STATUS" "422"
+request PATCH "$ADMIN_HOST" "/_api_/authz/v1/applications/$APP_ID" "$ADMIN_COOKIE" "$CSRF" '{"forwarded_port":70000}'
+assert_eq "binding rejects invalid forwarded port" "$STATUS" "422"
+request PATCH "$ADMIN_HOST" "/_api_/authz/v1/applications/$APP_ID" "$ADMIN_COOKIE" "$CSRF" '{"origin_mode":"custom","custom_origin":""}'
+assert_eq "custom Origin mode requires a value" "$STATUS" "422"
+request PATCH "$ADMIN_HOST" "/_api_/authz/v1/applications/$APP_ID" "$ADMIN_COOKIE" "$CSRF" '{"origin_mode":"custom","custom_origin":"https://public.example/path"}'
+assert_eq "binding rejects Origin paths" "$STATUS" "422"
+request PATCH "$ADMIN_HOST" "/_api_/authz/v1/applications/$APP_ID" "$ADMIN_COOKIE" "$CSRF" '{"simulate_local":true,"local_ip":"local-machine"}'
+assert_eq "local simulation rejects invalid source IP" "$STATUS" "422"
+
+request PATCH "$ADMIN_HOST" "/_api_/authz/v1/applications/$APP_ID" "$ADMIN_COOKIE" "$CSRF" '{"upstream_host":"app.internal:2078","forwarded_host":"public.example:99","forwarded_proto":"https","forwarded_port":99,"origin_mode":"custom","custom_origin":"https://public.example:99","simulate_local":false}'
+assert_eq "save custom proxy headers" "$STATUS" "200"
+request GET fixed.test.example /identity "$ADMIN_COOKIE"
+assert_eq "custom proxy request reaches upstream" "$STATUS" "200"
+assert_json "custom upstream Host reaches service" '.host' "app.internal:2078"
+assert_json "custom forwarded Host reaches service" '.forwarded_host' "public.example:99"
+assert_json "custom forwarded protocol reaches service" '.forwarded_proto' "https"
+assert_json "custom forwarded port reaches service" '.forwarded_port' "99"
+assert_json "custom Origin reaches service" '.origin' "https://public.example:99"
+
+request PATCH "$ADMIN_HOST" "/_api_/authz/v1/applications/$APP_ID" "$ADMIN_COOKIE" "$CSRF" '{"upstream_host":"","forwarded_host":"","forwarded_proto":"","forwarded_port":0,"origin_mode":"auto","custom_origin":"","simulate_local":true,"local_ip":"192.168.50.10"}'
+assert_eq "enable local request simulation" "$STATUS" "200"
+STATUS=$(curl -sS --max-time 5 --resolve "fixed.test.example:$HTTP_PORT:127.0.0.1" \
+    -H "Cookie: $(cookie_header "$ADMIN_COOKIE")" \
+    -H "Origin: http://fixed.test.example:$HTTP_PORT" \
+    -o "$TMP_DIR/body" -w '%{http_code}' "http://fixed.test.example:$HTTP_PORT/identity")
+assert_eq "local simulation request reaches upstream" "$STATUS" "200"
+assert_json "local simulation uses target Host" '.host' "127.0.0.1:$UPSTREAM_PORT"
+assert_json "local simulation uses target forwarded Host" '.forwarded_host' "127.0.0.1:$UPSTREAM_PORT"
+assert_json "local simulation reports HTTP upstream protocol" '.forwarded_proto' "http"
+assert_json "local simulation reports target port" '.forwarded_port' "$UPSTREAM_PORT"
+assert_json "local simulation rewrites Origin" '.origin' "http://127.0.0.1:$UPSTREAM_PORT"
+assert_json "local simulation replaces real IP" '.real_ip' "192.168.50.10"
+assert_json "local simulation replaces forwarded chain" '.forwarded_for' "192.168.50.10"
+assert_json "local simulation removes standard Forwarded" '.forwarded == null | tostring' "true"
+
+request PATCH "$ADMIN_HOST" "/_api_/authz/v1/applications/$APP_ID" "$ADMIN_COOKIE" "$CSRF" '{"upstream_host":"","forwarded_host":"","forwarded_proto":"","forwarded_port":0,"origin_mode":"auto","custom_origin":"","simulate_local":false,"local_ip":"127.0.0.1"}'
+assert_eq "restore default proxy behavior" "$STATUS" "200"
 login fixed.test.example bob bob654321 "$APP_COOKIE"
 request GET fixed.test.example / "$APP_COOKIE"
 assert_eq "fixed application proxy" "$STATUS" "200"
+
+STATUS=$(curl -sS --max-time 5 --resolve "fixed.test.example:$HTTP_PORT:127.0.0.1" \
+    -H "Cookie: $(cookie_header "$ADMIN_COOKIE")" \
+    -H "Origin: http://fixed.test.example:$HTTP_PORT" \
+    -H 'Content-Type: application/json' \
+    --data '{"cwd":"/tmp"}' \
+    -o "$TMP_DIR/trusted-origin-body" -w '%{http_code}' \
+    "http://fixed.test.example:$HTTP_PORT/trusted-origin")
+assert_eq "same-origin POST survives reverse proxy host forwarding" "$STATUS" "200"
+assert_eq "same-origin POST reaches upstream unchanged" \
+    "$(jq -r '.origin' "$TMP_DIR/trusted-origin-body")" "http://fixed.test.example:$HTTP_PORT"
+STATUS=$(curl -sS --max-time 5 --resolve "fixed.test.example:$HTTP_PORT:127.0.0.1" \
+    -H "Cookie: $(cookie_header "$ADMIN_COOKIE")" \
+    -H 'Origin: http://fixed.test.example:99' \
+    -H 'Content-Type: application/json' \
+    --data '{"cwd":"/tmp"}' \
+    -o "$TMP_DIR/public-port-origin-body" -w '%{http_code}' \
+    "http://fixed.test.example:$HTTP_PORT/trusted-origin")
+assert_eq "same-host public Origin port survives outer proxy port mapping" "$STATUS" "200"
+assert_eq "upstream Host restores the same-host public Origin port" \
+    "$(jq -r '.expected_origin' "$TMP_DIR/public-port-origin-body")" "http://fixed.test.example:99"
+STATUS=$(curl -sS --max-time 5 --resolve "fixed.test.example:$HTTP_PORT:127.0.0.1" \
+    -H "Cookie: $(cookie_header "$ADMIN_COOKIE")" \
+    -H 'Origin: https://cross-origin.test' \
+    -H 'Content-Type: application/json' \
+    --data '{"cwd":"/tmp"}' \
+    -o "$TMP_DIR/untrusted-origin-body" -w '%{http_code}' \
+    "http://fixed.test.example:$HTTP_PORT/trusted-origin")
+assert_eq "cross-origin POST remains rejected by upstream" "$STATUS" "403"
 
 STATUS=$(curl -skS --max-time 5 --resolve "fixed.test.example:$HTTPS_PORT:127.0.0.1" \
     -H "Cookie: $(cookie_header "$APP_COOKIE")" -o "$TMP_DIR/https-proxy-body" -w '%{http_code}' \
@@ -1111,6 +1385,10 @@ assert_json "unknown API error" '.error.code' "http_404"
 
 request DELETE "$ADMIN_HOST" /_api_/authz/v1/session "$ADMIN_COOKIE" "$CSRF"
 assert_eq "logout API" "$STATUS" "200"
+LOGOUT_COOKIES=$(cat "$TMP_DIR/headers")
+assert_contains "logout clears configured root-domain cookie" "$LOGOUT_COOKIES" "; Domain=.test.example"
+assert_contains "logout clears host-only cookie" "$LOGOUT_COOKIES" "authz_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"
+assert_contains "logout clears deeper legacy domain cookie" "$LOGOUT_COOKIES" "; Domain=.admin.test.example"
 request GET "$ADMIN_HOST" /_api_/authz/v1/session "$ADMIN_COOKIE"
 assert_eq "logged-out session rejected" "$STATUS" "401"
 

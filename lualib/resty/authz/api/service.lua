@@ -6,6 +6,7 @@ local identity_key = require "resty.authz.identity"
 local session = require "resty.authz.session"
 local util = require "resty.authz.util"
 local discovery = require "resty.authz.discovery"
+local target = require "resty.authz.target"
 
 local _M = {}
 
@@ -21,6 +22,15 @@ local HTTP_METHODS = {
 }
 local HTTP_METHOD_SET = {}
 for _, method in ipairs(HTTP_METHODS) do HTTP_METHOD_SET[method] = true end
+
+local BINDING_PROXY_FIELDS = {
+    "upstream_host", "forwarded_host", "forwarded_proto", "forwarded_port",
+    "origin_mode", "custom_origin", "simulate_local", "local_ip",
+}
+local FORWARDED_PROTO_SET = { [""] = true, http = true, https = true }
+local ORIGIN_MODE_SET = {
+    auto = true, preserve = true, rewrite = true, remove = true, custom = true,
+}
 
 local function normalize_http_methods(value)
     local input = type(value) == "table" and value or { tostring(value or "*") }
@@ -41,6 +51,24 @@ local function normalize_http_methods(value)
     end
     if #methods == 0 then return nil, "至少选择一个 HTTP 方法" end
     return table.concat(methods, ",")
+end
+
+local function parse_policy_object(value)
+    local object = tostring(value or ""):gsub("%s+", "")
+    if object == "" then object = "/*" end
+    if #object > 512 or object:find(",", 1, true) or object:find("|", 1, true) or
+        object:find("%c") then
+        return nil, "对象格式不合法"
+    end
+    if object == "/*" then
+        return { value = object, kind = "global", path = "/*" }
+    end
+    local port_value, path = object:match("^/(%d+)(/.*)$")
+    local port = tonumber(port_value)
+    if not port or port < authz.config.port_min or port > authz.config.port_max then
+        return nil, "对象必须使用 /<端口><路径> 格式，且端口在允许范围内"
+    end
+    return { value = "/" .. tostring(port) .. path, kind = "port", port = port, path = path }
 end
 
 local function bump_rev()
@@ -201,6 +229,20 @@ function _M.list_users(s)
 end
 
 function _M.authorization(s)
+    local bindings = db.query("SELECT * FROM bindings ORDER BY domain") or {}
+    local bindings_by_port = {}
+    for _, binding in ipairs(bindings) do
+        local port = tonumber(binding.port)
+        bindings_by_port[port] = bindings_by_port[port] or {}
+        bindings_by_port[port][#bindings_by_port[port] + 1] = {
+            id = binding.id,
+            domain = binding.domain,
+            target_ip = binding.target_ip,
+            port = binding.port,
+            menu_name = binding.menu_name,
+            enabled = binding.enabled,
+        }
+    end
     local policies = db.query("SELECT * FROM policies ORDER BY ptype, v0, id") or {}
     for _, policy in ipairs(policies) do
         local action, effect = tostring(policy.v2 or ""), "allow"
@@ -212,6 +254,29 @@ function _M.authorization(s)
         policy.effect = effect
         local source, username = identity_key.parse(policy.v0)
         policy.subject_label = source and (username .. " · " .. source) or policy.v0
+        if policy.ptype == "p" then
+            local object = parse_policy_object(policy.v1)
+            if object then
+                policy.object_kind = object.kind
+                policy.object_port = object.port or cjson.null
+                policy.object_path = object.path
+                policy.binding_matches = object.port and (bindings_by_port[object.port] or {}) or {}
+                if object.port then
+                    if #policy.binding_matches == 1 then
+                        policy.object_kind = "binding"
+                    elseif #policy.binding_matches > 1 then
+                        policy.object_kind = "shared"
+                    else
+                        policy.object_kind = "unbound"
+                    end
+                end
+            else
+                policy.object_kind = "invalid"
+                policy.object_port = cjson.null
+                policy.object_path = policy.v1
+                policy.binding_matches = {}
+            end
+        end
     end
     local admin = _M.is_admin(s)
     local policy_users = {}
@@ -241,7 +306,7 @@ function _M.authorization(s)
         roles = _M.roles_for(s),
         admin = admin,
         csrf = s.csrf,
-        bindings = db.query("SELECT * FROM bindings ORDER BY domain") or {},
+        bindings = bindings,
         policies = policies,
         policy_users = policy_users,
         policy_roles = POLICY_ROLE_CATALOG,
@@ -252,16 +317,20 @@ function _M.authorization(s)
 end
 
 function _M.applications()
-    local applications = db.query([[SELECT id, domain, port, note, menu_name, websocket
+    local applications = db.query([[SELECT id, domain, target_ip, port, note, menu_name, websocket,
+        upstream_host, forwarded_host, forwarded_proto, forwarded_port, origin_mode,
+        custom_origin, simulate_local, local_ip
         FROM bindings WHERE enabled = 1 ORDER BY domain]]) or {}
     local known_ports = {}
     for _, application in ipairs(applications) do
         known_ports[tonumber(application.port)] = true
-        application.note = application.menu_name ~= "" and application.menu_name or application.domain
+        application.label = application.menu_name ~= "" and application.menu_name or application.domain
+        application.binding = true
     end
     for _, application in ipairs(discovery.list(authz.config)) do
         if not known_ports[tonumber(application.port)] then
-            application.note = "local:" .. tostring(application.port)
+            application.label = "local:" .. tostring(application.port)
+            application.binding = false
             applications[#applications + 1] = application
         end
     end
@@ -462,21 +531,97 @@ local function normalize_binding_domain(value)
     return valid_host(generated) and generated or nil
 end
 
+local function normalize_binding_proxy(data)
+    local function optional(value, default)
+        if value == nil or value == cjson.null then return default end
+        return value
+    end
+
+    local upstream_host = target.normalize_authority(optional(data.upstream_host, ""), true)
+    if upstream_host == nil then return nil, "上游 Host 格式不合法" end
+
+    local forwarded_host = target.normalize_authority(optional(data.forwarded_host, ""), true)
+    if forwarded_host == nil then return nil, "Forwarded Host 格式不合法" end
+
+    local forwarded_proto = tostring(optional(data.forwarded_proto, "")):lower()
+        :gsub("^%s+", ""):gsub("%s+$", "")
+    if not FORWARDED_PROTO_SET[forwarded_proto] then
+        return nil, "Forwarded Proto 仅支持自动、http 或 https"
+    end
+
+    local forwarded_port = optional(data.forwarded_port, "")
+    if forwarded_port == "" then
+        forwarded_port = 0
+    else
+        forwarded_port = tonumber(forwarded_port)
+        if forwarded_port == 0 then
+            forwarded_port = 0
+        elseif not forwarded_port or forwarded_port % 1 ~= 0 or
+            forwarded_port < 1 or forwarded_port > 65535 then
+            return nil, "Forwarded Port 必须是 1-65535，留空表示自动"
+        end
+    end
+
+    local origin_mode = tostring(optional(data.origin_mode, "auto")):lower()
+        :gsub("^%s+", ""):gsub("%s+$", "")
+    if not ORIGIN_MODE_SET[origin_mode] then return nil, "Origin 处理模式不受支持" end
+    local custom_origin = target.normalize_origin(optional(data.custom_origin, ""), true)
+    if custom_origin == nil then return nil, "自定义 Origin 必须是合法的 http(s) Origin" end
+    if origin_mode == "custom" and custom_origin == "" then
+        return nil, "自定义 Origin 模式必须填写 Origin"
+    end
+
+    local local_ip = target.normalize_ip(optional(data.local_ip, "127.0.0.1"))
+    if not local_ip then return nil, "模拟本机 IP 必须是合法的 IPv4 或 IPv6 地址" end
+
+    return {
+        upstream_host = upstream_host,
+        forwarded_host = forwarded_host,
+        forwarded_proto = forwarded_proto,
+        forwarded_port = forwarded_port,
+        origin_mode = origin_mode,
+        custom_origin = custom_origin,
+        simulate_local = (data.simulate_local == true or data.simulate_local == 1) and 1 or 0,
+        local_ip = local_ip,
+    }
+end
+
+local function proxy_fields_present(data)
+    for _, field in ipairs(BINDING_PROXY_FIELDS) do
+        if data[field] ~= nil then return true end
+    end
+    return false
+end
+
 function _M.create_application(data)
     local domain = normalize_binding_domain(data.domain)
+    local target_ip = target.normalize_ip(data.target_ip == nil and "127.0.0.1" or data.target_ip)
     local port = tonumber(data.port)
     if not domain then return nil, "请输入最后一级域名前缀，例如 name1", 422 end
+    if not target_ip then return nil, "目标 IP 必须是合法的 IPv4 或 IPv6 地址", 422 end
     if not port or port < authz.config.port_min or port > authz.config.port_max then
         return nil, "端口必须在 " .. authz.config.port_min .. "-" .. authz.config.port_max, 422
     end
+    local proxy, proxy_err = normalize_binding_proxy(data)
+    if not proxy then return nil, proxy_err, 422 end
+    local note = tostring(data.note or "")
+    local menu_name = tostring(data.menu_name or "")
+    if #note > 256 then return nil, "备注不能超过 256 个字符", 422 end
+    if #menu_name > 128 then return nil, "菜单名称不能超过 128 个字符", 422 end
     local existing = db.query("SELECT id FROM bindings WHERE domain = ?", domain)
     if existing and existing[1] then
         return nil, "域名绑定已存在: " .. domain, 409
     end
-    local ok, err = db.exec(
-        "INSERT INTO bindings(domain, port, enabled, websocket, note, menu_name, created_at) VALUES(?,?,?,?,?,?,?)",
-        domain, port, data.enabled == false and 0 or 1, data.websocket == true and 1 or 0,
-        tostring(data.note or ""), tostring(data.menu_name or ""), os.time())
+    local ok, err = db.exec([[INSERT INTO bindings(
+        domain, target_ip, port, enabled, websocket, note, menu_name,
+        upstream_host, forwarded_host, forwarded_proto, forwarded_port,
+        origin_mode, custom_origin, simulate_local, local_ip, created_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)]],
+        domain, target_ip, port, data.enabled == false and 0 or 1,
+        data.websocket == true and 1 or 0, note, menu_name,
+        proxy.upstream_host, proxy.forwarded_host, proxy.forwarded_proto,
+        proxy.forwarded_port, proxy.origin_mode, proxy.custom_origin,
+        proxy.simulate_local, proxy.local_ip, os.time())
     if not ok then return db_error("创建应用失败", err) end
     bump_rev()
     return { message = "应用已创建" }, nil, 201
@@ -579,8 +724,9 @@ function _M.delete_api_key(id)
 end
 
 function _M.update_application(id, data)
-    local rows = db.query("SELECT id FROM bindings WHERE id = ?", id)
+    local rows = db.query("SELECT * FROM bindings WHERE id = ?", id)
     if not rows or not rows[1] then return nil, "应用不存在", 404 end
+    local current = rows[1]
     local fields, values = {}, {}
     if data.domain ~= nil then
         local domain = normalize_binding_domain(data.domain)
@@ -597,6 +743,12 @@ function _M.update_application(id, data)
         end
         fields[#fields + 1] = "port = ?"
         values[#values + 1] = port
+    end
+    if data.target_ip ~= nil then
+        local target_ip = target.normalize_ip(data.target_ip)
+        if not target_ip then return nil, "目标 IP 必须是合法的 IPv4 或 IPv6 地址", 422 end
+        fields[#fields + 1] = "target_ip = ?"
+        values[#values + 1] = target_ip
     end
     if data.note ~= nil then
         local note = tostring(data.note)
@@ -618,6 +770,22 @@ function _M.update_application(id, data)
         fields[#fields + 1] = "websocket = ?"
         values[#values + 1] = (data.websocket == true or data.websocket == 1) and 1 or 0
     end
+    if proxy_fields_present(data) then
+        local merged = {}
+        for _, field in ipairs(BINDING_PROXY_FIELDS) do
+            if data[field] ~= nil then
+                merged[field] = data[field]
+            else
+                merged[field] = current[field]
+            end
+        end
+        local proxy, proxy_err = normalize_binding_proxy(merged)
+        if not proxy then return nil, proxy_err, 422 end
+        for _, field in ipairs(BINDING_PROXY_FIELDS) do
+            fields[#fields + 1] = field .. " = ?"
+            values[#values + 1] = proxy[field]
+        end
+    end
     if #fields == 0 then return nil, "没有可更新字段", 422 end
     values[#values + 1] = id
     local ok, err = db.exec("UPDATE bindings SET " .. table.concat(fields, ", ") .. " WHERE id = ?", unpack(values))
@@ -633,38 +801,50 @@ function _M.delete_application(id)
     return { message = "应用已删除" }
 end
 
-function _M.create_policy(data)
+local function validate_policy_identity(value)
+    local source, username = identity_key.parse(value)
+    if not source then return false end
+    local rows
+    if source == "local" then
+        rows = db.query("SELECT id FROM users WHERE username = ? AND enabled = 1", username)
+    else
+        rows = db.query([[SELECT subject FROM remote_users
+            WHERE provider = ? AND username = ? AND enabled = 1]], source, username)
+    end
+    return rows and rows[1] ~= nil
+end
+
+local function normalize_policy(data)
     local ptype = data.ptype == "g" and "g" or "p"
     local v0 = tostring(data.v0 or ""):gsub("%s+", "")
     if v0 == "" or v0:find(",", 1, true) then return nil, "主体格式不合法", 422 end
     local v1, v2
-    local function validate_identity(value)
-        local source, username = identity_key.parse(value)
-        if not source then return false end
-        local rows
-        if source == "local" then
-            rows = db.query("SELECT id FROM users WHERE username = ? AND enabled = 1", username)
-        else
-            rows = db.query([[SELECT subject FROM remote_users
-                WHERE provider = ? AND username = ? AND enabled = 1]], source, username)
-        end
-        return rows and rows[1] ~= nil
-    end
     if ptype == "p" then
         if v0:sub(1, 5) == "role:" then
             if not POLICY_ROLE_SET[v0:sub(6)] then return nil, "策略角色不受支持", 422 end
         else
             if v0:sub(1, 5) ~= "user:" then v0 = identity_key.key("local", v0) or "" end
-            if not validate_identity(v0) then return nil, "策略用户不存在或已禁用", 422 end
+            if not validate_policy_identity(v0) then return nil, "策略用户不存在或已禁用", 422 end
         end
-        v1 = tostring(data.v1 or "/*"):gsub("%s+", "")
+        local object, object_err = parse_policy_object(data.v1)
+        if not object then return nil, object_err, 422 end
+        v1 = object.value
+        local binding_id = tonumber(data.binding_id)
+        if data.binding_id ~= nil and tostring(data.binding_id) ~= "" then
+            if not binding_id or binding_id < 1 or binding_id ~= math.floor(binding_id) then
+                return nil, "绑定对象不存在", 422
+            end
+            if object.kind ~= "port" then return nil, "全局对象不能关联域名绑定", 422 end
+            local selected = db.query("SELECT id, port FROM bindings WHERE id = ?", binding_id)
+            selected = selected and selected[1]
+            if not selected then return nil, "绑定对象不存在", 422 end
+            if tonumber(selected.port) ~= object.port then
+                return nil, "策略对象端口与所选绑定不一致", 422
+            end
+        end
         local method_err
         v2, method_err = normalize_http_methods(data.v2)
         if not v2 then return nil, method_err, 422 end
-        if v1 == "" then v1 = "/*" end
-        if v1:sub(1, 1) ~= "/" or v1:find(",", 1, true) then
-            return nil, "对象格式不合法", 422
-        end
         if data.eft == "deny" then v2 = v2 .. "|deny" end
     else
         v1 = tostring(data.v1 or ""):gsub("%s+", "")
@@ -673,15 +853,39 @@ function _M.create_policy(data)
         end
         v1 = "role:" .. v1:gsub("^role:", "")
         if v0:sub(1, 5) ~= "user:" then v0 = identity_key.key("local", v0) or "" end
-        if not validate_identity(v0) then return nil, "角色分配用户不存在或已禁用", 422 end
+        if not validate_policy_identity(v0) then return nil, "角色分配用户不存在或已禁用", 422 end
         v2 = "-"
     end
+    return { ptype = ptype, v0 = v0, v1 = v1, v2 = v2 }
+end
+
+function _M.create_policy(data)
+    local policy, err, status = normalize_policy(data)
+    if not policy then return nil, err, status end
     local ok, err = db.exec(
         "INSERT OR IGNORE INTO policies(ptype, v0, v1, v2) VALUES(?,?,?,?)",
-        ptype, v0, v1, v2)
+        policy.ptype, policy.v0, policy.v1, policy.v2)
     if not ok then return db_error("创建策略失败", err) end
     bump_rev()
     return { message = "策略已创建" }, nil, 201
+end
+
+function _M.update_policy(id, data)
+    if not id then return nil, "策略不存在", 404 end
+    local current = db.query("SELECT id FROM policies WHERE id = ?", id)
+    if not current or not current[1] then return nil, "策略不存在", 404 end
+    local policy, err, status = normalize_policy(data)
+    if not policy then return nil, err, status end
+    local duplicate = db.query([[SELECT id FROM policies
+        WHERE ptype = ? AND v0 = ? AND v1 = ? AND v2 = ? AND id != ?]],
+        policy.ptype, policy.v0, policy.v1, policy.v2, id)
+    if duplicate and duplicate[1] then return nil, "相同策略已存在", 409 end
+    local ok, update_err = db.exec(
+        "UPDATE policies SET ptype = ?, v0 = ?, v1 = ?, v2 = ? WHERE id = ?",
+        policy.ptype, policy.v0, policy.v1, policy.v2, id)
+    if not ok then return db_error("更新策略失败", update_err) end
+    bump_rev()
+    return { message = "策略已更新" }
 end
 
 function _M.delete_policy(id)

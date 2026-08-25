@@ -6,7 +6,7 @@
 --   remote_users 远程身份快照 (仅用户名和映射后的本地角色)
 --   sessions  服务端会话
 --   policies  casbin 策略行 p/g
---   bindings  域名 -> 本机端口 绑定
+--   bindings  域名 -> 目标 IP + 端口绑定
 --   api_keys  应用 API Key（只保存 SHA-256 摘要）
 
 local ffi = require "ffi"
@@ -256,11 +256,20 @@ CREATE TABLE IF NOT EXISTS policies(
 CREATE TABLE IF NOT EXISTS bindings(
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   domain     TEXT UNIQUE NOT NULL,
+  target_ip  TEXT NOT NULL DEFAULT '127.0.0.1',
   port       INTEGER NOT NULL,
   enabled    INTEGER NOT NULL DEFAULT 1,
   websocket  INTEGER NOT NULL DEFAULT 0,
   note       TEXT NOT NULL DEFAULT '',
   menu_name  TEXT NOT NULL DEFAULT '',
+  upstream_host TEXT NOT NULL DEFAULT '',
+  forwarded_host TEXT NOT NULL DEFAULT '',
+  forwarded_proto TEXT NOT NULL DEFAULT '',
+  forwarded_port INTEGER NOT NULL DEFAULT 0,
+  origin_mode TEXT NOT NULL DEFAULT 'auto',
+  custom_origin TEXT NOT NULL DEFAULT '',
+  simulate_local INTEGER NOT NULL DEFAULT 0,
+  local_ip TEXT NOT NULL DEFAULT '127.0.0.1',
   created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS api_keys(
@@ -313,6 +322,15 @@ function _M.init(opts)
     ensure_column("remote_users", "updated_at", "updated_at INTEGER NOT NULL DEFAULT 0")
     ensure_column("bindings", "menu_name", "menu_name TEXT NOT NULL DEFAULT ''")
     ensure_column("bindings", "websocket", "websocket INTEGER NOT NULL DEFAULT 0")
+    ensure_column("bindings", "target_ip", "target_ip TEXT NOT NULL DEFAULT '127.0.0.1'")
+    ensure_column("bindings", "upstream_host", "upstream_host TEXT NOT NULL DEFAULT ''")
+    ensure_column("bindings", "forwarded_host", "forwarded_host TEXT NOT NULL DEFAULT ''")
+    ensure_column("bindings", "forwarded_proto", "forwarded_proto TEXT NOT NULL DEFAULT ''")
+    ensure_column("bindings", "forwarded_port", "forwarded_port INTEGER NOT NULL DEFAULT 0")
+    ensure_column("bindings", "origin_mode", "origin_mode TEXT NOT NULL DEFAULT 'auto'")
+    ensure_column("bindings", "custom_origin", "custom_origin TEXT NOT NULL DEFAULT ''")
+    ensure_column("bindings", "simulate_local", "simulate_local INTEGER NOT NULL DEFAULT 0")
+    ensure_column("bindings", "local_ip", "local_ip TEXT NOT NULL DEFAULT '127.0.0.1'")
 
     -- 早期 api_keys schema 将 role CHECK 固定为 api。重建表以允许固定角色目录，保留现有 Key。
     local api_key_schema_rows = _M.query([[SELECT sql FROM sqlite_master

@@ -9,7 +9,7 @@
     <q-list class="menu-list">
       <q-item v-for="item in menuItems" :key="item.app" clickable :active="activeApp === item.app" active-class="menu-item-active" class="menu-item" @click="navigate(item)">
         <q-item-section avatar><q-icon :name="item.icon" size="18px"></q-icon></q-item-section>
-        <q-item-section class="menu-copy">{{ item.label }}</q-item-section>
+        <q-item-section class="menu-copy">{{ item.label }}<q-tooltip v-if="item.note" anchor="top right" self="top left" :offset="[8, 0]">{{ item.note }}</q-tooltip></q-item-section>
         <q-item-section v-if="activeApp === item.app" side class="menu-copy"><span class="active-dot"></span></q-item-section>
       </q-item>
     </q-list>

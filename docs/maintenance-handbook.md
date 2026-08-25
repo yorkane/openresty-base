@@ -38,17 +38,17 @@ Browser
                          -> 解析端口
                          -> 读取会话
                          -> mini-Casbin enforce
-                         -> proxy_pass 127.0.0.1:<port>
+                         -> proxy_pass <target_ip>:<port>
 ```
 
 两个网关入口使用相同控制面：
 
-- HTTP 入口默认 6080，代理 `http://127.0.0.1:<port>`；
-- HTTPS 入口默认 6443，在网关终止 TLS 后代理 `http://127.0.0.1:<port>`；
-- 目标端口优先取启用的精确域名绑定，否则解析 `<port>-任意域名`；显式绑定记录包含 `menu_name` 和 `websocket` 配置；
+- HTTP 入口默认 6080，显式绑定代理 `http://<target_ip>:<port>`；
+- HTTPS 入口默认 6443，在网关终止 TLS 后仍代理 `http://<target_ip>:<port>`；
+- 目标优先取启用的精确域名绑定，否则解析 `<port>-任意域名` 到 `127.0.0.1:<port>`；显式绑定还可保存绑定级 Host、Forwarded、Origin 和模拟本机访问配置；
 - 可代理端口下限强制不小于 2000；目标为网关自身端口时返回 508；
-- 上游收到 `X-Authz-User`、`X-Authz-Source`、`X-Authz-Identity`。
-- 只要请求带有 `Upgrade: websocket`，所有已解析的动态代理目标都会转发升级头；同时通过 `X-Forwarded-Host` 转发外部 Origin Host，并关闭缓冲、延长读写超时。`bindings.websocket` 保留为历史兼容字段，不再阻断升级请求。
+- 上游收到 `X-Authz-User`、`X-Authz-Source`、`X-Authz-Identity`；默认 `Host` 与 `X-Forwarded-Host` 保留外部请求主机名。若最外层代理替换了端口，只在 Origin 与请求 Host 的主机名相同时恢复 Origin 中的公网端口。显式绑定可安全覆盖 `Host`、`X-Forwarded-Host/Proto/Port` 和 `Origin`，但不能改变真实 TCP peer。
+- 只要请求带有 `Upgrade: websocket`，所有已解析的动态代理目标都会转发升级头，并关闭缓冲、延长读写超时。`bindings.websocket` 保留为历史兼容字段，不再阻断升级请求。
 
 Admin 菜单应用列表不依赖 `bindings` 表：`/_api_/authz/v1/applications` 读取 `/proc/net/tcp` 和
 `/proc/net/tcp6` 的监听端口，在 `AUTHZ_PORT_MIN/MAX` 范围内排除网关端口，再向 `127.0.0.1` 发送
@@ -59,8 +59,8 @@ host 网络或其他方式让目标服务位于网关容器的 `127.0.0.1` 网�
 
 | 路径 | 责任 |
 |---|---|
-| `conf/nginx.conf.template` | 全局配置、HTTP/HTTPS listener 与 TLS；两个 server 都 include 公共片段 |
-| `conf/server.conf.template` | HTTP/HTTPS 共用的控制面 location、Admin 静态资源和动态代理配置 |
+| `conf/nginx.conf.template` | 全局配置、HTTP/HTTPS listener 与 TLS；两个 server 都 include 运行时生成的 `server.conf` |
+| `conf/server.conf.template` | 生成 HTTP/HTTPS 共用的控制面 location、Admin 静态资源和动态代理配置 |
 | `lualib/resty/authz/init.lua` | 环境配置、初始化、端口解析、缓存和 access 阶段 |
 | `lualib/resty/authz/app.lua` | 登录、OAuth 跳转、旧接口 410；不承载管理业务 API |
 | `lualib/resty/authz/api/router.lua` | `/_api_/authz/v1` 代码注册式路由 |
@@ -86,6 +86,16 @@ host 网络或其他方式让目标服务位于网关容器的 `127.0.0.1` 网�
 该 revision，因此管理 API 的写入会让所有 worker 使用新查询键，不需要 IPC 广播。直接改 SQLite
 不会触发 revision；生产变更必须走管理 API 或重启网关。
 
+浏览器会话按每次请求的 Host 选择规范 Cookie 父域，而不是使用进程级固定父域：去掉入口主机的
+第一个标签，例如 `6080-241.ws.example.com` 得到 `.ws.example.com`，
+`code-m.w.wtvdev.com` 得到 `.w.wtvdev.com`。`AUTHZ_COOKIE_DOMAIN` 可配置一个或用逗号分隔的多个
+父域提示；仅当提示匹配当前 Host 且不比请求推导结果更宽时使用。`AUTHZ_HOST_URL` 的推导结果只作为
+无法从请求 Host 判断时的回退。因此同一实例可同时承载多套基础域名。
+
+登录、OAuth 和登出响应会清除 host-only、当前完整主机、更深层旧域以及比规范域更宽一级的旧
+Cookie；请求同时携带多个 `authz_session` 时选择仍有效且到期时间最新的会话，并立即重新签发到
+当前请求对应的规范父域。不能再恢复“只读取第一条同名 Cookie”的行为。
+
 ## 4. 数据和身份模型
 
 SQLite 默认位于 `/data/authz/authz.db`，`/data` 必须持久化。
@@ -96,7 +106,7 @@ SQLite 默认位于 `/data/authz/authz.db`，`/data` 必须持久化。
 | `remote_users` | 主键 `(provider, subject)`；唯一 `(provider, username)`；创建/最近登录/修改时间 |
 | `sessions` | token、username、source、csrf、expires_at |
 | `policies` | `ptype/v0/v1/v2` 唯一；存 p/g 规则 |
-| `bindings` | domain 唯一；port、enabled、websocket、note、menu_name |
+| `bindings` | domain 唯一；target_ip/port、enabled、websocket、note、menu_name；upstream/forwarded/origin 代理字段；simulate_local/local_ip |
 
 `remote_users.synced_at` 是保留的内部存储列名；管理 API 只输出语义明确的 `recorded_at`，避免把
 单向身份记录误解为双向同步协议。
@@ -159,12 +169,23 @@ API Key 安全约束：
 - Key 可使用固定目录中的 `admin/staff/user/viewer/api` 单一角色，角色修改必须立即失效旧缓存；
 - `admin` Key 可管理全部控制面；`api` Key 只额外允许新建 binding；其他角色与同角色用户边界一致；
 - 代理前必须通过 `proxy_set_header X-Authz-Key ""` 清除凭据；
+- `target_ip` 允许可信 admin/api 主体连接其他机器，应将其视为内网访问能力；Casbin 对象仍按
+  `/<port><path>` 授权，同端口的不同目标 IP 共享策略；
+- 绑定级 Host/Forwarded/Origin 字段必须经过 authority/origin 白名单校验并拒绝 CR/LF；模拟本机访问只重写
+  `Host`、`Origin`、`X-Real-IP`、`X-Forwarded-For` 等 HTTP 头，不应被描述成 TCP 来源伪造；
 - Key 启用、禁用、删除和策略变更都必须 bump cache revision，并有跨 worker HTTP 回归。
 
 策略规则：
 
 - `p`: `v0` 为 `user:<source>:<username>` 或 `role:<role>`；
 - `v1` 为 `/<port><path-pattern>`，全局为 `/*`；
+- Admin 新增和编辑表单只管理 `p` 访问策略，不提供 `g` 角色分配切换；历史 `g` 规则仍可列出和删除。
+  表单按 binding ID 选择目标，将菜单名、域名和目标 IP:端口同时展示；路径默认 `/*`，
+  绑定对象只能从下拉列表选择，选中后仅显示名称，详情在下拉项中分行展示；效果直接使用允许/拒绝 Radio；
+  编辑时回填类型、主体、绑定、路径、HTTP 方法和效果，提交时组合为 `/<port><path-pattern>`；服务端的
+  `POST` 与 `PATCH` 必须共享校验，确保 binding ID 存在且端口一致，失败时不得覆盖原策略；
+- 策略列表通过 API 的 `binding_matches` 反查绑定详情；无匹配绑定显示为“未绑定”，同端口多个绑定显示
+  为“共享策略”。Casbin 仍按端口 + 路径授权，不能把共享端口策略误显示为单一绑定专属策略；
 - `v2` 支持标准 HTTP 方法多选，数据库中以逗号保存；`*` 表示全部；
 - deny 通过 `v2` 的 `|deny` 后缀编码，deny 优先；
 - `g`: 将来源感知用户主体分配给固定角色。
@@ -287,7 +308,7 @@ bash test/run_tests.sh openresty-base:nocobase-test
 | `test/test_authz_gateway.sh` | 登录、API、CSRF、身份隔离、远端记录、OAuth、动态代理和 HTTPS Cookie |
 | `test/run_tests.sh` | 镜像基础库、WebDAV、FancyIndex、JWT/旧 SSO 兼容 |
 
-截至本文更新，最近基线为 Router 99、Authz 359、基础镜像 17，共 475 项/断言。数量不是固定契约；
+截至本文更新，最近基线为 Router 99、Authz 478、基础镜像 17，共 594 项/断言。数量不是固定契约；
 任何行为变更必须增加或调整能验证真实 HTTP 结果的断言。
 
 OAuth 测试使用 `test/mock_nocobase.py`，不得连接生产账号或把真实 token 写入测试输出。测试至少覆盖
@@ -301,13 +322,15 @@ PKCE、resource、回调 issuer、state 一次性、角色映射、同名来源�
 宿主机 data/   -> /data
 宿主机 admin/  -> /usr/local/openresty/nginx/html/admin:ro
 宿主机 lualib/ -> /usr/local/openresty/site/lualib:ro
+宿主机 conf/   -> /etc/openresty/templates:ro
 ```
 
-这使 Lua 和前端修改无需重建镜像。部署操作区分：
+这使 Lua、前端和 Nginx 模板修改无需重建镜像。镜像入口脚本每次启动都从运行时模板目录生成
+`/usr/local/openresty/nginx/conf/nginx.conf` 与 `server.conf`；未挂载模板目录时回退到镜像内置模板。部署操作区分：
 
 - 只改挂载代码/静态资源：`openresty -t` 后重启或 reload；
-- 镜像部署修改 `conf/nginx.conf.template` 或 `conf/server.conf.template`：重新构建并重建容器；主模板由 entrypoint 执行 `envsubst`，公共 server 模板由两个 listener 直接 include；
-- 开发时若显式挂载两个模板：主模板变化需要重启容器重新渲染，只有公共 server 模板变化时可先 `openresty -t` 再 reload；
+- 修改 `conf/nginx.conf.template` 或 `conf/server.conf.template`：重启容器，由 entrypoint 同时重新渲染两个最终配置；不需要重建镜像；
+- 只修改模板且环境变量未变化时可直接 `docker restart`；`.env` 变化仍必须重新创建容器；
 - 改环境变量、网络、挂载、镜像：重建容器；
 - 改数据库 schema：先备份 `/data/authz/authz.db`，不得先热更新挂载 Lua；必须重启或重建容器，让 `init_by_lua` 的幂等迁移在 worker 接收流量前完成；
 - 改 vendor：重新生成 manifest 和哈希，不在页面恢复 CDN 依赖。
@@ -327,13 +350,13 @@ curl -fsS http://127.0.0.1:6080/_authz/login >/dev/null
 日常重建优先使用仓库脚本：
 
 ```bash
-bash scripts/restart_gateway.sh          # 使用当前镜像，应用新的 .env
+bash scripts/restart_gateway.sh          # 使用当前镜像，应用新的 .env 和 conf 模板
 bash scripts/restart_gateway.sh --build  # 按当前 Docker 架构重建镜像后部署
 ```
 
 脚本会拒绝非 `host` 网络，执行 `openresty -t`，并检查登录页、session API、Admin 入口和 HTTPS 登录页。
 `.env`、网络、挂载和镜像变化都要重建容器；仅执行 `docker restart` 不会更新容器创建时的环境变量。
-主配置或公共 `server.conf.template` 变化必须 `--build`；`admin/` 和 `lualib/` 是挂载目录，修改它们通常无需重新构建镜像。
+`conf/`、`admin/` 和 `lualib/` 是挂载目录，修改它们通常无需重新构建镜像；只有镜像源发生变化时才使用 `--build`。
 
 ### 10.1 本次代理排障经验
 
@@ -341,7 +364,9 @@ bash scripts/restart_gateway.sh --build  # 按当前 Docker 架构重建镜像�
 2. 再确认网关入口：`6443` 对外提供 HTTPS，但上游仍是 HTTP，不能设置上游 TLS 参数。
 3. 未登录时，绑定已解析但返回 `302` 到 `/_authz/login` 是预期认证结果；它证明请求已经进入认证链路。
 4. WebSocket 默认全局开启；不同前缀可以共用同一端口，但同一最终域名重复创建返回 `409`。验证时只需携带 `Upgrade: websocket`，不依赖绑定记录中的旧 `websocket` 值。
-5. 管理菜单优先使用已配置绑定的 `menu-name`，其次是绑定域名；没有绑定时才使用自动发现的 `local:<port>`。
+5. 管理菜单优先使用已配置绑定的 `menu-name`，其次是绑定域名；绑定备注只在菜单名称悬浮时显示；没有绑定时才使用自动发现的 `local:<port>`，且不显示绑定备注。
+6. pi-web 会校验 API 请求的 Host 与 Origin；网关必须保留外部 Host，pi-web 启动环境需设置精确域名白名单，例如 `PI_WEB_ALLOWED_HOSTS=pi-m.ws.example.com`。公网端口被外层代理改写时，网关只对同主机名 Origin 恢复公网端口，异域 Origin 继续由上游拒绝。
+7. 若应用只接受目标地址 Host 或本地来源头，优先在单条绑定上覆盖 Host/Forwarded/Origin，或启用“模拟本机访问”并填写 `127.0.0.1`/网关局域网 IP；不要放宽所有绑定的全局默认策略。
 
 ## 11. 已解决故障与防回归点
 
@@ -355,8 +380,10 @@ bash scripts/restart_gateway.sh --build  # 按当前 Docker 架构重建镜像�
 - `db.lua` 的缓存查询键包含 `authz_cache:db_rev`；管理 API 写入会 bump revision 并让所有 worker 使用新查询键。
   直接改 SQLite 不会触发 revision，必须走 service/API，或重启进程。
 - 反向代理终止 TLS 时正确传递 `X-Forwarded-Proto`，或设置 `AUTHZ_COOKIE_SECURE=true`。
+- `authz_session` 必须统一使用规范父域；多条同名 Cookie 不能按首条盲选，登录/登出必须同时清理
+  host-only、旧子域和旧宽域作用域。当前实例规范域为 `.ws.example.com`。
 - `/_radmin_/` 静态资源默认启用 Brotli/Gzip，Brotli 动态等级 5、Gzip 等级 5；镜像构建为资源生成 Brotli 等级 11 的 `.br` 侧车文件，并通过 `brotli_static on` 优先提供。
-- Admin 入口启用 SSI，个性化壳输出 `Cache-Control: no-store`；普通静态资源通过 `expires max` 输出长期缓存头。
+- Admin 入口启用 SSI；`index.html`、`users.html`、`authorization.html` 在页面内声明 `no-cache/no-store`，HTTP 响应不再添加这两个缓存控制头；普通静态资源通过 `expires max` 输出长期缓存头。
 - Dockerfile 使用 Buildx 多阶段构建，`RESTY_J` 默认 8；源码下载单独缓存，GitHub Actions 使用 GHA cache。不要退回 `DOCKER_BUILDKIT=0`。
 - 发布或部署镜像时优先使用 GitHub Actions 推送到 GHCR 的镜像；只有调试 Dockerfile、验证未发布改动或 CI 不可用时才本地构建。
 - Docker Desktop for Mac 必须开启 Host Networking；否则容器内的 `127.0.0.1` 不代表宿主机端口，自动发现和代理测试都会产生误导性结果。

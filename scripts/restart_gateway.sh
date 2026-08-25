@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Recreate the local Authz Gateway container with the current .env.
 #
-# Default behavior is intentionally --no-build: .env changes require a new
-# container, not a new image. Use --build only when Dockerfile/image sources
-# changed and a local linux/arm64 image should be rebuilt.
+# Default behavior is intentionally --no-build: .env and conf template changes
+# require a new container, not a new image. Use --build only when Dockerfile or
+# other image sources changed and a local platform image should be rebuilt.
 
 set -Eeuo pipefail
 
@@ -111,6 +111,13 @@ if [[ "$ACTUAL_NETWORK_MODE" != "host" ]]; then
     exit 1
 fi
 printf '容器网络: host\n'
+
+ACTUAL_TEMPLATE_SOURCE="$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/etc/openresty/templates"}}{{.Source}}{{end}}{{end}}' "$CONTAINER_NAME")"
+if [[ -z "$ACTUAL_TEMPLATE_SOURCE" ]]; then
+    printf '错误: 未挂载运行时 Nginx 模板目录 /etc/openresty/templates。\n' >&2
+    exit 1
+fi
+printf '运行时 Nginx 模板: %s\n' "$ACTUAL_TEMPLATE_SOURCE"
 
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/openresty-gateway-restart.XXXXXX")"
 trap 'rm -rf -- "$TMP_DIR"' EXIT

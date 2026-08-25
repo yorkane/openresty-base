@@ -64,6 +64,7 @@ function saveApplication (values) {
 
 function savePolicy (values) {
   if (values.action === 'add') return mutation('POST', '/policies', values)
+  if (values.action === 'edit') return mutation('PATCH', `/policies/${values.id}`, values)
   if (values.action === 'del') return mutation('DELETE', `/policies/${values.id}`, values)
   throw new Error('Unsupported policy action')
 }

@@ -43,6 +43,9 @@ description: 维护本仓库的 OpenResty Authz Gateway、klib Router、Vue 3 + 
 - 生产 API 安装稳定的 404/500 JSON handler，不暴露请求头、token 或内部堆栈。
 - API handler 使用 `params/env/req`，JSON/form body 使用 `req.get_body(env)`。
 - guard 顺序保持会话、admin、CSRF，再进入 service；修改请求使用 `X-CSRF-Token`。
+- `authz_session` 按每次请求 Host 去掉第一个标签来选择父域；`AUTHZ_COOKIE_DOMAIN` 支持多个匹配提示，
+  `AUTHZ_HOST_URL` 只作回退。重复同名 Cookie 必须选择有效且最新的会话，并通过登录/登出响应清理
+  host-only、旧子域和旧宽域作用域。
 - `lualib` 作为整体复制和整体挂载，不能只部署 `resty/authz` 子目录。
 - NocoBase 2.2 OAuth 以 `docs/thirdparty-oauth-login.md` 为准：公网 Client 通过
   `oidcStates:create` 一次性注册，运行时使用 Code + PKCE、`client_secret_basic` 和严格 `iss` 校验；
@@ -58,10 +61,18 @@ description: 维护本仓库的 OpenResty Authz Gateway、klib Router、Vue 3 + 
 - i18n 完整覆盖 zh-CN/en-US，并通过 `admin_locale`、同源 postMessage 和 storage event 在壳与右侧应用页面间同步。
 - 延续 Linear/Pollux 暗色、低对比边框、柔和紫色、10-16px 圆角和可读的响应式字号。
 - 网络操作展示 Loading/错误，删除、禁用、覆盖和恢复操作需要确认。
-- `/_radmin_/` 精确入口必须启用 SSI 并输出 `Cache-Control: no-store`；菜单是 `menu.html` SSI 片段，不能恢复菜单 iframe。
+- `/_radmin_/` 精确入口必须启用 SSI；Admin HTML 页面内声明 `no-cache/no-store`，HTTP 响应不再添加这两个缓存控制头；菜单是 `menu.html` SSI 片段，不能恢复菜单 iframe。
 - 菜单应用列表通过 `resty.authz.discovery` 探测网关本机 `127.0.0.1` 的 HTTP 服务，仅扫描配置端口范围、排除网关端口，并使用短超时缓存结果；不要恢复仅依赖 `bindings` 表的菜单发现。
+- 左侧菜单固定绑定显示 `menu_name` 或域名，悬浮菜单名称时显示该绑定的 `note`；自动发现的 `local:<port>` 不伪造绑定备注。
 - Dockerfile 必须保留 `--with-http_ssi_module` 和 `ngx_brotli`；Brotli 动态等级 5，静态资源构建时生成等级 11 的 `.br`，由 `brotli_static` 提供。
-- `conf/nginx.conf.template` 只维护全局配置、HTTP/HTTPS listener 和 TLS；两个 server 必须共同 include `conf/server.conf.template`，控制面 location 与代理参数只在公共片段维护。
+- `conf/nginx.conf.template` 只维护全局配置、HTTP/HTTPS listener 和 TLS；两个 server 必须共同 include 入口脚本生成的 `server.conf`，控制面 location 与代理参数只在 `conf/server.conf.template` 维护。
+- 动态代理默认 `Host` 与 `X-Forwarded-Host` 必须保留外部请求主机名；显式 binding 可按记录覆盖 Host、Forwarded、Origin，或模拟本机 HTTP 请求头。不能恢复为 `$proxy_host` 全局默认。外层代理改写端口时，只能在 Origin 与请求 Host 的主机名相同后采用 Origin authority，不能信任异域 Origin；所有绑定级 authority/origin 必须拒绝 CR/LF 和 path/query。
+- 策略新增和编辑表单只管理 `p` 访问策略，不提供 `g` 角色分配切换；历史 `g` 规则仅列出和删除。
+  表单按 binding ID 选择目标并由服务端统一校验 binding 与 Casbin 对象端口一致；
+  绑定对象使用纯下拉选择，选中值不挤入详情；效果使用允许/拒绝 Radio；
+  编辑使用 `PATCH /policies/:id` 并回填完整策略，校验失败不得覆盖旧值。策略列表通过 `binding_matches`
+  展示菜单名、域名、目标 IP:端口和路径，并明确标记未绑定或同端口共享策略。
+- Compose 将 `conf/` 挂载到 `/etc/openresty/templates:ro`，镜像入口脚本每次启动生成最终 `nginx.conf` 与 `server.conf`；修改模板只需重建或重启容器，不需重建镜像。
 
 ## 验证顺序
 
@@ -82,7 +93,7 @@ bash test/run_tests.sh openresty-base:nocobase-test
 
 ## 部署规则
 
-- 开发/生产挂载保持：`data -> /data`、`admin -> nginx/html/admin:ro`、`lualib -> site/lualib:ro`。
+- 开发/生产挂载保持：`data -> /data`、`admin -> nginx/html/admin:ro`、`lualib -> site/lualib:ro`、`conf -> /etc/openresty/templates:ro`。
 - 修改挂载代码前后执行 `docker exec <container> openresty -t`；环境变量、网络或挂载改变必须重建容器。
 - 不假设容器名，先用 `docker ps` 和 `docker inspect` 确认镜像、network mode、mounts 和环境变量状态。
 - 部署后至少验证登录页、session API、`/_radmin_/`、SSI 菜单、一个右侧应用 iframe 页面和一个受保护代理目标。
