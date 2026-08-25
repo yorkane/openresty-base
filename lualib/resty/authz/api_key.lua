@@ -7,6 +7,12 @@ local util = require "resty.authz.util"
 local _M = {}
 
 local TOKEN_PATTERN = [[^ak_[0-9a-f]{64}$]]
+local ROLE_SET = { admin = true, staff = true, user = true, viewer = true, api = true }
+
+function _M.valid_role(role)
+    role = tostring(role or ""):lower()
+    return ROLE_SET[role] and role or nil
+end
 
 function _M.principal(id)
     id = tonumber(id)
@@ -19,19 +25,22 @@ function _M.authenticate(token)
     if not ngx.re.match(token, TOKEN_PATTERN, "jo") then return nil end
     local token_hash = util.sha256_hex(token)
     if not token_hash then return nil end
-    local rows = db.query([[SELECT id, name, role FROM api_keys
+    local rows = db.query([[SELECT id, name, role, created_at, updated_at FROM api_keys
         WHERE token_hash = ? AND enabled = 1]], token_hash)
     local row = rows and rows[1]
-    if not row or row.role ~= "api" then return nil end
+    local role = row and _M.valid_role(row.role)
+    if not role then return nil end
     return {
         kind = "api_key",
         id = row.id,
         name = row.name,
         username = row.name,
         source = "api-key",
-        role = "api",
-        roles = { "api" },
+        role = role,
+        roles = { role },
         identity = _M.principal(row.id),
+        created_at = row.created_at,
+        updated_at = row.updated_at,
     }
 end
 

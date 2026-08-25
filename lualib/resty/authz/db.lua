@@ -267,7 +267,7 @@ CREATE TABLE IF NOT EXISTS api_keys(
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   name       TEXT UNIQUE NOT NULL,
   token_hash TEXT UNIQUE NOT NULL,
-  role       TEXT NOT NULL DEFAULT 'api' CHECK(role = 'api'),
+  role       TEXT NOT NULL DEFAULT 'api',
   enabled    INTEGER NOT NULL DEFAULT 1,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
@@ -313,6 +313,38 @@ function _M.init(opts)
     ensure_column("remote_users", "updated_at", "updated_at INTEGER NOT NULL DEFAULT 0")
     ensure_column("bindings", "menu_name", "menu_name TEXT NOT NULL DEFAULT ''")
     ensure_column("bindings", "websocket", "websocket INTEGER NOT NULL DEFAULT 0")
+
+    -- 早期 api_keys schema 将 role CHECK 固定为 api。重建表以允许固定角色目录，保留现有 Key。
+    local api_key_schema_rows = _M.query([[SELECT sql FROM sqlite_master
+        WHERE type = 'table' AND name = 'api_keys']]) or {}
+    local api_key_schema = tostring(api_key_schema_rows[1] and api_key_schema_rows[1].sql or "")
+    if api_key_schema:match("CHECK%s*%(%s*role%s*=%s*'api'%s*%)") then
+        local statements = {
+            "BEGIN IMMEDIATE",
+            [[CREATE TABLE api_keys_role_catalog(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE NOT NULL,
+                token_hash TEXT UNIQUE NOT NULL,
+                role TEXT NOT NULL DEFAULT 'api',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            )]],
+            [[INSERT INTO api_keys_role_catalog
+                (id, name, token_hash, role, enabled, created_at, updated_at)
+                SELECT id, name, token_hash, role, enabled, created_at, updated_at FROM api_keys]],
+            "DROP TABLE api_keys",
+            "ALTER TABLE api_keys_role_catalog RENAME TO api_keys",
+            "COMMIT",
+        }
+        for _, statement in ipairs(statements) do
+            local migrated, migration_err = _M.exec(statement)
+            if not migrated then
+                _M.exec("ROLLBACK")
+                error("api_keys role migration failed: " .. tostring(migration_err))
+            end
+        end
+    end
     local ok, err = _M.exec("UPDATE remote_users SET remote_roles = roles WHERE remote_roles = ''")
     if not ok then error("remote role migration failed: " .. tostring(err)) end
     ok, err = _M.exec("UPDATE users SET updated_at = created_at WHERE updated_at = 0")

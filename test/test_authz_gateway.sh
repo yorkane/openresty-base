@@ -193,6 +193,15 @@ connection.execute("""CREATE TABLE policies(
 connection.execute("""INSERT INTO policies(ptype, v0, v1, v2)
     VALUES ('p', 'legacy_user', '/2999/*', 'GET')
 """)
+connection.execute("""CREATE TABLE api_keys(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT UNIQUE NOT NULL,
+    token_hash TEXT UNIQUE NOT NULL,
+    role TEXT NOT NULL DEFAULT 'api' CHECK(role = 'api'),
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+)""")
 connection.commit()
 connection.close()
 PY
@@ -305,10 +314,11 @@ import sys
 
 connection = sqlite3.connect(sys.argv[1])
 columns = {row[1] for row in connection.execute("PRAGMA table_info(api_keys)")}
+schema = connection.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'api_keys'").fetchone()[0]
 policy = connection.execute("""SELECT 1 FROM policies
     WHERE ptype = 'p' AND v0 = 'role:api' AND v1 = '/*' AND v2 = '*'""").fetchone()
 valid = columns == {"id", "name", "token_hash", "role", "enabled", "created_at", "updated_at"}
-print("yes" if valid and policy else "no")
+print("yes" if valid and policy and "CHECK" not in schema.upper() else "no")
 connection.close()
 PY
 )
@@ -496,14 +506,24 @@ mv "$TMP_DIR/body-redacted" "$TMP_DIR/body"
 BODY=$(<"$TMP_DIR/body")
 [[ "$API_KEY_TOKEN" =~ ^ak_[a-f0-9]{64}$ ]] || fail "created API key has an invalid format"
 pass "raw API key is returned once with a stable format"
-assert_json "API key has fixed api role" '.data.role' "api"
+assert_json "API key defaults to the api role" '.data.role' "api"
 
 request GET "$ADMIN_HOST" /_api_/authz/v1/api-keys "$ADMIN_COOKIE"
 assert_eq "admin lists API keys" "$STATUS" "200"
 assert_json "API key list never returns raw token" '.data[0] | has("token") | tostring' "false"
 assert_json "API key list never returns token hash" '.data[0] | has("token_hash") | tostring' "false"
+request POST "$ADMIN_HOST" /_api_/authz/v1/api-keys "$ADMIN_COOKIE" "$CSRF" \
+    '{"name":"invalid-role-agent","role":"root"}'
+assert_eq "unsupported API key role is rejected" "$STATUS" "422"
 request GET "$ADMIN_HOST" /_api_/authz/v1/session "" "" "" "$API_KEY_TOKEN"
-assert_eq "API role cannot impersonate a browser session" "$STATUS" "403"
+assert_eq "API key reads its service identity" "$STATUS" "200"
+assert_json "API key session identifies machine authentication" '.data.auth_type' "api_key"
+assert_json "API key session exposes assigned role" '.data.roles | join(",")' "api"
+assert_json "api role is not admin" '.data.admin | tostring' "false"
+request DELETE "$ADMIN_HOST" /_api_/authz/v1/session "" "" "" "$API_KEY_TOKEN"
+assert_eq "API key cannot perform browser logout" "$STATUS" "403"
+request GET "$ADMIN_HOST" /_api_/authz/v1/applications "" "" "" "$API_KEY_TOKEN"
+assert_eq "API role can read application entries" "$STATUS" "200"
 request GET "$ADMIN_HOST" /_api_/authz/v1/users "" "" "" "$API_KEY_TOKEN"
 assert_eq "API role cannot manage users or roles" "$STATUS" "403"
 request POST "$ADMIN_HOST" /_api_/authz/v1/policies "" "" '{"ptype":"p","v0":"role:api","v1":"/*","v2":"*"}' "$API_KEY_TOKEN"
@@ -538,6 +558,18 @@ request PATCH "$ADMIN_HOST" "/_api_/authz/v1/applications/$API_BINDING_ID" "" ""
     '{"menu_name":"forbidden"}' "$API_KEY_TOKEN"
 assert_eq "API role cannot modify an existing binding" "$STATUS" "403"
 
+request PATCH "$ADMIN_HOST" "/_api_/authz/v1/api-keys/$API_KEY_ID" "$ADMIN_COOKIE" "$CSRF" '{"role":"viewer"}'
+assert_eq "admin changes an API key role" "$STATUS" "200"
+request GET agent.test.example / "" "" "" "$API_KEY_TOKEN"
+assert_eq "viewer API key loses api proxy permission immediately" "$STATUS" "403"
+request POST "$ADMIN_HOST" /_api_/authz/v1/applications "" "" \
+    "{\"domain\":\"viewer-denied.test.example\",\"port\":$UPSTREAM_PORT}" "$API_KEY_TOKEN"
+assert_eq "viewer API key cannot create a binding" "$STATUS" "403"
+request PATCH "$ADMIN_HOST" "/_api_/authz/v1/api-keys/$API_KEY_ID" "$ADMIN_COOKIE" "$CSRF" '{"role":"api"}'
+assert_eq "admin restores the API key role" "$STATUS" "200"
+request GET agent.test.example / "" "" "" "$API_KEY_TOKEN"
+assert_eq "restored api role invalidates proxy authorization cache" "$STATUS" "200"
+
 request PATCH "$ADMIN_HOST" "/_api_/authz/v1/api-keys/$API_KEY_ID" "$ADMIN_COOKIE" "$CSRF" '{"enabled":false}'
 assert_eq "admin disables an API key" "$STATUS" "200"
 request GET agent.test.example /identity "" "" "" "$API_KEY_TOKEN"
@@ -553,6 +585,93 @@ assert_eq "deleted API key is rejected immediately" "$STATUS" "401"
 request DELETE "$ADMIN_HOST" "/_api_/authz/v1/applications/$API_BINDING_ID" "$ADMIN_COOKIE" "$CSRF"
 assert_eq "admin removes the API-created binding" "$STATUS" "200"
 unset API_KEY_TOKEN
+
+request POST "$ADMIN_HOST" /_api_/authz/v1/api-keys "$ADMIN_COOKIE" "$CSRF" \
+    '{"name":"admin-agent","role":"admin"}'
+assert_eq "admin creates an admin-role API key" "$STATUS" "201"
+ADMIN_API_KEY_ID=$(jq -er '.data.id' "$TMP_DIR/body")
+ADMIN_API_KEY_TOKEN=$(jq -er '.data.token' "$TMP_DIR/body")
+jq '.data.token = "[REDACTED]"' "$TMP_DIR/body" >"$TMP_DIR/body-redacted"
+mv "$TMP_DIR/body-redacted" "$TMP_DIR/body"
+BODY=$(<"$TMP_DIR/body")
+[[ "$ADMIN_API_KEY_TOKEN" =~ ^ak_[a-f0-9]{64}$ ]] || fail "created admin API key has an invalid format"
+pass "admin-role API key is returned once"
+
+request GET "$ADMIN_HOST" /_api_/authz/v1/session "" "" "" "$ADMIN_API_KEY_TOKEN"
+assert_eq "admin API key reads its identity" "$STATUS" "200"
+assert_json "admin API key exposes admin role" '.data.roles | join(",")' "admin"
+assert_json "admin API key exposes admin capability" '.data.admin | tostring' "true"
+assert_json "admin API key uses canonical service principal" ".data.identity" "api-key:$ADMIN_API_KEY_ID"
+request GET "$ADMIN_HOST" /_api_/authz/v1/users "" "" "" "$ADMIN_API_KEY_TOKEN"
+assert_eq "admin API key reads user management" "$STATUS" "200"
+request POST "$ADMIN_HOST" /_api_/authz/v1/users "" "" \
+    '{"username":"api-managed","password":"password123","roles":["user"]}' "$ADMIN_API_KEY_TOKEN"
+assert_eq "admin API key creates a user without CSRF" "$STATUS" "201"
+request GET "$ADMIN_HOST" /_api_/authz/v1/users "" "" "" "$ADMIN_API_KEY_TOKEN"
+API_MANAGED_USER_ID=$(jq -er '.data.users[] | select(.username == "api-managed") | .id' "$TMP_DIR/body")
+request PATCH "$ADMIN_HOST" "/_api_/authz/v1/users/$API_MANAGED_USER_ID" "" "" \
+    '{"roles":["viewer"]}' "$ADMIN_API_KEY_TOKEN"
+assert_eq "admin API key updates a user" "$STATUS" "200"
+request PUT "$ADMIN_HOST" "/_api_/authz/v1/users/$API_MANAGED_USER_ID/password" "" "" \
+    '{"password":"password456"}' "$ADMIN_API_KEY_TOKEN"
+assert_eq "admin API key resets a user password" "$STATUS" "200"
+request DELETE "$ADMIN_HOST" "/_api_/authz/v1/users/$API_MANAGED_USER_ID" "" "" "" "$ADMIN_API_KEY_TOKEN"
+assert_eq "admin API key deletes a user" "$STATUS" "200"
+
+request POST "$ADMIN_HOST" /_api_/authz/v1/applications "" "" \
+    "{\"domain\":\"admin-agent.test.example\",\"port\":$UPSTREAM_PORT}" "$ADMIN_API_KEY_TOKEN"
+assert_eq "admin API key creates a binding" "$STATUS" "201"
+request GET "$ADMIN_HOST" /_api_/authz/v1/authorization "" "" "" "$ADMIN_API_KEY_TOKEN"
+assert_eq "admin API key reads core authorization" "$STATUS" "200"
+ADMIN_API_BINDING_ID=$(jq -er '.data.bindings[] | select(.domain == "admin-agent.test.example") | .id' "$TMP_DIR/body")
+request PATCH "$ADMIN_HOST" "/_api_/authz/v1/applications/$ADMIN_API_BINDING_ID" "" "" \
+    '{"menu_name":"Admin agent"}' "$ADMIN_API_KEY_TOKEN"
+assert_eq "admin API key updates a binding" "$STATUS" "200"
+request GET admin-agent.test.example /identity "" "" "" "$ADMIN_API_KEY_TOKEN"
+assert_eq "admin API key accesses proxy targets through role:admin" "$STATUS" "200"
+request POST "$ADMIN_HOST" /_api_/authz/v1/policies "" "" \
+    "{\"ptype\":\"p\",\"v0\":\"role:viewer\",\"v1\":\"/$UPSTREAM_PORT/admin-agent\",\"v2\":\"GET\",\"eft\":\"allow\"}" "$ADMIN_API_KEY_TOKEN"
+assert_eq "admin API key creates an authorization policy" "$STATUS" "201"
+request GET "$ADMIN_HOST" /_api_/authz/v1/authorization "" "" "" "$ADMIN_API_KEY_TOKEN"
+ADMIN_API_POLICY_ID=$(jq -er --arg object "/$UPSTREAM_PORT/admin-agent" \
+    '.data.policies[] | select(.v0 == "role:viewer" and .v1 == $object) | .id' "$TMP_DIR/body")
+request DELETE "$ADMIN_HOST" "/_api_/authz/v1/policies/$ADMIN_API_POLICY_ID" "" "" "" "$ADMIN_API_KEY_TOKEN"
+assert_eq "admin API key deletes an authorization policy" "$STATUS" "200"
+request DELETE "$ADMIN_HOST" "/_api_/authz/v1/applications/$ADMIN_API_BINDING_ID" "" "" "" "$ADMIN_API_KEY_TOKEN"
+assert_eq "admin API key deletes a binding" "$STATUS" "200"
+
+request POST "$ADMIN_HOST" /_api_/authz/v1/api-keys "" "" \
+    '{"name":"viewer-agent","role":"viewer"}' "$ADMIN_API_KEY_TOKEN"
+assert_eq "admin API key creates another role-scoped key" "$STATUS" "201"
+VIEWER_API_KEY_ID=$(jq -er '.data.id' "$TMP_DIR/body")
+VIEWER_API_KEY_TOKEN=$(jq -er '.data.token' "$TMP_DIR/body")
+jq '.data.token = "[REDACTED]"' "$TMP_DIR/body" >"$TMP_DIR/body-redacted"
+mv "$TMP_DIR/body-redacted" "$TMP_DIR/body"
+BODY=$(<"$TMP_DIR/body")
+request GET "$ADMIN_HOST" /_api_/authz/v1/session "" "" "" "$VIEWER_API_KEY_TOKEN"
+assert_json "viewer API key receives viewer role" '.data.roles | join(",")' "viewer"
+request GET "$ADMIN_HOST" /_api_/authz/v1/users "" "" "" "$VIEWER_API_KEY_TOKEN"
+assert_eq "viewer API key cannot use admin APIs" "$STATUS" "403"
+request PATCH "$ADMIN_HOST" "/_api_/authz/v1/api-keys/$VIEWER_API_KEY_ID" "" "" \
+    '{"role":"user"}' "$ADMIN_API_KEY_TOKEN"
+assert_eq "admin API key changes another key role" "$STATUS" "200"
+request PATCH "$ADMIN_HOST" "/_api_/authz/v1/api-keys/$VIEWER_API_KEY_ID" "" "" \
+    '{"role":"root"}' "$ADMIN_API_KEY_TOKEN"
+assert_eq "admin API key cannot assign an unknown role" "$STATUS" "422"
+request GET "$ADMIN_HOST" /_api_/authz/v1/session "" "" "" "$VIEWER_API_KEY_TOKEN"
+assert_json "API key role update is immediately visible" '.data.roles | join(",")' "user"
+request DELETE "$ADMIN_HOST" "/_api_/authz/v1/api-keys/$VIEWER_API_KEY_ID" "" "" "" "$ADMIN_API_KEY_TOKEN"
+assert_eq "admin API key deletes another key" "$STATUS" "200"
+unset VIEWER_API_KEY_TOKEN
+
+request PUT "$ADMIN_HOST" /_api_/authz/v1/me/password "" "" \
+    '{"old_password":"ignored","new_password":"ignored"}' "$ADMIN_API_KEY_TOKEN"
+assert_eq "API key cannot use personal password endpoint" "$STATUS" "403"
+request DELETE "$ADMIN_HOST" "/_api_/authz/v1/api-keys/$ADMIN_API_KEY_ID" "" "" "" "$ADMIN_API_KEY_TOKEN"
+assert_eq "admin API key can revoke itself" "$STATUS" "200"
+request GET "$ADMIN_HOST" /_api_/authz/v1/users "" "" "" "$ADMIN_API_KEY_TOKEN"
+assert_eq "self-revoked admin API key is rejected" "$STATUS" "401"
+unset ADMIN_API_KEY_TOKEN
 
 request GET "$ADMIN_HOST" '/_authz/login?next=/_radmin_/'
 assert_eq "login page with OAuth provider" "$STATUS" "200"

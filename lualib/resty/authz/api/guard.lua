@@ -20,21 +20,23 @@ function _M.wrap(handler, options)
             if not current then
                 return error_payload("invalid_api_key", "API Key 无效或已禁用"), 401
             end
-            if not options.api_key or current.role ~= "api" then
-                return error_payload("forbidden", "API 角色无权调用此接口"), 403
+            if options.session_only then
+                return error_payload("forbidden", "此接口仅适用于浏览器会话"), 403
             end
-            return handler(params, env, req, current, nil)
-        end
-
-        token = session.get_request_token()
-        current = token and session.get(token)
-        if not current then
-            return error_payload("unauthenticated", "请先登录"), 401
+        else
+            token = session.get_request_token()
+            current = token and session.get(token)
+            if not current then
+                return error_payload("unauthenticated", "请先登录"), 401
+            end
         end
         if options.admin and not service.is_admin(current) then
             return error_payload("forbidden", "需要管理员权限"), 403
         end
-        if options.csrf and req.get_header("X-CSRF-Token", env) ~= current.csrf then
+        if options.roles and not service.has_any_role(current, options.roles) then
+            return error_payload("forbidden", "当前角色无权调用此接口"), 403
+        end
+        if not key_presented and options.csrf and req.get_header("X-CSRF-Token", env) ~= current.csrf then
             return error_payload("csrf_failed", "CSRF 校验失败"), 403
         end
         return handler(params, env, req, current, token)

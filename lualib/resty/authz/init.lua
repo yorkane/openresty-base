@@ -337,8 +337,9 @@ local function ensure_cache()
     local api_keys = db.query("SELECT id, role FROM api_keys WHERE enabled = 1") or {}
     for _, key in ipairs(api_keys) do
         local principal = api_key.principal(key.id)
-        if principal and key.role == "api" then
-            lines[#lines + 1] = "g, " .. principal .. ", role:api"
+        local role = api_key.valid_role(key.role)
+        if principal and role then
+            lines[#lines + 1] = "g, " .. principal .. ", role:" .. role
         end
     end
     cache.enforcer = casbin_mod.new_enforcer(lines)

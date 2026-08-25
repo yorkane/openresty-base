@@ -37,8 +37,9 @@ CSRF=$(curl -sS -b cookie.txt "${GATEWAY}/_api_/authz/v1/session" | jq -r '.data
 x-authz-key: ak_<64 个小写十六进制字符>
 ```
 
-API Key 的主体是 `api-key:<id>`，固定继承内置 `role:api`。默认策略允许该角色访问所有已解析的代理
-目标；管理员仍可通过 Casbin `role:api` allow/deny 策略收紧目标端口、路径或 HTTP 方法。
+API Key 的主体是 `api-key:<id>`，创建或修改时可绑定一个固定目录角色：`admin`、`staff`、`user`、
+`viewer`、`api`。控制面权限与同角色用户一致，代理权限由对应的 `role:<role>` Casbin 策略决定。
+`role:admin` 和 `role:api` 默认可访问所有已解析代理目标，管理员可用 deny 策略继续收紧。
 
 ```bash
 curl -sS -H "x-authz-key: ${AUTHZ_KEY}" \
@@ -58,21 +59,21 @@ X-Authz-Identity: api-key:<id>
 
 ## 3. 权限矩阵
 
-| 接口能力 | 普通会话 | admin 会话 | `api` Key |
+| 接口能力 | 普通用户/Key | `admin` 用户/Key | `api` Key |
 |---|---:|---:|---:|
-| 读取/退出自己的 session | 是 | 是 | 否 |
-| 读取应用入口 | 是 | 是 | 否 |
-| 新建域名与端口绑定 | 否 | 是（CSRF） | 是 |
-| 修改或删除绑定 | 否 | 是（CSRF） | 否 |
-| 管理用户、远程身份、密码 | 仅自己的密码 | 是（CSRF） | 否 |
-| 读取/修改 Casbin 策略 | 否 | 是（修改需 CSRF） | 否 |
-| 创建、修改、删除 API Key | 否 | 是（修改需 CSRF） | 否 |
-| 新建角色或修改核心认证 | 否 | 否（无此 API） | 否 |
-| 请求受保护的代理目标 | 按用户/角色策略 | 按 `admin` 策略 | 按 `api` 策略 |
+| 读取自身身份和应用入口 | 是 | 是 | 是 |
+| 浏览器注销/修改自己的密码 | 仅用户会话 | 仅用户会话 | 否 |
+| 新建域名与端口绑定 | 否 | 是 | 是 |
+| 修改或删除绑定 | 否 | 是 | 否 |
+| 管理用户、远程身份和密码 | 否 | 是 | 否 |
+| 读取/修改 Casbin 策略 | 否 | 是 | 否 |
+| 创建、修改、删除 API Key | 否 | 是 | 否 |
+| 请求受保护的代理目标 | 按绑定角色策略 | 按 `admin` 策略 | 按 `api` 策略 |
 
-`api` 是服务主体专用角色，不能分配给本地或远程用户，也不能通过 API 创建其他角色。
+用户会话的修改请求必须发送 CSRF；API Key 请求不使用 CSRF。`api` 是服务主体专用角色，不能分配给
+本地或远程用户。角色目录固定，不提供动态新建角色 API。
 
-## 4. API Key 管理（仅 admin 会话）
+## 4. API Key 管理（`admin` 角色）
 
 ### `GET /api-keys`
 
@@ -80,13 +81,14 @@ X-Authz-Identity: api-key:<id>
 
 ### `POST /api-keys`
 
-创建 Key。请求需要 admin Cookie 与 CSRF。
+创建 Key。可使用 admin Cookie + CSRF，也可直接使用 `admin` API Key；机器请求不发送 CSRF。
 
 ```json
-{"name":"deployment-agent"}
+{"name":"deployment-agent","role":"staff"}
 ```
 
-名称为 2–64 位 ASCII 字母、数字、点、下划线或连字符。角色固定为 `api`，不可指定其他角色。
+名称为 2–64 位 ASCII 字母、数字、点、下划线或连字符。`role` 可为
+`admin/staff/user/viewer/api`，省略时默认 `api`。
 
 创建响应中的 `token` 只出现一次：
 
@@ -95,7 +97,7 @@ X-Authz-Identity: api-key:<id>
   "data": {
     "id": 12,
     "name": "deployment-agent",
-    "role": "api",
+    "role": "staff",
     "enabled": 1,
     "created_at": 1787580000,
     "updated_at": 1787580000,
@@ -111,10 +113,10 @@ SQLite 只保存 SHA-256 摘要，丢失明文后不能恢复，应删除旧 Key
 允许字段：
 
 ```json
-{"name":"deployment-agent-2","enabled":false}
+{"name":"deployment-agent-2","role":"viewer","enabled":false}
 ```
 
-禁用后立即拒绝控制面和代理请求。`role` 不可修改。
+角色、名称或启用状态修改后立即作用于控制面与代理授权缓存。
 
 ### `DELETE /api-keys/:id`
 
@@ -129,7 +131,7 @@ SQLite 只保存 SHA-256 摘要，丢失明文后不能恢复，应删除旧 Key
 
 ### `POST /applications`
 
-admin 会话或 `api` Key 均可调用。API Key 不使用 CSRF。
+`admin` 用户/Key 或 `api` Key 均可调用。API Key 不使用 CSRF。
 
 ```bash
 curl -sS -X POST "${GATEWAY}/_api_/authz/v1/applications" \
@@ -154,29 +156,32 @@ curl -sS -X POST "${GATEWAY}/_api_/authz/v1/applications" \
 
 ### `PATCH /applications/:id`
 
-仅 admin 会话。可修改 `domain`、`port`、`menu_name`、`note`、`enabled`、`websocket`。
+仅 `admin` 角色。可修改 `domain`、`port`、`menu_name`、`note`、`enabled`、`websocket`。
 
 ### `DELETE /applications/:id`
 
-仅 admin 会话，删除绑定。
+仅 `admin` 角色，删除绑定。
 
 ## 6. 其他核心 API
 
 | Method | Path | 身份 | 用途 |
 |---|---|---|---|
-| `GET` | `/session` | 会话 | 当前身份、来源、角色、admin、CSRF 与时间信息 |
+| `GET` | `/session` | 会话或 Key | 当前身份、来源、角色、admin 与时间信息；用户会话另含 CSRF |
 | `DELETE` | `/session` | 会话 + CSRF | 退出当前会话 |
-| `GET` | `/users` | admin | 本地与远程身份列表、可分配的人类角色目录 |
-| `POST` | `/users` | admin + CSRF | 创建本地用户；`username/password/roles` |
-| `PATCH` | `/users/:id` | admin + CSRF | 修改本地用户 `roles` 或 `enabled` |
-| `DELETE` | `/users/:id` | admin + CSRF | 删除本地用户 |
-| `PUT` | `/users/:id/password` | admin + CSRF | 重置本地用户密码；`password` |
+| `GET` | `/users` | admin 用户/Key | 本地与远程身份列表、可分配的人类角色目录 |
+| `POST` | `/users` | admin 用户/Key | 创建本地用户；`username/password/roles` |
+| `PATCH` | `/users/:id` | admin 用户/Key | 修改本地用户 `roles` 或 `enabled` |
+| `DELETE` | `/users/:id` | admin 用户/Key | 删除本地用户 |
+| `PUT` | `/users/:id/password` | admin 用户/Key | 重置本地用户密码；`password` |
 | `PUT` | `/me/password` | 本地会话 + CSRF | 修改自己的密码；`old_password/new_password` |
-| `PATCH` | `/remote-users/:provider` | admin + CSRF | 按 body 中 `subject` 修改远程身份角色/启用状态 |
-| `DELETE` | `/remote-users/:provider` | admin + CSRF | 按 body 中 `subject` 删除远程身份快照 |
-| `GET` | `/authorization` | admin | 绑定、策略、策略主体、角色与 HTTP 方法目录 |
-| `POST` | `/policies` | admin + CSRF | 新建 Casbin `p` 或人类用户的 `g` 规则 |
-| `DELETE` | `/policies/:id` | admin + CSRF | 删除策略 |
+| `PATCH` | `/remote-users/:provider` | admin 用户/Key | 按 body 中 `subject` 修改远程身份角色/启用状态 |
+| `DELETE` | `/remote-users/:provider` | admin 用户/Key | 按 body 中 `subject` 删除远程身份快照 |
+| `GET` | `/authorization` | admin 用户/Key | 绑定、策略、策略主体、角色与 HTTP 方法目录 |
+| `POST` | `/policies` | admin 用户/Key | 新建 Casbin `p` 或人类用户的 `g` 规则 |
+| `DELETE` | `/policies/:id` | admin 用户/Key | 删除策略 |
+
+表中 admin 用户执行修改时仍需 CSRF，admin Key 不需要。`DELETE /session` 和 `PUT /me/password` 是
+浏览器用户会话专用接口；admin Key 可通过 `/users/:id/password` 管理本地用户密码。
 
 策略对象格式为 `/<port><path-pattern>`，例如 `/2077/*`；动作支持标准 HTTP 方法或 `*`。`p.v0` 可为
 `user:<source>:<username>` 或 `role:<role>`。`deny` 优先于 `allow`。
@@ -188,4 +193,5 @@ curl -sS -X POST "${GATEWAY}/_api_/authz/v1/applications" \
 - 每个应用/Agent 使用独立 Key，名称可追踪用途；停用优先于共享或复用 Key。
 - 仅把 Key 发给受信任的网关 Origin；不要把 Key 放进 URL、query、Cookie 或请求 body。
 - 自动化遇到 `401` 时停止并请求管理员轮换/启用 Key；不要尝试回退用户密码。
-- 自动化遇到 `403` 时视为策略拒绝，不要尝试调用用户、角色、策略或核心认证接口绕过限制。
+- 自动化遇到 `403` 时视为角色或策略拒绝，不要尝试越权；需要完整管理能力时由管理员签发独立
+  `admin` Key，而不是复用用户密码。

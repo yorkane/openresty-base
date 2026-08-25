@@ -52,7 +52,8 @@
 - 授权管理支持域名绑定增删/启停及 Casbin 策略编辑
 - `/_radmin_/` 由服务端会话保护，未登录自动跳转到 `/_authz/login?next=...`
 - 管理端统一调用 `/_api_/authz/v1/*` JSON API；旧 `/_authz/api/*` 与 `*/save` 接口已退役
-- 应用可使用 `x-authz-key` 访问代理目标并新建绑定；完整契约见 [核心 API（Agent 使用手册）](docs/core-api.md)
+- 应用可使用 `x-authz-key` 作为服务身份；Key 可绑定固定角色，`admin` Key 可管理全部核心 API，完整
+  契约见 [核心 API（Agent 使用手册）](docs/core-api.md)
 
 首次启动自动 seed：`admin / admin123`（务必尽快改密）。默认仅
 `role:admin` 对 `/*` 全放行，其他角色默认拒绝。
@@ -155,7 +156,7 @@ docker run -d --name gw --network host \
 - `lualib/resty/authz/db.lua` 是 SQLite 数据层；只读查询通过 vendored `resty.mlcache` 的 L1/L2/L3
   分层缓存，成功写入会递增共享的数据库 revision，使其他 worker 的旧查询键失效。
 - 数字前缀动态端口默认允许 `2000` 起步；人类角色固定为 `admin`、`staff`、`user`、`viewer`，应用
-  Key 固定使用独立 `api` 角色；HTTP 方法使用完整方法目录，并支持多选策略。
+  Key 可绑定这些角色或专用 `api` 角色；HTTP 方法使用完整方法目录，并支持多选策略。
 
 #### 身份与授权
 

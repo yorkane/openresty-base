@@ -39,7 +39,7 @@ register("DELETE", "/authz/v1/session", guard.wrap(function(_, _, _, _, token)
     session.delete(token)
     session.clear_cookie()
     return { data = { message = "已退出登录" } }
-end, { csrf = true }))
+end, { csrf = true, session_only = true }))
 
 register("GET", "/authz/v1/users", guard.wrap(function(_, _, _, current)
     return { data = service.list_users(current) }
@@ -71,7 +71,7 @@ end), { admin = true, csrf = true }))
 
 register("PUT", "/authz/v1/me/password", guard.wrap(with_body(function(_, data, current, token)
     return service.change_password(current, token, data)
-end), { csrf = true }))
+end), { csrf = true, session_only = true }))
 
 register("GET", "/authz/v1/authorization", guard.wrap(function(_, _, _, current)
     return { data = service.authorization(current) }
@@ -83,7 +83,7 @@ end))
 
 register("POST", "/authz/v1/applications", guard.wrap(with_body(function(_, data)
     return service.create_application(data)
-end), { admin = true, csrf = true, api_key = true }))
+end), { roles = { "admin", "api" }, csrf = true }))
 
 register("PATCH", "/authz/v1/applications/:id", guard.wrap(with_body(function(params, data)
     return service.update_application(tonumber(params.id), data)

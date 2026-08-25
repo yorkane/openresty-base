@@ -1,4 +1,5 @@
 local authz = require "resty.authz"
+local api_key = require "resty.authz.api_key"
 local cjson = require "cjson.safe"
 local db = require "resty.authz.db"
 local identity_key = require "resty.authz.identity"
@@ -86,7 +87,8 @@ end
 
 function _M.roles_for(identity)
     if type(identity) == "table" and identity.kind == "api_key" then
-        return { "api" }
+        local role = api_key.valid_role(identity.role)
+        return role and { role } or {}
     end
     local username = type(identity) == "table" and identity.username or identity
     local source = type(identity) == "table" and identity.source or "local"
@@ -103,6 +105,17 @@ function _M.roles_for(identity)
     return roles
 end
 
+function _M.has_any_role(identity, allowed)
+    local role_set = {}
+    for _, role in ipairs(type(allowed) == "table" and allowed or { allowed }) do
+        role_set[tostring(role)] = true
+    end
+    for _, role in ipairs(_M.roles_for(identity)) do
+        if role_set[role] then return true end
+    end
+    return false
+end
+
 function _M.is_admin(s)
     if not s then return false end
     for _, role in ipairs(_M.roles_for(s)) do
@@ -112,6 +125,21 @@ function _M.is_admin(s)
 end
 
 function _M.session_payload(s)
+    if s.kind == "api_key" then
+        return {
+            authenticated = true,
+            auth_type = "api_key",
+            api_key_id = s.id,
+            username = s.username,
+            source = s.source,
+            identity = s.identity,
+            roles = _M.roles_for(s),
+            admin = _M.is_admin(s),
+            created_at = s.created_at,
+            last_login_at = cjson.null,
+            updated_at = s.updated_at,
+        }
+    end
     local timestamps
     if s.source == "local" then
         timestamps = db.query([[SELECT created_at, last_login_at, updated_at FROM users
@@ -133,6 +161,11 @@ function _M.session_payload(s)
         last_login_at = timestamps.last_login_at or cjson.null,
         updated_at = timestamps.updated_at,
     }
+end
+
+local function principal_for(s)
+    if s.kind == "api_key" then return s.identity end
+    return identity_key.key(s.source, s.username)
 end
 
 function _M.list_users(s)
@@ -157,7 +190,7 @@ function _M.list_users(s)
     return {
         username = s.username,
         source = s.source,
-        identity = identity_key.key(s.source, s.username),
+        identity = principal_for(s),
         roles = _M.roles_for(s),
         admin = true,
         csrf = s.csrf,
@@ -204,7 +237,7 @@ function _M.authorization(s)
     return {
         username = s.username,
         source = s.source,
-        identity = identity_key.key(s.source, s.username),
+        identity = principal_for(s),
         roles = _M.roles_for(s),
         admin = admin,
         csrf = s.csrf,
@@ -473,9 +506,8 @@ function _M.create_api_key(data)
     if not name then return nil, "名称需为 2-64 位字母、数字、点、下划线或连字符", 422 end
     local duplicate = db.query("SELECT id FROM api_keys WHERE name = ?", name)
     if duplicate and duplicate[1] then return nil, "API Key 名称已存在", 409 end
-    if data.role ~= nil and tostring(data.role) ~= "api" then
-        return nil, "API Key 角色固定为 api", 422
-    end
+    local role = api_key.valid_role(data.role or "api")
+    if not role then return nil, "API Key 角色仅支持 admin、staff、user、viewer、api", 422 end
 
     local random_part = util.random_token(32)
     if not random_part then return nil, "生成 API Key 失败", 500 end
@@ -485,7 +517,7 @@ function _M.create_api_key(data)
     local now = os.time()
     local ok, err = db.exec([[INSERT INTO api_keys
         (name, token_hash, role, enabled, created_at, updated_at)
-        VALUES(?, ?, 'api', 1, ?, ?)]], name, token_hash, now, now)
+        VALUES(?, ?, ?, 1, ?, ?)]], name, token_hash, role, now, now)
     if not ok then return db_error("创建 API Key 失败", err) end
     local rows = db.query([[SELECT id, name, role, enabled, created_at, updated_at
         FROM api_keys WHERE token_hash = ?]], token_hash)
@@ -507,8 +539,6 @@ function _M.update_api_key(id, data)
     id = tonumber(id)
     local current = id and api_key_by_id(id)
     if not current then return nil, "API Key 不存在", 404 end
-    if data.role ~= nil then return nil, "API Key 角色固定为 api", 422 end
-
     local fields, values = {}, {}
     if data.name ~= nil then
         local name = valid_api_key_name(data.name)
@@ -521,6 +551,12 @@ function _M.update_api_key(id, data)
     if data.enabled ~= nil then
         fields[#fields + 1] = "enabled = ?"
         values[#values + 1] = (data.enabled == true or data.enabled == 1) and 1 or 0
+    end
+    if data.role ~= nil then
+        local role = api_key.valid_role(data.role)
+        if not role then return nil, "API Key 角色仅支持 admin、staff、user、viewer、api", 422 end
+        fields[#fields + 1] = "role = ?"
+        values[#values + 1] = role
     end
     if #fields == 0 then return nil, "没有可更新字段", 422 end
     fields[#fields + 1] = "updated_at = ?"
