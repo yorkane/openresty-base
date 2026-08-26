@@ -502,6 +502,10 @@ assert_eq "unauthenticated API JSON type" "$CONTENT_TYPE" "application/json; cha
 assert_json "unauthenticated API error" '.error.code' "unauthenticated"
 request GET "$ADMIN_HOST" /_radmin_/
 assert_eq "unauthenticated admin UI redirects" "$STATUS" "302"
+request GET "$ADMIN_HOST" /_radmin_
+assert_eq "admin URL without slash redirects" "$STATUS" "301"
+ADMIN_SLASH_LOCATION=$(awk 'BEGIN { IGNORECASE=1 } /^Location:/ { sub(/^[^:]+:[[:space:]]*/, ""); sub(/\r$/, ""); print; exit }' "$TMP_DIR/headers")
+assert_eq "admin slash redirect stays relative" "$ADMIN_SLASH_LOCATION" "/_radmin_/"
 
 login "$ADMIN_HOST" admin admin123 "$ADMIN_COOKIE"
 HTTP_LOGIN_COOKIE=$(awk 'BEGIN { IGNORECASE=1 } /^Set-Cookie:/ { sub(/^[^:]+:[[:space:]]*/, ""); sub(/^[^;]+/, ""); sub(/\r$/, ""); print; exit }' "$TMP_DIR/login-headers")
@@ -541,7 +545,8 @@ assert_contains "admin UI loads shell" "$BODY" "app-frame"
 assert_contains "admin UI assembles menu with SSI" "$BODY" "id=\"admin-menu\""
 assert_not_contains "admin SSI menu has no inline style" "$BODY" "<style>"
 assert_not_contains "admin UI does not iframe menu" "$BODY" "menu-frame"
-assert_contains "menu shows binding notes on hover" "$BODY" '<q-tooltip v-if="item.note"'
+assert_contains "menu shows application address on hover" "$BODY" '<q-tooltip v-if="item.address"'
+assert_contains "menu renders binding note below label" "$BODY" '<span v-if="item.note" class="menu-item-note">{{ item.note }}</span>'
 assert_not_contains "admin shell has no no-store HTTP header" "$(cat "$TMP_DIR/headers")" "Cache-Control: no-store"
 assert_contains "admin shell declares browser no-cache" "$BODY" 'http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate"'
 assert_contains "admin shell declares no-cache pragma" "$BODY" 'http-equiv="Pragma" content="no-cache"'
@@ -575,11 +580,14 @@ assert_contains "admin static asset expires max" \
 request GET "$ADMIN_HOST" '/_radmin_/app.js?v=9' "$ADMIN_COOKIE"
 assert_contains "admin redirect is limited to API 401" "$BODY" "error?.status === 401"
 assert_contains "menu separates application label and note" "$BODY" "application.label || application.menu_name || application.domain"
-assert_contains "menu sends binding notes to tooltip" "$BODY" "note: application.binding ? application.note : ''"
+assert_contains "menu sends application address to tooltip" "$BODY" "address: appUrl"
+assert_contains "menu keeps binding notes below label" "$BODY" "note: application.binding ? application.note : ''"
 assert_contains "authorization menu is admin gated" "$BODY" "if (isAdmin.value)"
 assert_contains "menu reads admin status from session" "$BODY" "isAdmin.value = Boolean(session.admin)"
 assert_contains "menu loads local applications" "$BODY" "window.adminApi.applications"
 assert_contains "menu refreshes local applications" "$BODY" "setInterval(loadApplications, 30000)"
+assert_contains "menu supports Ctrl or Command click" "$BODY" 'event?.ctrlKey || event?.metaKey'
+assert_contains "menu opens Ctrl click in a new window" "$BODY" "window.open(item.app, '_blank', 'noopener,noreferrer')"
 assert_contains "built-in app URLs are versioned" "$BODY" "apps/authorization.html?v=14"
 request GET "$ADMIN_HOST" /_radmin_/apps/users.html "$ADMIN_COOKIE"
 assert_contains "user roles use controlled multi-select" "$BODY" 'multiple use-chips emit-value map-options'

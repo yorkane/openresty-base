@@ -63,7 +63,7 @@ description: 维护本仓库的 OpenResty Authz Gateway、klib Router、Vue 3 + 
 - 网络操作展示 Loading/错误，删除、禁用、覆盖和恢复操作需要确认。
 - `/_radmin_/` 精确入口必须启用 SSI；Admin HTML 页面内声明 `no-cache/no-store`，HTTP 响应不再添加这两个缓存控制头；菜单是 `menu.html` SSI 片段，不能恢复菜单 iframe。
 - 菜单应用列表通过 `resty.authz.discovery` 探测网关本机 `127.0.0.1` 的 HTTP 服务，仅扫描配置端口范围、排除网关端口，并使用短超时缓存结果；不要恢复仅依赖 `bindings` 表的菜单发现。
-- 左侧菜单固定绑定显示 `menu_name` 或域名，悬浮菜单名称时显示该绑定的 `note`；自动发现的 `local:<port>` 不伪造绑定备注。
+- 左侧菜单固定绑定显示 `menu_name` 或域名；绑定备注只显示在菜单名称下方，悬浮菜单项时显示该菜单实际打开的完整域名地址；自动发现的 `local:<port>` 不伪造绑定备注。
 - Dockerfile 必须保留 `--with-http_ssi_module` 和 `ngx_brotli`；Brotli 动态等级 5，静态资源构建时生成等级 11 的 `.br`，由 `brotli_static` 提供。
 - `conf/nginx.conf.template` 只维护全局配置、HTTP/HTTPS listener 和 TLS；两个 server 必须共同 include 入口脚本生成的 `server.conf`，控制面 location 与代理参数只在 `conf/server.conf.template` 维护。
 - 动态代理默认 `Host` 与 `X-Forwarded-Host` 必须保留外部请求主机名；显式 binding 可按记录覆盖 Host、Forwarded、Origin，或模拟本机 HTTP 请求头。不能恢复为 `$proxy_host` 全局默认。外层代理改写端口时，只能在 Origin 与请求 Host 的主机名相同后采用 Origin authority，不能信任异域 Origin；所有绑定级 authority/origin 必须拒绝 CR/LF 和 path/query。
@@ -73,6 +73,19 @@ description: 维护本仓库的 OpenResty Authz Gateway、klib Router、Vue 3 + 
   编辑使用 `PATCH /policies/:id` 并回填完整策略，校验失败不得覆盖旧值。策略列表通过 `binding_matches`
   展示菜单名、域名、目标 IP:端口和路径，并明确标记未绑定或同端口共享策略。
 - Compose 将 `conf/` 挂载到 `/etc/openresty/templates:ro`，镜像入口脚本每次启动生成最终 `nginx.conf` 与 `server.conf`；修改模板只需重建或重启容器，不需重建镜像。
+
+## 镜像构建决策（强制）
+
+绝大部分维护、修复和测试不需要构建镜像。默认使用已有测试镜像，并通过真实 OpenResty 容器挂载当前工作树的
+`admin/`、`lualib/`、`conf/`、脚本和测试文件验证；修改这些运行时挂载目录后，不得为了测试额外执行 Docker build。
+
+只有以下情况才构建镜像：
+
+1. 用户明确要求“重新构建镜像”或等价要求；
+2. 修改了镜像构建链或未通过运行时挂载提供的较大/固化文件，例如 `Dockerfile`、基础镜像/构建参数、原生模块、镜像内置依赖或必须复制进镜像的大型资源。
+
+普通 Lua、前端、Nginx 模板、文档、测试和 `.env` 修改均按挂载目录处理；先完成挂载式测试，只有命中上述条件时才增加构建步骤。
+若是否属于“大文件”不明确，优先不构建，并先验证挂载路径是否已覆盖该文件；不要仅因为代码行数较多就构建。
 
 ## 验证顺序
 
@@ -85,7 +98,7 @@ OPENRESTY_TEST_IMAGE=openresty-base:nocobase-test bash test/test_authz_gateway.s
 bash test/run_tests.sh openresty-base:nocobase-test
 ```
 
-镜像发布和部署优先使用 GitHub Actions 构建并推送的 GHCR 镜像；仅在调试 Dockerfile、验证未发布改动或 CI 不可用时本地构建。
+镜像发布和部署优先使用 GitHub Actions 构建并推送的 GHCR 镜像；本地构建只能在满足上面的构建条件后使用，不能作为普通代码测试的默认步骤。
 本地构建需要 Docker CLI `buildx`，可使用 `docker buildx build --load` 或 `docker compose build`，不要设置
 `DOCKER_BUILDKIT=0` 退回 legacy builder。普通代码修改优先复用 BuildKit 缓存；只有变更 OpenResty
 版本、编译参数或原生模块时才触发完整编译。

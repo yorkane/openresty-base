@@ -1,3 +1,5 @@
+absolute_redirect off;
+
 location /_authz {
     default_type text/html;
     content_by_lua_block {

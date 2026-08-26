@@ -42,6 +42,7 @@ const app = createApp({
           app: appUrl,
           title: applicationLabel,
           label: applicationLabel,
+          address: appUrl,
           note: application.binding ? application.note : '',
           icon: 'mdi-application-outline'
         })
@@ -55,8 +56,12 @@ const app = createApp({
       return `${window.location.protocol}//${hostname}${gatewayPort}/`
     }
 
-    function navigate (item) {
+    function navigate (item, event) {
       if (!allowedApps.has(item.app) && !item.app.startsWith(`${window.location.protocol}//`)) return
+      if (event?.ctrlKey || event?.metaKey) {
+        window.open(item.app, '_blank', 'noopener,noreferrer')
+        return
+      }
       activeApp.value = item.app
       activeTitle.value = item.title
     }

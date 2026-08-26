@@ -74,6 +74,12 @@
 
 #admin-menu .menu-item .q-item__section--avatar { min-width: 28px; }
 
+#admin-menu .menu-item .q-item__section--main { min-width: 0; }
+#admin-menu .menu-item-label,
+#admin-menu .menu-item-note { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#admin-menu .menu-item-note { margin-top: 2px; color: var(--muted); font-size: 11px; line-height: 1.25; }
+#admin-menu .menu-item-active .menu-item-note { color: rgba(243, 244, 251, .72); }
+
 #admin-menu .menu-item .q-icon,
 #admin-menu .collapse-button .q-icon,
 #admin-menu .footer-action .q-icon { padding-left: 8px; }
