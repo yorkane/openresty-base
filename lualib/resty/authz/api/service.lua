@@ -484,18 +484,22 @@ function _M.reset_password(id, data)
     return { message = "密码已重置" }
 end
 
-function _M.change_password(s, token, data)
+function _M.change_password(s, _, data)
     if s.source ~= "local" then
         return nil, "远程用户请在 NocoBase 修改密码", 409
     end
     local old_password = tostring(data.old_password or data.oldpw or "")
     local new_password = tostring(data.new_password or data.newpw or "")
+    local confirm_password = tostring(data.new_password_confirm or data.newpw_confirm or "")
     local rows = db.query("SELECT password_hash, salt FROM users WHERE username = ?", s.username)
     local user = rows and rows[1]
     if not user or not util.verify_password(old_password, user.salt, user.password_hash) then
         return nil, "当前密码错误", 422
     end
     if #new_password < 6 then return nil, "新密码至少 6 位", 422 end
+    if confirm_password ~= "" and confirm_password ~= new_password then
+        return nil, "两次输入的新密码不一致", 422
+    end
     local salt = util.random_token(16)
     local hash, hash_err = util.hash_password(new_password, salt)
     if not hash then return nil, tostring(hash_err), 500 end
@@ -503,8 +507,7 @@ function _M.change_password(s, token, data)
         "UPDATE users SET password_hash = ?, salt = ?, updated_at = ? WHERE username = ?",
         hash, salt, os.time(), s.username)
     if not ok then return db_error("修改密码失败", err) end
-    db.exec([[DELETE FROM sessions WHERE username = ? AND source = 'local' AND token != ?]],
-        s.username, token)
+    session.delete_all_for(s.username, "local")
     return { message = "密码已修改" }
 end
 

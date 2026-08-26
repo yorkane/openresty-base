@@ -196,7 +196,7 @@ TCP 来源仍是网关主机地址。
 | `PATCH` | `/users/:id` | admin 用户/Key | 修改本地用户 `roles` 或 `enabled` |
 | `DELETE` | `/users/:id` | admin 用户/Key | 删除本地用户 |
 | `PUT` | `/users/:id/password` | admin 用户/Key | 重置本地用户密码；`password` |
-| `PUT` | `/me/password` | 本地会话 + CSRF | 修改自己的密码；`old_password/new_password` |
+| `PUT` | `/me/password` | 本地会话 + CSRF | 修改自己的密码并使该用户所有本地 session 失效；`old_password/new_password`，管理端同时提交 `new_password_confirm`（也支持 `newpw_confirm`） |
 | `PATCH` | `/remote-users/:provider` | admin 用户/Key | 按 body 中 `subject` 修改远程身份角色/启用状态 |
 | `DELETE` | `/remote-users/:provider` | admin 用户/Key | 按 body 中 `subject` 删除远程身份快照 |
 | `GET` | `/authorization` | admin 用户/Key | 绑定、策略、策略主体、角色与 HTTP 方法目录 |

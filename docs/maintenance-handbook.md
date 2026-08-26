@@ -134,6 +134,18 @@ user:dingtalk:kate
 - viewer 不得看到 Authorization/Casbin 数据；
 - 远程用户不能在本机修改密码。
 
+本地用户在管理端“修改我的密码”时必须输入两次新密码，页面会在提交前检查一致性，密码修改成功后该用户的所有本地 session（包括当前 session）都会失效，必须重新登录。API
+`PUT /_api_/authz/v1/me/password` 也会校验 `newpw_confirm`（或
+`new_password_confirm`）。管理员忘记内置 `admin` 密码时，可执行：
+
+```bash
+docker exec <container_name> admin_password_reset
+```
+
+命令使用容器当前的 `AUTHZ_ADMIN_PASSWORD` 环境变量生成与应用一致的密码摘要，清除 admin
+本地会话并 reload OpenResty 使 worker 缓存立即失效。它不会读取宿主机 `.env`；修改 `.env`
+后必须先 recreate 容器。命令不接受密码参数，也不会在输出中显示密码。
+
 所有用户只有启用和未启用两种认证状态。后续登录记录不得重新启用已被本机管理员禁用的身份。
 管理员删除远程快照时，同时删除其会话和直接策略；下次远程认证会以新身份快照重新创建并默认启用。
 

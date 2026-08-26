@@ -87,6 +87,16 @@ docker run -d --name gw --network host \
 # 代理本机 3000 端口: http://3000-myhost.example.com:6080/
 ```
 
+如果管理员忘记密码，可在容器内执行以下命令，使用容器当前的
+`AUTHZ_ADMIN_PASSWORD` 环境变量重置内置 `admin` 密码，并自动 reload OpenResty：
+
+```bash
+docker exec <container_name> admin_password_reset
+```
+
+该命令读取的是容器当前环境，不会重新读取宿主机 `.env`。修改 `.env` 后请先用
+`docker compose up -d --force-recreate` 重建容器，再执行重置命令；密码至少需要 6 位。
+
 本项目的 Compose 默认使用 `network_mode: host`，因此本机服务发现和代理目标都直接访问宿主机
 网络命名空间的 `127.0.0.1`。这也是动态端口代理访问宿主机 HTTP 服务的必要配置；不要再为该服务
 添加 `ports` 映射。若改为普通 bridge 网络，容器内的 `127.0.0.1` 只代表网关容器自身，无法访问
@@ -119,7 +129,7 @@ docker run -d --name gw --network host \
 | 变量 | 默认 | 说明 |
 |------|------|------|
 | `AUTHZ_DB_PATH` | `/data/authz/authz.db` | SQLite 路径（用户/会话/策略/绑定） |
-| `AUTHZ_ADMIN_PASSWORD` | `admin123` | 首次 seed 的 admin 密码 |
+| `AUTHZ_ADMIN_PASSWORD` | `admin123` | 首次 seed 的 admin 密码；也作为 `admin_password_reset` 的重置密码 |
 | `AUTHZ_PORT_MIN` / `AUTHZ_PORT_MAX` | `2000` / `20000` | 数字前缀端口范围 |
 | `AUTHZ_HTTP_PORT` / `AUTHZ_HTTPS_PORT` | `6080` / `6443` | 入口端口 |
 | `AUTHZ_DISCOVERY_PORTS` | 空 | Docker Desktop 无法从监听表发现时，追加探测端口，例如 `2077,3080` |

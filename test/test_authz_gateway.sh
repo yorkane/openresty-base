@@ -158,6 +158,11 @@ assert_not_contains "gateway does not derive upstream scheme from listener" "$AU
 NGINX_TEMPLATE=$(cat "$REPO_DIR/conf/nginx.conf.template")
 assert_contains "database cache shared dictionary configured" "$NGINX_TEMPLATE" \
     'lua_shared_dict authz_db_cache 10m;'
+USERS_SOURCE=$(cat "$REPO_DIR/admin/apps/users.html")
+assert_contains "password form asks for confirmation" "$USERS_SOURCE" 'passwordForm.newpw_confirm'
+assert_contains "password form validates confirmation" "$USERS_SOURCE" 'matchingPassword'
+SERVICE_SOURCE=$(cat "$REPO_DIR/lualib/resty/authz/api/service.lua")
+assert_contains "password API validates confirmation" "$SERVICE_SOURCE" '两次输入的新密码不一致'
 
 cat >"$TMP_DIR/nocobase.env" <<EOF
 AUTHZ_HOST_URL=http://admin.test.example:$HTTP_PORT
@@ -483,6 +488,7 @@ REMOTE_COOKIE="$TMP_DIR/remote.cookie"
 REMOTE_DYNAMIC_COOKIE="$TMP_DIR/remote-dynamic.cookie"
 SHADOW_COOKIE="$TMP_DIR/shadow.cookie"
 SHADOW_DYNAMIC_COOKIE="$TMP_DIR/shadow-dynamic.cookie"
+RESET_COOKIE="$TMP_DIR/reset.cookie"
 OAUTH_COOKIE="$TMP_DIR/oauth.cookie"
 NOCO_OAUTH_COOKIE="$TMP_DIR/noco-oauth.cookie"
 NOCO_OAUTH_SECOND_COOKIE="$TMP_DIR/noco-oauth-second.cookie"
@@ -1038,12 +1044,26 @@ login "$ADMIN_HOST" bob bob654321 "$BOB_COOKIE"
 request GET "$ADMIN_HOST" /_api_/authz/v1/session "$BOB_COOKIE"
 assert_eq "non-admin can read own session profile" "$STATUS" "200"
 assert_json "non-admin own identity" '.data.identity' "user:local:bob"
+BOB_CSRF=$(jq -er '.data.csrf' "$TMP_DIR/body")
+login "$DYNAMIC_HOST" bob bob654321 "$DYNAMIC_COOKIE"
+request PUT "$ADMIN_HOST" /_api_/authz/v1/me/password "$BOB_COOKIE" "$BOB_CSRF" \
+    '{"oldpw":"bob654321","newpw":"changed123","newpw_confirm":"different123"}'
+assert_eq "mismatched password confirmation rejected" "$STATUS" "422"
+assert_json "password mismatch error" '.error.message' "两次输入的新密码不一致"
+request PUT "$ADMIN_HOST" /_api_/authz/v1/me/password "$BOB_COOKIE" "$BOB_CSRF" \
+    '{"oldpw":"bob654321","newpw":"changed123","newpw_confirm":"changed123"}'
+assert_eq "password change succeeds with matching confirmation" "$STATUS" "200"
+request GET "$ADMIN_HOST" /_api_/authz/v1/session "$BOB_COOKIE"
+assert_eq "password change invalidates current session" "$STATUS" "401"
+request GET "$DYNAMIC_HOST" /_api_/authz/v1/session "$DYNAMIC_COOKIE"
+assert_eq "password change invalidates other sessions" "$STATUS" "401"
+login "$ADMIN_HOST" bob changed123 "$BOB_COOKIE"
 request GET "$ADMIN_HOST" /_api_/authz/v1/users "$BOB_COOKIE"
 assert_eq "non-admin users API denied" "$STATUS" "403"
 request GET "$ADMIN_HOST" /_api_/authz/v1/authorization "$BOB_COOKIE"
 assert_eq "non-admin authorization API denied" "$STATUS" "403"
 
-login "$DYNAMIC_HOST" bob bob654321 "$DYNAMIC_COOKIE"
+login "$DYNAMIC_HOST" bob changed123 "$DYNAMIC_COOKIE"
 request GET "$DYNAMIC_HOST" / "$DYNAMIC_COOKIE"
 assert_eq "default deny for ordinary user" "$STATUS" "403"
 
@@ -1288,7 +1308,7 @@ assert_json "local simulation removes standard Forwarded" '.forwarded == null | 
 
 request PATCH "$ADMIN_HOST" "/_api_/authz/v1/applications/$APP_ID" "$ADMIN_COOKIE" "$CSRF" '{"upstream_host":"","forwarded_host":"","forwarded_proto":"","forwarded_port":0,"origin_mode":"auto","custom_origin":"","simulate_local":false,"local_ip":"127.0.0.1"}'
 assert_eq "restore default proxy behavior" "$STATUS" "200"
-login fixed.test.example bob bob654321 "$APP_COOKIE"
+login fixed.test.example bob changed123 "$APP_COOKIE"
 request GET fixed.test.example / "$APP_COOKIE"
 assert_eq "fixed application proxy" "$STATUS" "200"
 
@@ -1367,7 +1387,7 @@ request PATCH "$ADMIN_HOST" "/_api_/authz/v1/users/$BOB_ID" "$ADMIN_COOKIE" "$CS
 assert_eq "disable user" "$STATUS" "200"
 request GET "$ADMIN_HOST" /_api_/authz/v1/session "$BOB_COOKIE"
 assert_eq "disabled user session revoked" "$STATUS" "401"
-login "$ADMIN_HOST" bob bob654321 "$BOB_COOKIE" local false
+login "$ADMIN_HOST" bob changed123 "$BOB_COOKIE" local false
 request GET "$ADMIN_HOST" /_api_/authz/v1/session "$BOB_COOKIE"
 assert_eq "disabled local user cannot sign in again" "$STATUS" "401"
 
@@ -1391,6 +1411,16 @@ assert_contains "logout clears host-only cookie" "$LOGOUT_COOKIES" "authz_sessio
 assert_contains "logout clears deeper legacy domain cookie" "$LOGOUT_COOKIES" "; Domain=.admin.test.example"
 request GET "$ADMIN_HOST" /_api_/authz/v1/session "$ADMIN_COOKIE"
 assert_eq "logged-out session rejected" "$STATUS" "401"
+
+RESET_OUTPUT=$(docker exec "$CONTAINER_NAME" env AUTHZ_ADMIN_PASSWORD=reset123 admin_password_reset)
+assert_contains "admin password reset command runs" "$RESET_OUTPUT" "admin password reset from AUTHZ_ADMIN_PASSWORD"
+sleep 1
+login "$ADMIN_HOST" admin reset123 "$RESET_COOKIE"
+request GET "$ADMIN_HOST" /_api_/authz/v1/session "$RESET_COOKIE"
+assert_eq "reset admin password is immediately usable" "$STATUS" "200"
+docker exec "$CONTAINER_NAME" env AUTHZ_ADMIN_PASSWORD=admin123 admin_password_reset >/dev/null
+sleep 1
+login "$ADMIN_HOST" admin admin123 "$ADMIN_COOKIE"
 
 STATUS=$(curl -skS --max-time 5 --resolve "$ADMIN_HOST:$HTTPS_PORT:127.0.0.1" \
     -D "$TMP_DIR/secure-headers" -o /dev/null -w '%{http_code}' \

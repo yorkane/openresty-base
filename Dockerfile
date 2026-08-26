@@ -403,6 +403,10 @@ COPY --from=lua-resty-http-source /out/ /usr/local/openresty/lualib/resty/
 # 整体复制到 site/lualib，和开发时只读挂载目录保持完全一致；同时不遮蔽
 # OpenResty 自带的 /usr/local/openresty/lualib 模块。
 COPY lualib/ /usr/local/openresty/site/lualib/
+# Container maintenance command for recovering the built-in admin account.
+COPY scripts/admin_password_reset.lua /usr/local/openresty/admin_password_reset.lua
+COPY scripts/admin_password_reset /usr/local/bin/admin_password_reset
+RUN chmod +x /usr/local/bin/admin_password_reset
 # 静态 SSI 管理界面
 COPY admin/ /usr/local/openresty/nginx/html/admin/
 
