@@ -160,4 +160,22 @@ function _M.normalize_origin(value, allow_empty)
     return authority and scheme:lower() .. "://" .. authority or nil
 end
 
+function _M.normalize_upstream_path(value)
+    local path = trim(value)
+    if path == "" then return "" end
+    if #path > 512 or path:sub(1, 1) ~= "/" or path:find("[%?#%c]") or
+        path:find("//", 1, true) or path:find("/../", 1, true) or path:sub(-3) == "/.." then
+        return nil
+    end
+    return path
+end
+
+function _M.authority_host(value)
+    local authority = _M.normalize_authority(value, false)
+    if not authority then return nil end
+    local bracket_ip = authority:match("^%[([^%]]+)%]")
+    if bracket_ip then return bracket_ip end
+    return authority:match("^([^:]+)")
+end
+
 return _M

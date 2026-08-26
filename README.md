@@ -15,8 +15,8 @@
 
 | 入口 | 上游 | 说明 |
 |------|------|------|
-| `6080` (http) | `http://<target_ip>:<port>` | 代理本机或其他 IP 的 HTTP 服务 |
-| `6443` (https) | `http://<target_ip>:<port>` | 网关终止 TLS，再代理 HTTP 上游 |
+| `6080` (http) | `http(s)://<target_ip>:<port>` | 代理本机或其他 IP 的 HTTP/HTTPS 服务 |
+| `6443` (https) | `http(s)://<target_ip>:<port>` | 网关终止客户端 TLS，再按绑定配置代理 HTTP/HTTPS 上游 |
 
 ### 域名 → 端口解析规则
 
@@ -33,12 +33,12 @@
 管理端的“新增域名绑定”支持以下配置：
 
 - 只填写最后一级域名前缀，例如 `name1`；当前实例为 `m.ws.example.com` 时保存为 `name1-m.ws.example.com`；
-- 目标 IP 默认 `127.0.0.1`，也可填写其他机器的 IPv4 或 IPv6 地址，所有上游统一使用 HTTP；
+- 目标 IP 默认 `127.0.0.1`，也可填写其他机器的 IPv4 或 IPv6 地址；上游协议可选择 HTTP 或 HTTPS，HTTPS 可选择是否忽略 SSL 证书校验；
 - 不同前缀可以绑定同一个端口，最终域名必须唯一，重复提交返回 `409`；
 - 可填写 `menu-name` 覆盖左侧菜单名称；配置绑定后，该端口不再依赖主动探测的菜单名称；
 - 域名绑定的 `note` 会在左侧菜单名称下方显示；鼠标悬浮菜单时显示该菜单实际打开的完整域名地址，自动探测的 `local:<port>` 也显示生成后的地址；普通点击在右侧 iframe 打开，Ctrl/Command + 点击在新窗口打开菜单地址；
 - WebSocket 默认对所有已解析目标开启；`bindings.websocket` 字段保留用于兼容历史数据，不再作为升级请求的阻断开关。
-- “高级代理配置”可覆盖上游 `Host`、`X-Forwarded-Host`、`X-Forwarded-Proto`、`X-Forwarded-Port`，并选择保持、重写、移除或自定义 `Origin`；留空时继续使用外部访问域名。
+- “高级代理配置”可选择上游协议、SSL 校验和上游路径改写，并覆盖上游 `Host`、`X-Forwarded-Host`、`X-Forwarded-Proto`、`X-Forwarded-Port`，以及保持、重写、移除或自定义 `Origin`；改写路径留空时保持原路径，填写后请求统一转发到该路径。
 - “模拟本机访问”默认把 `Host`/`Origin` 改为目标 HTTP 地址，并将 `X-Real-IP`、`X-Forwarded-For` 设置为 `127.0.0.1`；也可填写网关的局域网 IP。该选项只模拟 HTTP 请求头，不能改变真实 TCP 来源地址。
 
 ### 管理界面
@@ -108,7 +108,7 @@ docker exec <container_name> admin_password_reset
 - 只修改模板时也可执行 `docker restart openresty-gateway`；只执行 `docker restart` 不会更新容器创建时的环境变量。Darwin Apple Silicon 本地构建自动使用 `linux/arm64`。
 - 只有修改 Dockerfile、`docker-entrypoint.sh`、镜像依赖或原生模块时才使用 `bash scripts/restart_gateway.sh --build`。
 - 修改已挂载的 `admin/` 或 `lualib/` 通常无需重建镜像，但应执行 `openresty -t`；修改挂载、网络或环境变量必须重建容器。
-- `6443` 是网关的 HTTPS 入口，TLS 在网关终止，本机应用通常仍使用 HTTP 上游；不要为该路径配置 `proxy_ssl_*`。
+- `6443` 是网关的 HTTPS 入口，TLS 在网关终止；上游协议由域名绑定单独选择，HTTPS 上游可按需关闭证书校验。
 - 网关向上游保留外部 `Host`；带严格 Host/Origin 校验的应用还需把绑定域名加入自身可信列表，例如 pi-web 设置 `PI_WEB_ALLOWED_HOSTS=pi-m.ws.example.com`。
 - 若上游只接受内部 Host 或本地来源，可在该绑定的“高级代理配置”中精确覆盖相关头，或启用“模拟本机访问”；不要为解决单个应用兼容问题修改全局代理默认值。
 - 测试本机 code-server 时先运行 `curl -i http://127.0.0.1:2077/`，返回 `200` 才说明后端 HTTP 正常；直接访问本机 `https://127.0.0.1:2077/` 失败是正常的协议不匹配。

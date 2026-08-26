@@ -1,6 +1,6 @@
 # Authz Gateway 核心 API（Agent 使用手册）
 
-本文档描述稳定的 Authz Gateway v1 控制面 API，以及应用使用 API Key 请求受保护本机 HTTP 服务的方式。
+本文档描述稳定的 Authz Gateway v1 控制面 API，以及应用使用 API Key 请求受保护的 HTTP/HTTPS 服务的方式。
 API 根路径固定为 `/_api_/authz/v1`。
 
 ## 1. 通用协议
@@ -148,8 +148,8 @@ curl -sS -X POST "${GATEWAY}/_api_/authz/v1/applications" \
 | 字段 | 必填 | 说明 |
 |---|---:|---|
 | `domain` | 是 | 推荐只填最后一级前缀，例如 `code`；也接受完整域名 |
-| `target_ip` | 否 | HTTP 上游的 IPv4 或 IPv6 地址，默认 `127.0.0.1`；不接受 URL、协议或主机名 |
-| `port` | 是 | 上游 HTTP 端口，必须位于配置的允许范围 |
+| `target_ip` | 否 | 上游服务的 IPv4 或 IPv6 地址，默认 `127.0.0.1`；不接受 URL、协议或主机名 |
+| `port` | 是 | 上游服务端口，必须位于配置的允许范围 |
 | `menu_name` | 否 | 左侧菜单显示名称，最多 128 字符 |
 | `note` | 否 | 备注，最多 256 字符 |
 | `enabled` | 否 | 默认 `true` |
@@ -162,6 +162,9 @@ curl -sS -X POST "${GATEWAY}/_api_/authz/v1/applications" \
 | `custom_origin` | 否 | `origin_mode=custom` 时必填，只接受无 path/query 的 `http(s)://authority` |
 | `simulate_local` | 否 | 默认 `false`；启用本机 HTTP 请求头模拟 |
 | `local_ip` | 否 | 模拟来源 IP，默认 `127.0.0.1`，也可使用网关局域网 IPv4/IPv6 |
+| `upstream_scheme` | 否 | 上游协议，`http`（默认）或 `https` |
+| `upstream_ssl_verify` | 否 | HTTPS 上游是否校验证书，默认 `true`；设为 `false` 忽略证书校验，仅建议用于受控内网或自签名证书 |
+| `upstream_path` | 否 | 上游路径改写，默认空值表示保留请求路径；例如 `/v1/index.html` 会把任意请求转发到 `/v1/index.html`，查询参数原样保留；不接受 query、fragment、连续斜杠或 `..` |
 
 前缀会按当前实例域名生成完整入口。例如实例基域名为 `m.ws.example.com`，`domain: "code"` 保存为
 `code-m.ws.example.com`。域名必须唯一，重复返回 `409`。
@@ -170,11 +173,14 @@ curl -sS -X POST "${GATEWAY}/_api_/authz/v1/applications" \
 
 仅 `admin` 角色。可修改创建接口中的全部字段。
 
-显式绑定始终代理到 `http://<target_ip>:<port>`。数字前缀免配置入口仍固定使用
-`http://127.0.0.1:<port>`；主动发现也只扫描本机 `127.0.0.1`。
+显式绑定按 `upstream_scheme` 代理到 `http(s)://<target_ip>:<port>`；HTTPS 上游默认校验证书，只有绑定显式设置
+`upstream_ssl_verify=false` 时才进入忽略校验的内部代理路径。数字前缀免配置入口仍固定使用
+`http://127.0.0.1:<port>`；主动发现也只扫描本机 `127.0.0.1`。客户端访问网关的 HTTP/HTTPS 协议与上游绑定协议相互独立。
 
 `target_ip` 不改变现有 Casbin 对象格式，授权仍按 `/<port><path>` 判断；不同 IP 上相同端口的绑定共享同一端口策略。
 `admin`/`api` Key 能创建指向内网地址的绑定，应只发放给允许访问目标网络的可信应用。
+
+上游路径改写只改变发往上游的 URI，不改变 Casbin 授权对象；权限仍按客户端请求的原始路径检查。改写路径为空时保留原路径；填写后使用固定目标路径，查询参数仍原样保留。
 
 代理头字段拒绝 CR/LF、URL path 和非法 authority，避免 Header 注入。`simulate_local` 会把默认 Host/Origin
 指向 `http://<target_ip>:<port>`，把 `X-Real-IP` 与 `X-Forwarded-For` 改为 `local_ip`，并移除客户端

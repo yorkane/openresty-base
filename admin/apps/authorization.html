@@ -79,6 +79,9 @@
 
               <q-expansion-item v-model="bindingAdvancedOpen" dense dense-toggle switch-toggle-side icon="mdi-tune-variant" :label="t.advancedProxy" :caption="t.advancedProxyHint" class="proxy-expansion">
                 <div class="proxy-grid">
+                  <q-select v-model="bindingForm.upstream_scheme" dark dense outlined emit-value map-options :options="upstreamSchemeOptions" :label="t.upstreamScheme"></q-select>
+                  <div class="proxy-toggle-field"><q-toggle v-model="bindingForm.upstream_ssl_verify" dense color="teal-4" :disable="bindingForm.upstream_scheme !== 'https'" :label="t.sslVerify"></q-toggle><div class="simulate-copy">{{ t.sslVerifyHint }}</div></div>
+                  <q-input v-model.trim="bindingForm.upstream_path" dark dense outlined hide-bottom-space :label="t.upstreamPath" :placeholder="t.upstreamPathPlaceholder" :hint="t.upstreamPathHint" class="binding-grid-full"></q-input>
                   <q-input v-model.trim="bindingForm.upstream_host" dark dense outlined hide-bottom-space :label="t.upstreamHost" :placeholder="t.upstreamHostPlaceholder" :hint="t.upstreamHostHint"></q-input>
                   <q-input v-model.trim="bindingForm.forwarded_host" dark dense outlined hide-bottom-space :label="t.forwardedHost" :placeholder="t.forwardedHostPlaceholder" :hint="t.forwardedHostHint"></q-input>
                   <q-select v-model="bindingForm.forwarded_proto" dark dense outlined emit-value map-options :options="forwardedProtoOptions" :label="t.forwardedProto"></q-select>
@@ -157,7 +160,7 @@
         const policyEditingId = ref(null)
         const portMin = ref(2000)
         const portMax = ref(20000)
-        const bindingDefaults = () => ({ domain: '', target_ip: '127.0.0.1', port: 3000, menu_name: '', note: '', enabled: true, upstream_host: '', forwarded_host: '', forwarded_proto: '', forwarded_port: '', origin_mode: 'auto', custom_origin: '', simulate_local: false, local_ip: '127.0.0.1' })
+        const bindingDefaults = () => ({ domain: '', target_ip: '127.0.0.1', port: 3000, menu_name: '', note: '', enabled: true, upstream_scheme: 'http', upstream_ssl_verify: true, upstream_path: '', upstream_host: '', forwarded_host: '', forwarded_proto: '', forwarded_port: '', origin_mode: 'auto', custom_origin: '', simulate_local: false, local_ip: '127.0.0.1' })
         const bindingForm = reactive(bindingDefaults())
         const policyForm = reactive({ ptype: 'p', v0: 'role:user', objectTarget: 'global', objectPath: '/*', v2: ['*'], eft: 'allow' })
       const policyUserOptions = computed(() => policyUsers.value.map(user => ({
@@ -215,6 +218,10 @@
         { label: t.value.originRemove, value: 'remove' },
         { label: t.value.originCustom, value: 'custom' }
       ])
+      const upstreamSchemeOptions = computed(() => [
+        { label: 'HTTP', value: 'http' },
+        { label: 'HTTPS', value: 'https' }
+      ])
 
       function actionList (value) {
         return String(value || '-').split(',').filter(Boolean)
@@ -226,7 +233,7 @@
       }
 
       function hasCustomProxy (binding) {
-        return Boolean(binding.upstream_host || binding.forwarded_host || binding.forwarded_proto || Number(binding.forwarded_port) || (binding.origin_mode && binding.origin_mode !== 'auto') || binding.custom_origin)
+        return Boolean(binding.upstream_scheme === 'https' || Number(binding.upstream_ssl_verify) === 0 || binding.upstream_path || binding.upstream_host || binding.forwarded_host || binding.forwarded_proto || Number(binding.forwarded_port) || (binding.origin_mode && binding.origin_mode !== 'auto') || binding.custom_origin)
       }
 
       function proxySummary (binding) {
@@ -236,7 +243,13 @@
 
       function proxyDetails (binding) {
         const automatic = t.value.autoValue
+        const ssl = binding.upstream_scheme === 'https'
+          ? (Number(binding.upstream_ssl_verify) === 0 ? t.value.sslIgnored : t.value.sslVerified)
+          : t.value.notApplicable
         return [
+          `${t.value.upstreamScheme}: ${(binding.upstream_scheme || 'http').toUpperCase()}`,
+          `${t.value.sslVerification}: ${ssl}`,
+          `${t.value.upstreamPath}: ${binding.upstream_path || automatic}`,
           `Host: ${binding.upstream_host || automatic}`,
           `X-Forwarded-Host: ${binding.forwarded_host || automatic}`,
           `X-Forwarded-Proto / Port: ${binding.forwarded_proto || automatic} / ${Number(binding.forwarded_port) || automatic}`,
@@ -357,7 +370,7 @@
 
         function openEditBinding (binding) {
           bindingEditingId.value = binding.id
-          Object.assign(bindingForm, bindingDefaults(), { domain: binding.domain, target_ip: binding.target_ip || '127.0.0.1', port: binding.port, menu_name: binding.menu_name || '', note: binding.note || '', enabled: binding.enabled === 1, upstream_host: binding.upstream_host || '', forwarded_host: binding.forwarded_host || '', forwarded_proto: binding.forwarded_proto || '', forwarded_port: Number(binding.forwarded_port) || '', origin_mode: binding.origin_mode || 'auto', custom_origin: binding.custom_origin || '', simulate_local: binding.simulate_local === 1, local_ip: binding.local_ip || '127.0.0.1' })
+          Object.assign(bindingForm, bindingDefaults(), { domain: binding.domain, target_ip: binding.target_ip || '127.0.0.1', port: binding.port, menu_name: binding.menu_name || '', note: binding.note || '', enabled: binding.enabled === 1, upstream_scheme: binding.upstream_scheme || 'http', upstream_ssl_verify: binding.upstream_ssl_verify !== 0, upstream_path: binding.upstream_path || '', upstream_host: binding.upstream_host || '', forwarded_host: binding.forwarded_host || '', forwarded_proto: binding.forwarded_proto || '', forwarded_port: Number(binding.forwarded_port) || '', origin_mode: binding.origin_mode || 'auto', custom_origin: binding.custom_origin || '', simulate_local: binding.simulate_local === 1, local_ip: binding.local_ip || '127.0.0.1' })
           bindingAdvancedOpen.value = binding.simulate_local === 1 || hasCustomProxy(binding)
           bindingOpen.value = true
         }
@@ -448,7 +461,7 @@
 
       onBeforeUnmount(() => unsubscribeLocale?.())
     
-      return { actionList, allowCount, bindingAdvancedOpen, bindingColumns, bindingEditingId, bindingForm, bindingOpen, bindings, denyCount, error, forwardedProtoOptions, hasCustomProxy, httpActions, isAdmin, load, loading, openCreateBinding, openEditBinding, openEditPolicy, openPolicyDialog, originModeOptions, policies, policyBindings, policyColumns, policyEditingId, policyFilter, policyForm, policyObjectIcon, policyObjectOptions, policyObjectPathRule, policyObjectTargetRule, policyObjectTitle, policyObjectValue, policyOpen, policyPrimaryBinding, policyRoleOptions, policySubjectOptions, policyUserOptions, portMax, portMin, proxyDetails, proxySummary, removeBinding, removePolicy, required, resetPolicyFields, saveBindingForm, savePolicyForm, saving, selectedPolicyObject, setPolicyMethods, sourceLabel, t, toggleBinding }
+      return { actionList, allowCount, bindingAdvancedOpen, bindingColumns, bindingEditingId, bindingForm, bindingOpen, bindings, denyCount, error, forwardedProtoOptions, hasCustomProxy, httpActions, isAdmin, load, loading, openCreateBinding, openEditBinding, openEditPolicy, openPolicyDialog, originModeOptions, policies, policyBindings, policyColumns, policyEditingId, policyFilter, policyForm, policyObjectIcon, policyObjectOptions, policyObjectPathRule, policyObjectTargetRule, policyObjectTitle, policyObjectValue, policyOpen, policyPrimaryBinding, policyRoleOptions, policySubjectOptions, policyUserOptions, portMax, portMin, proxyDetails, proxySummary, removeBinding, removePolicy, required, resetPolicyFields, saveBindingForm, savePolicyForm, saving, selectedPolicyObject, setPolicyMethods, sourceLabel, t, toggleBinding, upstreamSchemeOptions }
       }
     })
     

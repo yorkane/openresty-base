@@ -10,6 +10,7 @@ MOCK_PID=""
 REMOTE_PID=""
 NOCO_PID=""
 WS_PID=""
+TLS_PID=""
 
 free_port() {
     python3 - <<'PY'
@@ -26,6 +27,7 @@ HTTPS_PORT=$(free_port)
 UPSTREAM_PORT=$(free_port)
 NOCO_PORT=$(free_port)
 WS_PORT=$(free_port)
+TLS_PORT=$(free_port)
 REMOTE_PORT=$(free_port)
 REMOTE_IP=$(python3 - <<'PY'
 import socket
@@ -48,6 +50,7 @@ cleanup() {
     if [[ -n "$REMOTE_PID" ]]; then kill "$REMOTE_PID" >/dev/null 2>&1 || true; fi
     if [[ -n "$NOCO_PID" ]]; then kill "$NOCO_PID" >/dev/null 2>&1 || true; fi
     if [[ -n "$WS_PID" ]]; then kill "$WS_PID" >/dev/null 2>&1 || true; fi
+    if [[ -n "$TLS_PID" ]]; then kill "$TLS_PID" >/dev/null 2>&1 || true; fi
     rm -rf "$TMP_DIR" || true
 }
 trap cleanup EXIT
@@ -89,6 +92,11 @@ assert_json() {
     assert_eq "$name" "$actual" "$expected"
 }
 
+TLS_CERT="$TMP_DIR/mock-upstream-cert.pem"
+TLS_KEY="$TMP_DIR/mock-upstream-key.pem"
+openssl req -x509 -newkey rsa:2048 -nodes -keyout "$TLS_KEY" -out "$TLS_CERT" \
+    -days 1 -subj '/CN=127.0.0.1' >/dev/null 2>&1 || fail "unable to create TLS mock certificate"
+
 python3 "$REPO_DIR/test/mock_http.py" "$UPSTREAM_PORT" >"$TMP_DIR/mock.log" 2>&1 &
 MOCK_PID=$!
 python3 "$REPO_DIR/test/mock_http.py" "$REMOTE_PORT" 0.0.0.0 hello-from-remote-ip >"$TMP_DIR/remote.log" 2>&1 &
@@ -98,6 +106,14 @@ python3 "$REPO_DIR/test/mock_nocobase.py" "$NOCO_PORT" \
 NOCO_PID=$!
 python3 "$REPO_DIR/test/mock_websocket.py" "$WS_PORT" >"$TMP_DIR/websocket.log" 2>&1 &
 WS_PID=$!
+python3 "$REPO_DIR/test/mock_https.py" "$TLS_PORT" "$TLS_CERT" "$TLS_KEY" >"$TMP_DIR/https-mock.log" 2>&1 &
+TLS_PID=$!
+for _ in $(seq 1 30); do
+    curl -kfsS --max-time 1 "https://127.0.0.1:$TLS_PORT/" >/dev/null 2>&1 && break
+    sleep 0.1
+done
+curl -kfsS --max-time 2 "https://127.0.0.1:$TLS_PORT/" >/dev/null \
+    || fail "mock HTTPS upstream did not start"
 for _ in $(seq 1 30); do
     curl -fsS --max-time 1 "http://127.0.0.1:$UPSTREAM_PORT/" >/dev/null 2>&1 && break
     sleep 0.1
@@ -151,10 +167,20 @@ assert_contains "WebSocket idle timeout extended" "$SERVER_TEMPLATE" 'proxy_read
 assert_contains "API key is stripped before proxying" "$SERVER_TEMPLATE" \
     'proxy_set_header X-Authz-Key       "";'
 AUTHZ_INIT_SOURCE=$(cat "$REPO_DIR/lualib/resty/authz/init.lua")
-assert_contains "gateway always uses HTTP upstream" "$AUTHZ_INIT_SOURCE" \
-    'ngx.var.authz_target = "http://" .. target.url_host(target_ip) .. ":" .. port'
+assert_contains "gateway chooses configured upstream scheme" "$AUTHZ_INIT_SOURCE" \
+    'local scheme = binding and binding.upstream_scheme or "http"'
 assert_not_contains "gateway does not derive upstream scheme from listener" "$AUTHZ_INIT_SOURCE" \
     'ngx.var.scheme .. "://"'
+assert_contains "gateway supports upstream SSL verification" "$SERVER_TEMPLATE" \
+    'proxy_ssl_verify on;'
+assert_contains "gateway has private insecure HTTPS proxy location" "$SERVER_TEMPLATE" \
+    'location @authz_proxy_insecure {'
+assert_contains "gateway configures upstream SNI" "$SERVER_TEMPLATE" \
+    'proxy_ssl_name $authz_upstream_ssl_name;'
+assert_contains "gateway configures upstream CA bundle" "$SERVER_TEMPLATE" \
+    'proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;'
+assert_contains "gateway preserves query when rewriting upstream path" "$AUTHZ_INIT_SOURCE" \
+    'local query = ngx.var.args'
 NGINX_TEMPLATE=$(cat "$REPO_DIR/conf/nginx.conf.template")
 assert_contains "database cache shared dictionary configured" "$NGINX_TEMPLATE" \
     'lua_shared_dict authz_db_cache 10m;'
@@ -389,11 +415,13 @@ import sys
 connection = sqlite3.connect(sys.argv[1])
 columns = {row[1] for row in connection.execute("PRAGMA table_info(bindings)")}
 expected = {"target_ip", "upstream_host", "forwarded_host", "forwarded_proto",
-            "forwarded_port", "origin_mode", "custom_origin", "simulate_local", "local_ip"}
+            "forwarded_port", "origin_mode", "custom_origin", "simulate_local", "local_ip",
+            "upstream_scheme", "upstream_ssl_verify", "upstream_path"}
 row = connection.execute("""SELECT target_ip, upstream_host, forwarded_host, forwarded_proto,
-    forwarded_port, origin_mode, custom_origin, simulate_local, local_ip
+    forwarded_port, origin_mode, custom_origin, simulate_local, local_ip,
+    upstream_scheme, upstream_ssl_verify, upstream_path
     FROM bindings WHERE domain = 'legacy.test.example'""").fetchone()
-defaults = ("127.0.0.1", "", "", "", 0, "auto", "", 0, "127.0.0.1")
+defaults = ("127.0.0.1", "", "", "", 0, "auto", "", 0, "127.0.0.1", "http", 1, "")
 print("yes" if expected.issubset(columns) and row == defaults else "no")
 connection.close()
 PY
@@ -636,6 +664,9 @@ assert_contains "binding form exposes upstream Host" "$BODY" 'bindingForm.upstre
 assert_contains "binding form exposes forwarded Host" "$BODY" 'bindingForm.forwarded_host'
 assert_contains "binding form exposes Origin policy" "$BODY" 'bindingForm.origin_mode'
 assert_contains "binding form supports local request simulation" "$BODY" 'bindingForm.simulate_local'
+assert_contains "binding form exposes upstream scheme" "$BODY" 'bindingForm.upstream_scheme'
+assert_contains "binding form exposes upstream SSL verification" "$BODY" 'bindingForm.upstream_ssl_verify'
+assert_contains "binding form exposes upstream path rewrite" "$BODY" 'bindingForm.upstream_path'
 assert_contains "binding form keeps proxy settings compact" "$BODY" 'q-expansion-item v-model="bindingAdvancedOpen"'
 request GET "$ADMIN_HOST" /_api_/authz/v1/session "$ADMIN_COOKIE"
 assert_eq "session API" "$STATUS" "200"
@@ -1223,6 +1254,9 @@ assert_json "binding defaults to the local target IP" '.data.bindings[] | select
 assert_json "binding defaults to request Host forwarding" '.data.bindings[] | select(.domain == "fixed.test.example") | .upstream_host' ""
 assert_json "binding defaults to automatic Origin handling" '.data.bindings[] | select(.domain == "fixed.test.example") | .origin_mode' "auto"
 assert_json "binding defaults to normal client identity" '.data.bindings[] | select(.domain == "fixed.test.example") | .simulate_local | tostring' "0"
+assert_json "binding defaults to HTTP upstream" '.data.bindings[] | select(.domain == "fixed.test.example") | .upstream_scheme' "http"
+assert_json "binding defaults to SSL verification" '.data.bindings[] | select(.domain == "fixed.test.example") | .upstream_ssl_verify | tostring' "1"
+assert_json "binding defaults to original upstream path" '.data.bindings[] | select(.domain == "fixed.test.example") | .upstream_path' ""
 assert_json "existing port policy is associated with its binding" ".data.policies[] | select(.v0 == \"role:user\" and .v1 == \"$POLICY_OBJECT\") | .object_kind" "binding"
 assert_json "associated policy exposes the binding domain" ".data.policies[] | select(.v0 == \"role:user\" and .v1 == \"$POLICY_OBJECT\") | .binding_matches[0].domain" "fixed.test.example"
 assert_json "associated policy exposes the binding target" ".data.policies[] | select(.v0 == \"role:user\" and .v1 == \"$POLICY_OBJECT\") | .binding_matches[0].target_ip" "127.0.0.1"
@@ -1271,7 +1305,13 @@ assert_eq "restore edited binding" "$STATUS" "200"
 request GET "$ADMIN_HOST" /_api_/authz/v1/authorization "$ADMIN_COOKIE"
 APP_ID=$(jq -er '.data.bindings[] | select(.domain == "fixed.test.example") | .id' "$TMP_DIR/body")
 
-request PATCH "$ADMIN_HOST" "/_api_/authz/v1/applications/$APP_ID" "$ADMIN_COOKIE" "$CSRF" '{"upstream_host":null,"forwarded_host":null,"forwarded_proto":null,"forwarded_port":null,"origin_mode":null,"custom_origin":null,"simulate_local":null,"local_ip":null}'
+request PATCH "$ADMIN_HOST" "/_api_/authz/v1/applications/$APP_ID" "$ADMIN_COOKIE" "$CSRF" '{"upstream_path":"/backend"}'
+assert_eq "save upstream path rewrite" "$STATUS" "200"
+request GET fixed.test.example '/path-probe?check=1' "$ADMIN_COOKIE"
+assert_eq "upstream path rewrite reaches service" "$STATUS" "200"
+assert_eq "upstream path rewrite replaces path and keeps query" "$BODY" "/backend?check=1"
+
+request PATCH "$ADMIN_HOST" "/_api_/authz/v1/applications/$APP_ID" "$ADMIN_COOKIE" "$CSRF" '{"upstream_host":null,"forwarded_host":null,"forwarded_proto":null,"forwarded_port":null,"origin_mode":null,"custom_origin":null,"simulate_local":null,"local_ip":null,"upstream_path":null}'
 assert_eq "binding accepts null as an automatic proxy value" "$STATUS" "200"
 request PATCH "$ADMIN_HOST" "/_api_/authz/v1/applications/$APP_ID" "$ADMIN_COOKIE" "$CSRF" '{"upstream_host":"http://bad.example"}'
 assert_eq "binding rejects URL syntax in upstream Host" "$STATUS" "422"
@@ -1279,6 +1319,10 @@ request PATCH "$ADMIN_HOST" "/_api_/authz/v1/applications/$APP_ID" "$ADMIN_COOKI
 assert_eq "binding rejects header injection in upstream Host" "$STATUS" "422"
 request PATCH "$ADMIN_HOST" "/_api_/authz/v1/applications/$APP_ID" "$ADMIN_COOKIE" "$CSRF" '{"forwarded_proto":"ftp"}'
 assert_eq "binding rejects unsupported forwarded protocol" "$STATUS" "422"
+request PATCH "$ADMIN_HOST" "/_api_/authz/v1/applications/$APP_ID" "$ADMIN_COOKIE" "$CSRF" '{"upstream_scheme":"ftp"}'
+assert_eq "binding rejects unsupported upstream scheme" "$STATUS" "422"
+request PATCH "$ADMIN_HOST" "/_api_/authz/v1/applications/$APP_ID" "$ADMIN_COOKIE" "$CSRF" '{"upstream_path":"https://backend.example"}'
+assert_eq "binding rejects URL as upstream path rewrite" "$STATUS" "422"
 request PATCH "$ADMIN_HOST" "/_api_/authz/v1/applications/$APP_ID" "$ADMIN_COOKIE" "$CSRF" '{"forwarded_port":70000}'
 assert_eq "binding rejects invalid forwarded port" "$STATUS" "422"
 request PATCH "$ADMIN_HOST" "/_api_/authz/v1/applications/$APP_ID" "$ADMIN_COOKIE" "$CSRF" '{"origin_mode":"custom","custom_origin":""}'
@@ -1288,7 +1332,7 @@ assert_eq "binding rejects Origin paths" "$STATUS" "422"
 request PATCH "$ADMIN_HOST" "/_api_/authz/v1/applications/$APP_ID" "$ADMIN_COOKIE" "$CSRF" '{"simulate_local":true,"local_ip":"local-machine"}'
 assert_eq "local simulation rejects invalid source IP" "$STATUS" "422"
 
-request PATCH "$ADMIN_HOST" "/_api_/authz/v1/applications/$APP_ID" "$ADMIN_COOKIE" "$CSRF" '{"upstream_host":"app.internal:2078","forwarded_host":"public.example:99","forwarded_proto":"https","forwarded_port":99,"origin_mode":"custom","custom_origin":"https://public.example:99","simulate_local":false}'
+request PATCH "$ADMIN_HOST" "/_api_/authz/v1/applications/$APP_ID" "$ADMIN_COOKIE" "$CSRF" '{"upstream_host":"app.internal:2078","forwarded_host":"public.example:99","forwarded_proto":"https","forwarded_port":99,"origin_mode":"custom","custom_origin":"https://public.example:99","simulate_local":false,"upstream_path":""}'
 assert_eq "save custom proxy headers" "$STATUS" "200"
 request GET fixed.test.example /identity "$ADMIN_COOKIE"
 assert_eq "custom proxy request reaches upstream" "$STATUS" "200"
@@ -1374,6 +1418,23 @@ WS_STATUS=$(curl -skS --max-time 5 --http1.1 --resolve "ws-fixed.test.example:$H
 assert_eq "HTTPS default WebSocket proxy" "$WS_STATUS" "101"
 assert_contains "HTTPS WebSocket upgrade response" \
     "$(cat "$TMP_DIR/https-websocket-headers")" "101 Switching Protocols"
+
+request POST "$ADMIN_HOST" /_api_/authz/v1/applications "$ADMIN_COOKIE" "$CSRF" \
+    "{\"domain\":\"https-fixed.test.example\",\"target_ip\":\"127.0.0.1\",\"port\":$TLS_PORT,\"upstream_scheme\":\"https\",\"upstream_ssl_verify\":false}"
+assert_eq "create HTTPS upstream binding" "$STATUS" "201"
+request GET "$ADMIN_HOST" /_api_/authz/v1/authorization "$ADMIN_COOKIE"
+HTTPS_APP_ID=$(jq -er '.data.bindings[] | select(.domain == "https-fixed.test.example") | .id' "$TMP_DIR/body")
+assert_json "HTTPS binding stores upstream scheme" '.data.bindings[] | select(.domain == "https-fixed.test.example") | .upstream_scheme' "https"
+assert_json "HTTPS binding can ignore SSL verification" '.data.bindings[] | select(.domain == "https-fixed.test.example") | .upstream_ssl_verify | tostring' "0"
+request GET https-fixed.test.example / "$ADMIN_COOKIE"
+assert_eq "HTTPS upstream works with ignored certificate" "$STATUS" "200"
+assert_eq "HTTPS upstream response body" "$BODY" "/"
+request PATCH "$ADMIN_HOST" "/_api_/authz/v1/applications/$HTTPS_APP_ID" "$ADMIN_COOKIE" "$CSRF" '{"upstream_ssl_verify":true}'
+assert_eq "enable HTTPS upstream SSL verification" "$STATUS" "200"
+request GET https-fixed.test.example / "$ADMIN_COOKIE"
+assert_eq "self-signed HTTPS upstream is rejected when verification is enabled" "$STATUS" "502"
+request DELETE "$ADMIN_HOST" "/_api_/authz/v1/applications/$HTTPS_APP_ID" "$ADMIN_COOKIE" "$CSRF"
+assert_eq "delete HTTPS upstream binding" "$STATUS" "200"
 
 request POST "$ADMIN_HOST" /_api_/authz/v1/applications "$ADMIN_COOKIE" "$CSRF" "{\"domain\":\"ws-fixed.test.example\",\"port\":$WS_PORT,\"enabled\":true}"
 assert_eq "duplicate domain binding rejected clearly" "$STATUS" "409"

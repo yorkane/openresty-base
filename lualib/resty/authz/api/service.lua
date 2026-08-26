@@ -25,9 +25,11 @@ for _, method in ipairs(HTTP_METHODS) do HTTP_METHOD_SET[method] = true end
 
 local BINDING_PROXY_FIELDS = {
     "upstream_host", "forwarded_host", "forwarded_proto", "forwarded_port",
-    "origin_mode", "custom_origin", "simulate_local", "local_ip",
+    "origin_mode", "custom_origin", "simulate_local", "local_ip", "upstream_scheme",
+    "upstream_ssl_verify", "upstream_path",
 }
 local FORWARDED_PROTO_SET = { [""] = true, http = true, https = true }
+local UPSTREAM_SCHEME_SET = { http = true, https = true }
 local ORIGIN_MODE_SET = {
     auto = true, preserve = true, rewrite = true, remove = true, custom = true,
 }
@@ -319,7 +321,8 @@ end
 function _M.applications()
     local applications = db.query([[SELECT id, domain, target_ip, port, note, menu_name, websocket,
         upstream_host, forwarded_host, forwarded_proto, forwarded_port, origin_mode,
-        custom_origin, simulate_local, local_ip
+        custom_origin, simulate_local, local_ip, upstream_scheme, upstream_ssl_verify,
+        upstream_path
         FROM bindings WHERE enabled = 1 ORDER BY domain]]) or {}
     local known_ports = {}
     for _, application in ipairs(applications) do
@@ -577,6 +580,22 @@ local function normalize_binding_proxy(data)
     local local_ip = target.normalize_ip(optional(data.local_ip, "127.0.0.1"))
     if not local_ip then return nil, "模拟本机 IP 必须是合法的 IPv4 或 IPv6 地址" end
 
+    local upstream_scheme = tostring(optional(data.upstream_scheme, "http")):lower()
+        :gsub("^%s+", ""):gsub("%s+$", "")
+    if not UPSTREAM_SCHEME_SET[upstream_scheme] then
+        return nil, "上游协议仅支持 http 或 https"
+    end
+
+    local upstream_path = target.normalize_upstream_path(optional(data.upstream_path, ""))
+    if upstream_path == nil then
+        return nil, "上游改写路径必须是合法路径，不能包含查询参数、片段、连续斜杠或 .."
+    end
+
+    local ssl_verify = optional(data.upstream_ssl_verify, true)
+    if type(ssl_verify) == "string" then
+        ssl_verify = ssl_verify:lower():gsub("^%s+", ""):gsub("%s+$", "")
+    end
+
     return {
         upstream_host = upstream_host,
         forwarded_host = forwarded_host,
@@ -586,6 +605,9 @@ local function normalize_binding_proxy(data)
         custom_origin = custom_origin,
         simulate_local = (data.simulate_local == true or data.simulate_local == 1) and 1 or 0,
         local_ip = local_ip,
+        upstream_scheme = upstream_scheme,
+        upstream_ssl_verify = (ssl_verify == false or ssl_verify == 0 or ssl_verify == "0" or ssl_verify == "false") and 0 or 1,
+        upstream_path = upstream_path,
     }
 end
 
@@ -618,13 +640,15 @@ function _M.create_application(data)
     local ok, err = db.exec([[INSERT INTO bindings(
         domain, target_ip, port, enabled, websocket, note, menu_name,
         upstream_host, forwarded_host, forwarded_proto, forwarded_port,
-        origin_mode, custom_origin, simulate_local, local_ip, created_at)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)]],
+        origin_mode, custom_origin, simulate_local, local_ip,
+        upstream_scheme, upstream_ssl_verify, upstream_path, created_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)]],
         domain, target_ip, port, data.enabled == false and 0 or 1,
         data.websocket == true and 1 or 0, note, menu_name,
         proxy.upstream_host, proxy.forwarded_host, proxy.forwarded_proto,
         proxy.forwarded_port, proxy.origin_mode, proxy.custom_origin,
-        proxy.simulate_local, proxy.local_ip, os.time())
+        proxy.simulate_local, proxy.local_ip, proxy.upstream_scheme,
+        proxy.upstream_ssl_verify, proxy.upstream_path, os.time())
     if not ok then return db_error("创建应用失败", err) end
     bump_rev()
     return { message = "应用已创建" }, nil, 201

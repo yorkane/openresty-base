@@ -270,6 +270,9 @@ CREATE TABLE IF NOT EXISTS bindings(
   custom_origin TEXT NOT NULL DEFAULT '',
   simulate_local INTEGER NOT NULL DEFAULT 0,
   local_ip TEXT NOT NULL DEFAULT '127.0.0.1',
+  upstream_scheme TEXT NOT NULL DEFAULT 'http',
+  upstream_ssl_verify INTEGER NOT NULL DEFAULT 1,
+  upstream_path TEXT NOT NULL DEFAULT '',
   created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS api_keys(
@@ -300,11 +303,16 @@ function _M.init(opts)
         end
     end
 
-    local function ensure_column(table_name, column_name, definition)
+    local function has_column(table_name, column_name)
         local columns = _M.query("PRAGMA table_info(" .. table_name .. ")") or {}
         for _, column in ipairs(columns) do
-            if column.name == column_name then return end
+            if column.name == column_name then return true end
         end
+        return false
+    end
+
+    local function ensure_column(table_name, column_name, definition)
+        if has_column(table_name, column_name) then return end
         local ok, err = _M.exec("ALTER TABLE " .. table_name .. " ADD COLUMN " .. definition)
         if not ok then
             error(table_name .. " migration failed: " .. tostring(err))
@@ -331,6 +339,15 @@ function _M.init(opts)
     ensure_column("bindings", "custom_origin", "custom_origin TEXT NOT NULL DEFAULT ''")
     ensure_column("bindings", "simulate_local", "simulate_local INTEGER NOT NULL DEFAULT 0")
     ensure_column("bindings", "local_ip", "local_ip TEXT NOT NULL DEFAULT '127.0.0.1'")
+    ensure_column("bindings", "upstream_scheme", "upstream_scheme TEXT NOT NULL DEFAULT 'http'")
+    ensure_column("bindings", "upstream_ssl_verify", "upstream_ssl_verify INTEGER NOT NULL DEFAULT 1")
+    local legacy_upstream_path = has_column("bindings", "upstream_path_prefix")
+    ensure_column("bindings", "upstream_path", "upstream_path TEXT NOT NULL DEFAULT ''")
+    if legacy_upstream_path then
+        local ok, err = _M.exec([[UPDATE bindings SET upstream_path = upstream_path_prefix
+            WHERE upstream_path = '' AND upstream_path_prefix <> '']])
+        if not ok then error("bindings path migration failed: " .. tostring(err)) end
+    end
 
     -- 早期 api_keys schema 将 role CHECK 固定为 api。重建表以允许固定角色目录，保留现有 Key。
     local api_key_schema_rows = _M.query([[SELECT sql FROM sqlite_master

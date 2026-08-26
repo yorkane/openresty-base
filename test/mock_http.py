@@ -8,6 +8,14 @@ BODY = (sys.argv[3] if len(sys.argv) > 3 else "hello-from-authz-mock").encode()
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def respond(self):
+        if self.path.startswith("/backend"):
+            body = self.path.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if self.path == "/trusted-origin":
             forwarded_proto = self.headers.get("X-Forwarded-Proto") or "http"
             expected_origin = f"{forwarded_proto}://{self.headers.get('Host')}"

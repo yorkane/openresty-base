@@ -43,8 +43,8 @@ Browser
 
 两个网关入口使用相同控制面：
 
-- HTTP 入口默认 6080，显式绑定代理 `http://<target_ip>:<port>`；
-- HTTPS 入口默认 6443，在网关终止 TLS 后仍代理 `http://<target_ip>:<port>`；
+- HTTP 入口默认 6080，显式绑定按记录代理到 `http://` 或 `https://<target_ip>:<port>`；
+- HTTPS 入口默认 6443，在网关终止客户端 TLS 后，仍按绑定记录选择 HTTP/HTTPS 上游；HTTPS 上游默认校验证书，可按绑定关闭校验；
 - 目标优先取启用的精确域名绑定，否则解析 `<port>-任意域名` 到 `127.0.0.1:<port>`；显式绑定还可保存绑定级 Host、Forwarded、Origin 和模拟本机访问配置；
 - 可代理端口下限强制不小于 2000；目标为网关自身端口时返回 508；
 - 上游收到 `X-Authz-User`、`X-Authz-Source`、`X-Authz-Identity`；默认 `Host` 与 `X-Forwarded-Host` 保留外部请求主机名。若最外层代理替换了端口，只在 Origin 与请求 Host 的主机名相同时恢复 Origin 中的公网端口。显式绑定可安全覆盖 `Host`、`X-Forwarded-Host/Proto/Port` 和 `Origin`，但不能改变真实 TCP peer。
@@ -373,13 +373,14 @@ bash scripts/restart_gateway.sh --build  # 按当前 Docker 架构重建镜像�
 ### 10.1 本次代理排障经验
 
 1. 先确认上游服务本身：`curl -i http://127.0.0.1:2077/` 返回 `200` 才说明本机 code-server HTTP 服务正常；本机 HTTPS 失败不代表网关故障。
-2. 再确认网关入口：`6443` 对外提供 HTTPS，但上游仍是 HTTP，不能设置上游 TLS 参数。
+2. 再确认网关入口：`6443` 对外提供 HTTPS，但客户端入口协议与上游协议独立；绑定可选择 HTTP 或 HTTPS。HTTPS 上游默认校验证书，使用自签名证书时需在对应绑定开启“忽略 SSL 验证”，不要放宽全局设置。
 3. 未登录时，绑定已解析但返回 `302` 到 `/_authz/login` 是预期认证结果；它证明请求已经进入认证链路。
 4. WebSocket 默认全局开启；不同前缀可以共用同一端口，但同一最终域名重复创建返回 `409`。验证时只需携带 `Upgrade: websocket`，不依赖绑定记录中的旧 `websocket` 值。
 5. 管理菜单优先使用已配置绑定的 `menu-name`，其次是绑定域名；绑定备注只在菜单名称下方显示，鼠标悬浮菜单时显示该菜单实际打开的完整域名地址；没有绑定时才使用自动发现的 `local:<port>`，且不显示绑定备注。普通点击在右侧 iframe 打开，Ctrl/Command + 点击在新窗口打开菜单地址。
 6. pi-web 会校验 API 请求的 Host 与 Origin；网关必须保留外部 Host，pi-web 启动环境需设置精确域名白名单，例如 `PI_WEB_ALLOWED_HOSTS=pi-m.ws.example.com`。公网端口被外层代理改写时，网关只对同主机名 Origin 恢复公网端口，异域 Origin 继续由上游拒绝。
 7. 若应用只接受目标地址 Host 或本地来源头，优先在单条绑定上覆盖 Host/Forwarded/Origin，或启用“模拟本机访问”并填写 `127.0.0.1`/网关局域网 IP；不要放宽所有绑定的全局默认策略。
 8. 外层入口可能使用 `:99` 映射网关内部 HTTPS `:6443`；`server.conf.template` 必须保持 `absolute_redirect off`，否则访问 `/_radmin_` 时生成的尾斜杠跳转会泄露不可达的 `:6443`，造成 Admin 入口无法访问。
+9. 绑定的“上游路径改写”会把请求统一转发到填写的目标路径，不改变 Casbin 对象；例如填写 `/backend/index.html` 会把 `/path?a=1` 转发为 `/backend/index.html?a=1`。改写路径必须是安全路径，不能带 query、fragment、连续斜杠或 `..`。
 
 ## 11. 已解决故障与防回归点
 

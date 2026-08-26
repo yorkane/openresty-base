@@ -310,7 +310,8 @@ end
 local function load_bindings()
     local rows = db.query([[SELECT domain, target_ip, port, enabled, websocket,
         upstream_host, forwarded_host, forwarded_proto, forwarded_port, origin_mode,
-        custom_origin, simulate_local, local_ip FROM bindings]]) or {}
+        custom_origin, simulate_local, local_ip, upstream_scheme, upstream_ssl_verify,
+        upstream_path FROM bindings]]) or {}
     local map = {}
     for _, b in ipairs(rows) do
         map[b.domain] = {
@@ -328,6 +329,9 @@ local function load_bindings()
             custom_origin = target.normalize_origin(b.custom_origin, true) or "",
             simulate_local = tonumber(b.simulate_local) == 1,
             local_ip = target.normalize_ip(b.local_ip) or "127.0.0.1",
+            upstream_scheme = b.upstream_scheme == "https" and "https" or "http",
+            upstream_ssl_verify = tonumber(b.upstream_ssl_verify) ~= 0,
+            upstream_path = target.normalize_upstream_path(b.upstream_path) or "",
         }
     end
     return map
@@ -458,6 +462,13 @@ local function apply_proxy_headers(binding, target_ip, port)
     end
 end
 
+local function upstream_path(binding)
+    local request_path = tostring(ngx.var.uri or "/")
+    local rewrite = binding and binding.upstream_path or ""
+    if rewrite == "" then return request_path end
+    return rewrite
+end
+
 local function serve_404(host)
     ngx.status = ngx.HTTP_NOT_FOUND
     ngx.header.content_type = "text/html; charset=utf-8"
@@ -540,8 +551,17 @@ function _M.access()
     ngx.var.authz_user = current.username
     ngx.var.authz_source = current.source
     ngx.var.authz_identity = principal
-    -- TLS terminates at the gateway; configured services are always HTTP upstreams.
-    ngx.var.authz_target = "http://" .. target.url_host(target_ip) .. ":" .. port
+    -- The gateway may terminate TLS for the client while forwarding to either
+    -- an HTTP or HTTPS upstream selected by the binding.
+    local scheme = binding and binding.upstream_scheme or "http"
+    local query = ngx.var.args
+    local query_suffix = query and query ~= "" and "?" .. query or ""
+    ngx.var.authz_target = scheme .. "://" .. target.url_host(target_ip) .. ":" .. port ..
+        upstream_path(binding) .. query_suffix
+    local ssl_host = binding and binding.upstream_host ~= "" and
+        target.authority_host(binding.upstream_host)
+    ssl_host = ssl_host or target.authority_host(target.url_host(target_ip)) or target.url_host(target_ip)
+    ngx.var.authz_upstream_ssl_name = ssl_host
     apply_proxy_headers(binding, target_ip, port)
     local requested_upgrade = tostring(ngx.var.http_upgrade or "")
     -- WebSocket 代理默认对所有已解析目标开启；bindings.websocket 仅保留
@@ -550,6 +570,13 @@ function _M.access()
     ngx.var.authz_websocket = websocket_request and "1" or "0"
     ngx.var.authz_upgrade = websocket_request and requested_upgrade or ""
     ngx.var.authz_connection = websocket_request and "upgrade" or ""
+
+    -- proxy_ssl_verify only accepts a literal on/off in nginx.  Keep the
+    -- normal location fail-closed and use a private named location when a
+    -- binding explicitly opts out of HTTPS certificate verification.
+    if scheme == "https" and binding and binding.upstream_ssl_verify == false then
+        return ngx.exec("@authz_proxy_insecure")
+    end
 end
 
 return _M
