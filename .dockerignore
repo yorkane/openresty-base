@@ -4,7 +4,9 @@
 .dockerignore
 .codex
 test
-scripts
+scripts/*
+!scripts/admin_password_reset
+!scripts/admin_password_reset.lua
 data
 .env
 .env.*
