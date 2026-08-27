@@ -101,6 +101,31 @@ function _M.init()
     c.login_window = math.max(1, tonumber(os.getenv("AUTHZ_LOGIN_WINDOW")) or 60)
     session.secure = env_bool("AUTHZ_COOKIE_SECURE", false)
     session.configure_cookie_domain(os.getenv("AUTHZ_COOKIE_DOMAIN"), os.getenv("AUTHZ_HOST_URL"))
+
+    -- 共享会话 (Redis): 各实例把登录会话同步到公共 Redis, 切换域名不丢登录。
+    -- Casbin 策略/绑定/角色仍在各实例本地管理, 不做同步。
+    c.session_shared = env_bool("AUTHZ_SESSION_SHARED", false)
+    local redis_url = tostring(os.getenv("AUTHZ_SESSION_REDIS_URL") or ""):gsub("%s+", "")
+    if c.session_shared then
+        local redis_host, redis_port_text = redis_url:match("^redis://([^:/]+):?(%d*)$")
+        if not redis_host then
+            error("AUTHZ_SESSION_SHARED requires AUTHZ_SESSION_REDIS_URL=redis://<host>[:<port>]")
+        end
+        session.redis.host = redis_host
+        local redis_port = redis_port_text ~= "" and tonumber(redis_port_text) or 6379
+        if not redis_port or redis_port < 1 or redis_port > 65535 then
+            error("AUTHZ_SESSION_REDIS_URL port must be 1-65535")
+        end
+        session.redis.port = redis_port
+        session.redis.password = tostring(os.getenv("AUTHZ_SESSION_REDIS_PASSWORD") or "")
+        session.redis.db = tonumber(os.getenv("AUTHZ_SESSION_REDIS_DB")) or 0
+        session.redis.prefix = tostring(os.getenv("AUTHZ_SESSION_REDIS_PREFIX") or "authz")
+        session.redis.connect_timeout = tonumber(os.getenv("AUTHZ_SESSION_REDIS_CONNECT_TIMEOUT_MS")) or 2000
+        session.redis.read_timeout = tonumber(os.getenv("AUTHZ_SESSION_REDIS_READ_TIMEOUT_MS")) or 2000
+        session.shared_enabled = true
+        ngx.log(ngx.NOTICE, "authz: shared session mode enabled (redis://" ..
+            session.redis.host .. ":" .. session.redis.port .. ")")
+    end
     c.noco_enabled = env_bool("AUTHZ_NOCO_ENABLED", false)
     c.noco_oauth_enabled = env_bool("AUTHZ_NOCO_OAUTH_ENABLED", false)
     c.noco_base_url = tostring(os.getenv("AUTHZ_NOCO_URL") or ""):gsub("/+$", "")

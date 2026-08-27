@@ -12,6 +12,178 @@ _M.secure = false
 _M.cookie_domain = ""
 _M.cookie_domains = {}
 
+-- 共享会话 (Redis): 各实例把登录会话写入公共 Redis, 身份在多实例间共享。
+-- Casbin 策略、绑定与角色仍在各实例本地管理; 读取共享会话时仍会用本地
+-- users / remote_users 校验身份, 本地不存在或已禁用即清除登录信息。
+_M.redis = {
+    configured = false,
+    host = "",
+    port = 6379,
+    db = 0,
+    password = "",
+    prefix = "authz",
+    connect_timeout = 2000,
+    read_timeout = 2000,
+}
+_M.shared_enabled = false
+
+local function redis_log(level, ...)
+    ngx.log(level, "authz redis session: ", ...)
+end
+
+local function redis_acquire()
+    local redis = require "resty.redis"
+    local red = redis:new()
+    red:set_timeouts(_M.redis.connect_timeout, _M.redis.read_timeout, _M.redis.read_timeout)
+    local ok, err = red:connect(_M.redis.host, _M.redis.port)
+    if not ok then
+        return nil, "connect failed: " .. tostring(err)
+    end
+    if _M.redis.password ~= "" then
+        local auth_ok, auth_err = red:auth(_M.redis.password)
+        if not auth_ok then
+            red:close()
+            return nil, "auth failed: " .. tostring(auth_err)
+        end
+    end
+    if _M.redis.db ~= 0 then
+        local sel_ok, sel_err = red:select(_M.redis.db)
+        if not sel_ok then
+            red:close()
+            return nil, "select db failed: " .. tostring(sel_err)
+        end
+    end
+    return red
+end
+
+local function redis_release(red)
+    local ok, err = red:set_keepalive(10000, 32)
+    if not ok then redis_log(ngx.DEBUG, "keepalive failed: ", tostring(err)) end
+end
+
+local function redis_key(token)
+    return _M.redis.prefix .. ":session:" .. token
+end
+
+local function redis_save(token, record)
+    if not _M.shared_enabled then return true end
+    local red, err = redis_acquire()
+    if not red then
+        redis_log(ngx.ERR, err)
+        return false
+    end
+    local cjson = require "cjson.safe"
+    -- Redis 只共享用户 ID 与来源; 角色、策略不共享, 由各实例本地管理。
+    -- csrf / expires_at 是会话机制字段, 不属于权限数据。
+    local ok, set_err = red:setex(redis_key(token), _M.ttl,
+        cjson.encode({
+            username = record.username,
+            source = record.source,
+            csrf = record.csrf,
+            expires_at = record.expires_at,
+        }))
+    redis_release(red)
+    if not ok then
+        redis_log(ngx.ERR, "setex failed: ", tostring(set_err))
+        return false
+    end
+    return true
+end
+
+-- 返回 record 或 (nil, "redis_unreachable") / (nil, "not_found")
+local function redis_load(token)
+    if not _M.shared_enabled then return nil, "not_found" end
+    local red, err = redis_acquire()
+    if not red then
+        redis_log(ngx.WARN, err)
+        return nil, "redis_unreachable"
+    end
+    local raw, get_err = red:get(redis_key(token))
+    if get_err then
+        redis_release(red)
+        redis_log(ngx.WARN, "get failed: ", tostring(get_err))
+        return nil, "redis_unreachable"
+    end
+    redis_release(red)
+    if type(raw) ~= "string" or raw == "" then
+        return nil, "not_found"
+    end
+    local cjson = require "cjson.safe"
+    local record = cjson.decode(raw)
+    if type(record) ~= "table" then return nil, "not_found" end
+    return {
+        username = tostring(record.username or ""),
+        source = tostring(record.source or "local"),
+        csrf = tostring(record.csrf or ""),
+        expires_at = tonumber(record.expires_at) or 0,
+    }
+end
+
+local function redis_delete(token)
+    if not _M.shared_enabled then return end
+    local red, err = redis_acquire()
+    if not red then
+        redis_log(ngx.WARN, err)
+        return
+    end
+    local ok, del_err = red:del(redis_key(token))
+    redis_release(red)
+    if not ok then redis_log(ngx.WARN, "del failed: ", tostring(del_err)) end
+end
+
+local function redis_delete_many(tokens)
+    if not _M.shared_enabled or #tokens == 0 then return end
+    local red, err = redis_acquire()
+    if not red then
+        redis_log(ngx.WARN, err)
+        return
+    end
+    local keys = {}
+    for _, token in ipairs(tokens) do keys[#keys + 1] = redis_key(token) end
+    local ok, del_err = red:del(unpack(keys))
+    redis_release(red)
+    if not ok then redis_log(ngx.WARN, "del failed: ", tostring(del_err)) end
+end
+
+-- 共享模式下撤销某身份的全部会话: 扫描 Redis 中所有会话键,
+-- 命中相同 username + source 的一并删除 (覆盖其他实例创建的会话)。
+local function redis_delete_all_for(username, source)
+    if not _M.shared_enabled then return end
+    local red, err = redis_acquire()
+    if not red then
+        redis_log(ngx.WARN, err)
+        return
+    end
+    local cjson = require "cjson.safe"
+    local cursor = "0"
+    local pattern = _M.redis.prefix .. ":session:*"
+    local matched = {}
+    for _ = 1, 100 do
+        local res = red:scan(cursor, "MATCH", pattern, "COUNT", 500)
+        if type(res) ~= "table" or type(res[1]) ~= "string" or type(res[2]) ~= "table" then
+            redis_log(ngx.WARN, "scan failed")
+            break
+        end
+        cursor = res[1]
+        for _, key in ipairs(res[2]) do
+            local raw = red:get(key)
+            if type(raw) == "string" then
+                local record = cjson.decode(raw)
+                if type(record) == "table" and record.username == username and
+                    record.source == source then
+                    matched[#matched + 1] = key
+                end
+            end
+        end
+        if cursor == "0" then break end
+    end
+    if #matched > 0 then
+        local ok, del_err = red:del(unpack(matched))
+        if not ok then redis_log(ngx.WARN, "del failed: ", tostring(del_err)) end
+    end
+    redis_release(red)
+end
+
 local function normalize_domain(value)
     local domain = tostring(value or ""):lower()
         :gsub("^%s+", ""):gsub("%s+$", ""):gsub("^%.*", ""):gsub("%.$", "")
@@ -163,41 +335,115 @@ function _M.create(username, source)
     source, username = identity.parse(principal)
     local token = util.random_token(32)
     local csrf = util.random_token(16)
+    if not redis_save(token, {
+        username = username,
+        source = source,
+        csrf = csrf,
+        expires_at = os.time() + _M.ttl,
+    }) then
+        -- Redis 不可达时降级为纯本地会话; 跨实例共享暂时失效, 登录后仍可用。
+        ngx.log(ngx.WARN, "authz redis session: create degraded to local-only session")
+    end
     local ok, err = db.exec(
         "INSERT INTO sessions(token, username, source, csrf, expires_at) VALUES(?,?,?,?,?)",
         token, username, source, csrf, os.time() + _M.ttl)
-    if not ok then return nil, err end
+    if not ok then
+        redis_delete(token)
+        return nil, err
+    end
     return token
 end
 
 -- 按 cookie token 取会话, 过期返回 nil (顺带清理)
 function _M.get(token)
     if not token or #token < 16 or #token > 128 then return nil end
-    local rows = db.query(
-        "SELECT username, source, csrf, expires_at FROM sessions WHERE token = ?", token)
-    local s = rows and rows[1]
-    if not s then return nil end
-    if s.expires_at < os.time() then
-        db.exec("DELETE FROM sessions WHERE token = ?", token)
+    local s
+    if _M.shared_enabled then
+        local load_err
+        s, load_err = redis_load(token)
+        if s then
+            if s.expires_at < os.time() then
+                redis_delete(token)
+                _M.clear_cookie()
+                return nil
+            end
+        elseif load_err == "redis_unreachable" then
+            -- 本地 SQLite 兜底恢复 (共享存储暂时不可达或记录迁移)
+            local rows = db.query(
+                "SELECT username, source, csrf, expires_at FROM sessions WHERE token = ?", token)
+            local local_row = rows and rows[1]
+            if local_row then
+                if local_row.expires_at < os.time() then
+                    db.exec("DELETE FROM sessions WHERE token = ?", token)
+                    return nil
+                end
+                if redis_save(token, local_row) then
+                    s = {
+                        username = local_row.username,
+                        source = local_row.source,
+                        csrf = local_row.csrf,
+                        expires_at = local_row.expires_at,
+                    }
+                else
+                    s = local_row
+                end
+            end
+        else
+            -- Redis 中确实没有该会话: 按约定清除登录信息。
+            db.exec("DELETE FROM sessions WHERE token = ?", token)
+            _M.clear_cookie()
+            return nil
+        end
+    else
+        local rows = db.query(
+            "SELECT username, source, csrf, expires_at FROM sessions WHERE token = ?", token)
+        s = rows and rows[1]
+        if not s then return nil end
+        if s.expires_at < os.time() then
+            db.exec("DELETE FROM sessions WHERE token = ?", token)
+            return nil
+        end
+    end
+    if not s then
+        _M.clear_cookie()
         return nil
     end
     if s.source == "local" then
         local users = db.query(
             "SELECT id FROM users WHERE username = ? AND enabled = 1", s.username)
-        if not users or not users[1] then return nil end
+        if not users or not users[1] then
+            redis_delete(token)
+            db.exec("DELETE FROM sessions WHERE token = ?", token)
+            _M.clear_cookie()
+            return nil
+        end
     else
         local remote_users = db.query([[SELECT subject FROM remote_users
             WHERE provider = ? AND username = ? AND enabled = 1]], s.source, s.username)
-        if not remote_users or not remote_users[1] then return nil end
+        if not remote_users or not remote_users[1] then
+            -- 本地没有该身份(或已禁用): 按约定清除登录信息。
+            redis_delete(token)
+            db.exec("DELETE FROM sessions WHERE token = ?", token)
+            _M.clear_cookie()
+            return nil
+        end
     end
     return s
 end
 
 function _M.delete(token)
+    redis_delete(token)
     return db.exec("DELETE FROM sessions WHERE token = ?", token)
 end
 
 function _M.delete_all_for(username, source)
+    local rows = db.query(
+        "SELECT token FROM sessions WHERE username = ? AND source = ?",
+        username, identity.source(source) or "local") or {}
+    local tokens = {}
+    for _, row in ipairs(rows) do tokens[#tokens + 1] = row.token end
+    redis_delete_many(tokens)
+    redis_delete_all_for(username, identity.source(source) or "local")
     return db.exec("DELETE FROM sessions WHERE username = ? AND source = ?",
         username, identity.source(source) or "local")
 end

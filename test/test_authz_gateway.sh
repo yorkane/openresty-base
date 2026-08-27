@@ -5,6 +5,9 @@ REPO_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 IMAGE=${OPENRESTY_TEST_IMAGE:-ghcr.io/yorkane/openresty-base:latest}
 CONTAINER_NAME="authz-gateway-test-$$"
 RELAY_CONTAINER_NAME=""
+SHARED_REDIS_CONTAINER=""
+SHARED_FIRST_CONTAINER=""
+SHARED_SECOND_CONTAINER=""
 TMP_DIR=$(mktemp -d)
 PASS=0
 MOCK_PID=""
@@ -31,6 +34,12 @@ WS_PORT=$(free_port)
 TLS_PORT=$(free_port)
 RELAY_HTTP_PORT=$(free_port)
 RELAY_HTTPS_PORT=$(free_port)
+SHARED_REDIS_PORT=$(free_port)
+SHARED_HTTP_PORT=$(free_port)
+SHARED_HTTPS_PORT=$(free_port)
+SHARED_B_HTTP_PORT=$(free_port)
+SHARED_B_HTTPS_PORT=$(free_port)
+SHARED_REDIS_PASS="shared-session-test-secret"
 REMOTE_PORT=$(free_port)
 REMOTE_IP=$(python3 - <<'PY'
 import socket
@@ -52,6 +61,17 @@ cleanup() {
     if [[ -n "$RELAY_CONTAINER_NAME" ]]; then
         docker exec "$RELAY_CONTAINER_NAME" chmod -R a+rwx /data >/dev/null 2>&1 || true
         docker rm -f "$RELAY_CONTAINER_NAME" >/dev/null 2>&1 || true
+    fi
+    if [[ -n "$SHARED_FIRST_CONTAINER" ]]; then
+        docker exec "$SHARED_FIRST_CONTAINER" chmod -R a+rwx /data >/dev/null 2>&1 || true
+        docker rm -f "$SHARED_FIRST_CONTAINER" >/dev/null 2>&1 || true
+    fi
+    if [[ -n "$SHARED_SECOND_CONTAINER" ]]; then
+        docker exec "$SHARED_SECOND_CONTAINER" chmod -R a+rwx /data >/dev/null 2>&1 || true
+        docker rm -f "$SHARED_SECOND_CONTAINER" >/dev/null 2>&1 || true
+    fi
+    if [[ -n "$SHARED_REDIS_CONTAINER" ]]; then
+        docker rm -f "$SHARED_REDIS_CONTAINER" >/dev/null 2>&1 || true
     fi
     if [[ -n "$MOCK_PID" ]]; then kill "$MOCK_PID" >/dev/null 2>&1 || true; fi
     if [[ -n "$REMOTE_PID" ]]; then kill "$REMOTE_PID" >/dev/null 2>&1 || true; fi
@@ -1725,5 +1745,186 @@ STATUS=$(curl -sS --max-time 5 --resolve "$HUB_HOST:$HTTP_PORT:127.0.0.1" \
 assert_eq "hub provider mismatch uses provider flow" "$STATUS" "302"
 HUB_MISMATCH_LOCATION=$(awk 'BEGIN { IGNORECASE=1 } /^Location:/ { sub(/^[^:]+:[[:space:]]*/, ""); sub(/\r$/, ""); print; exit }' "$TMP_DIR/hub-mismatch-headers")
 assert_contains "hub mismatch redirects to dingtalk authorize" "$HUB_MISMATCH_LOCATION" "dingtalk/authorize"
+
+# ── 共享会话 (Redis): 只共享用户 ID 与来源, 角色/策略仍由各实例本地管理 ──
+assert_contains "session store supports shared redis mode" \
+    "$(cat "$REPO_DIR/lualib/resty/authz/session.lua")" '_M.shared_enabled'
+assert_contains "shared session parses redis config" \
+    "$(cat "$REPO_DIR/lualib/resty/authz/init.lua")" 'AUTHZ_SESSION_SHARED'
+
+SHARED_REDIS_CONTAINER="authz-shared-redis-test-$$"
+SHARED_FIRST_CONTAINER="authz-shared-gateway-a-test-$$"
+SHARED_SECOND_CONTAINER="authz-shared-gateway-b-test-$$"
+SHARED_A_HOST="shared-a.test.example"
+SHARED_B_HOST="shared-b.test.example"
+
+docker run -d --name "$SHARED_REDIS_CONTAINER" --network host \
+    redis:8-alpine redis-server --port "$SHARED_REDIS_PORT" \
+    --requirepass "$SHARED_REDIS_PASS" >/dev/null
+wait_shared_redis() {
+    local pong=""
+    for _ in $(seq 1 30); do
+        pong=$(docker exec "$SHARED_REDIS_CONTAINER" redis-cli -p "$SHARED_REDIS_PORT" \
+            -a "$SHARED_REDIS_PASS" --no-auth-warning ping 2>/dev/null || true)
+        [[ "$pong" == "PONG" ]] && break
+        sleep 0.2
+    done
+    [[ "$pong" == "PONG" ]] || fail "shared redis container did not become ready"
+}
+wait_shared_redis
+pass "shared redis is ready"
+
+start_shared_gateway() {
+    local name=$1 http_port=$2 https_port=$3
+    mkdir -p "$TMP_DIR/$name-data/authz"
+    docker run -d \
+        --name "$name" \
+        --network host \
+        -e NGINX_WORKER_PROCESSES=1 \
+        -e AUTHZ_HTTP_PORT="$http_port" \
+        -e AUTHZ_HTTPS_PORT="$https_port" \
+        -e AUTHZ_ADMIN_PASSWORD=admin123 \
+        -e AUTHZ_PORT_MIN=1000 \
+        -e AUTHZ_PORT_MAX=65535 \
+        -e AUTHZ_SESSION_SHARED=true \
+        -e "AUTHZ_SESSION_REDIS_URL=redis://127.0.0.1:$SHARED_REDIS_PORT" \
+        -e "AUTHZ_SESSION_REDIS_PASSWORD=$SHARED_REDIS_PASS" \
+        -e AUTHZ_SESSION_REDIS_PREFIX=authz-test \
+        -e OPENRESTY_TEMPLATE_DIR=/etc/openresty/templates \
+        -v "$TMP_DIR/$name-data:/data" \
+        -v "$REPO_DIR/admin:/usr/local/openresty/nginx/html/admin:ro" \
+        -v "$TMP_DIR/templates:/etc/openresty/templates:ro" \
+        -v "$REPO_DIR/docker-entrypoint.sh:/docker-entrypoint.sh:ro" \
+        -v "$REPO_DIR/lualib:/usr/local/openresty/site/lualib:ro" \
+        "$IMAGE" >/dev/null
+}
+wait_shared_gateway() {
+    local host_port="$1" status=""
+    for _ in $(seq 1 60); do
+        status=$(curl -sS --max-time 2 --resolve "$host_port:127.0.0.1" \
+            -o /dev/null -w '%{http_code}' "http://$host_port/_authz/login" 2>/dev/null || true)
+        [[ "$status" == "200" ]] && break
+        sleep 0.5
+    done
+    [[ "$status" == "200" ]] || fail "shared gateway on $host_port did not become ready"
+}
+start_shared_gateway "$SHARED_FIRST_CONTAINER" "$SHARED_HTTP_PORT" "$SHARED_HTTPS_PORT"
+start_shared_gateway "$SHARED_SECOND_CONTAINER" "$SHARED_B_HTTP_PORT" "$SHARED_B_HTTPS_PORT"
+wait_shared_gateway "$SHARED_A_HOST:$SHARED_HTTP_PORT"
+wait_shared_gateway "$SHARED_B_HOST:$SHARED_B_HTTP_PORT"
+pass "shared gateways are ready"
+
+shared_login() {
+    local host=$1 port=$2 username=$3 password=$4 cookie=$5
+    rm -f "$cookie"
+    STATUS=$(curl -sS --max-time 5 --resolve "$host:$port:127.0.0.1" \
+        -D "$TMP_DIR/shared-login-headers" -o /dev/null -w '%{http_code}' \
+        -X POST "http://$host:$port/_authz/login" \
+        --data-urlencode "username=$username" --data-urlencode "password=$password")
+    [[ "$STATUS" == "302" ]] || fail "shared login on $host failed (got $STATUS)"
+    save_session_cookie "$TMP_DIR/shared-login-headers" "$cookie"
+}
+shared_session() {
+    local host=$1 port=$2 cookie=$3
+    curl -sS --max-time 5 --resolve "$host:$port:127.0.0.1" \
+        -H "Cookie: $(cookie_header "$cookie")" -D "$TMP_DIR/shared-headers" \
+        -o "$TMP_DIR/body" -w '%{http_code}' "http://$host:$port/_api_/authz/v1/session"
+}
+seed_shared_bob() {
+    local host_port="$1" host="${1%%:*}" port="${1#*:}" csrf=""
+    STATUS=$(curl -sS --max-time 5 --resolve "$host_port:127.0.0.1" \
+        -D "$TMP_DIR/shared-admin-headers" -o /dev/null -w '%{http_code}' \
+        -X POST "http://$host_port/_authz/login" \
+        --data-urlencode 'username=admin' --data-urlencode 'password=admin123')
+    [[ "$STATUS" == "302" ]] || fail "shared admin login on $host failed"
+    save_session_cookie "$TMP_DIR/shared-admin-headers" "$TMP_DIR/shared-admin-$host.cookie"
+    csrf=$(curl -sS --max-time 5 --resolve "$host_port:127.0.0.1" \
+        -H "Cookie: $(cookie_header "$TMP_DIR/shared-admin-$host.cookie")" \
+        "http://$host_port/_api_/authz/v1/session" | jq -r '.data.csrf')
+    curl -sS --max-time 5 --resolve "$host_port:127.0.0.1" \
+        -H "Cookie: $(cookie_header "$TMP_DIR/shared-admin-$host.cookie")" \
+        -H "X-CSRF-Token: $csrf" -H 'Content-Type: application/json' \
+        -X POST "http://$host_port/_api_/authz/v1/users" \
+        -d '{"username":"sharedbob","password":"bob-secret-1","roles":["viewer"]}' >/dev/null
+}
+
+# 1) 实例 A 登录 admin, 会话写入共享 Redis; 同一 Cookie 在实例 B 直接有效。
+SHARED_A_COOKIE="$TMP_DIR/shared-a-admin.cookie"
+shared_login "$SHARED_A_HOST" "$SHARED_HTTP_PORT" admin admin123 "$SHARED_A_COOKIE"
+SHARED_TOKEN=$(cookie_header "$SHARED_A_COOKIE" | sed 's/^authz_session=//')
+REDIS_KEYS=$(docker exec "$SHARED_REDIS_CONTAINER" redis-cli -p "$SHARED_REDIS_PORT" \
+    -a "$SHARED_REDIS_PASS" --no-auth-warning keys 'authz-test:session:*')
+assert_eq "shared redis stores the session key" "$REDIS_KEYS" "authz-test:session:$SHARED_TOKEN"
+STATUS=$(shared_session "$SHARED_A_HOST" "$SHARED_HTTP_PORT" "$SHARED_A_COOKIE")
+assert_eq "shared session valid on instance A" "$STATUS" "200"
+assert_json "shared session username" '.data.username' "admin"
+assert_json "shared session source" '.data.source' "local"
+STATUS=$(shared_session "$SHARED_B_HOST" "$SHARED_B_HTTP_PORT" "$SHARED_A_COOKIE")
+assert_eq "shared session valid on instance B" "$STATUS" "200"
+assert_json "shared session identity on B" '.data.identity' "user:local:admin"
+
+# 2) Redis 只保存用户 ID 与来源 (外加会话机制字段), 不含角色或策略数据。
+REDIS_PAYLOAD=$(docker exec "$SHARED_REDIS_CONTAINER" redis-cli -p "$SHARED_REDIS_PORT" \
+    -a "$SHARED_REDIS_PASS" --no-auth-warning get "authz-test:session:$SHARED_TOKEN")
+assert_contains "redis payload carries username" "$REDIS_PAYLOAD" '"username":"admin"'
+assert_contains "redis payload carries source" "$REDIS_PAYLOAD" '"source":"local"'
+assert_not_contains "redis payload does not carry roles" "$REDIS_PAYLOAD" 'roles'
+
+# 3) Redis 中会话被删除 (登出/过期) 后, 实例立即清除登录信息。
+docker exec "$SHARED_REDIS_CONTAINER" redis-cli -p "$SHARED_REDIS_PORT" \
+    -a "$SHARED_REDIS_PASS" --no-auth-warning del "authz-test:session:$SHARED_TOKEN" >/dev/null
+STATUS=$(shared_session "$SHARED_B_HOST" "$SHARED_B_HTTP_PORT" "$SHARED_A_COOKIE")
+assert_eq "missing shared session is cleared" "$STATUS" "401"
+assert_contains "missing session response clears cookie" "$(cat "$TMP_DIR/shared-headers")" "authz_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"
+
+# 4) 共享会话命中但实例 B 本地没有该身份时, 清除登录而不是放行。
+SHARED_BOB_A="$TMP_DIR/shared-a-bob.cookie"
+SHARED_BOB_B_COOKIE="$TMP_DIR/shared-b-bob.cookie"
+seed_shared_bob "$SHARED_A_HOST:$SHARED_HTTP_PORT"
+seed_shared_bob "$SHARED_B_HOST:$SHARED_B_HTTP_PORT"
+shared_login "$SHARED_A_HOST" "$SHARED_HTTP_PORT" sharedbob bob-secret-1 "$SHARED_BOB_A"
+STATUS=$(shared_session "$SHARED_B_HOST" "$SHARED_B_HTTP_PORT" "$SHARED_BOB_A")
+assert_eq "shared viewer session valid on instance B" "$STATUS" "200"
+assert_json "shared viewer role comes from B local record" '.data.roles | join(",")' "viewer"
+
+SHARED_BOB_B_ID=$(curl -sS --max-time 5 --resolve "$SHARED_B_HOST:$SHARED_B_HTTP_PORT:127.0.0.1" \
+    -H "Cookie: $(cookie_header "$TMP_DIR/shared-admin-$SHARED_B_HOST.cookie")" \
+    "http://$SHARED_B_HOST:$SHARED_B_HTTP_PORT/_api_/authz/v1/users" | jq -r '.data.users[] | select(.username == "sharedbob") | .id')
+SHARED_BOB_B_CSRF=$(curl -sS --max-time 5 --resolve "$SHARED_B_HOST:$SHARED_B_HTTP_PORT:127.0.0.1" \
+    -H "Cookie: $(cookie_header "$TMP_DIR/shared-admin-$SHARED_B_HOST.cookie")" \
+    "http://$SHARED_B_HOST:$SHARED_B_HTTP_PORT/_api_/authz/v1/session" | jq -r '.data.csrf')
+curl -sS --max-time 5 --resolve "$SHARED_B_HOST:$SHARED_B_HTTP_PORT:127.0.0.1" \
+    -H "Cookie: $(cookie_header "$TMP_DIR/shared-admin-$SHARED_B_HOST.cookie")" \
+    -H "X-CSRF-Token: $SHARED_BOB_B_CSRF" \
+    -X DELETE "http://$SHARED_B_HOST:$SHARED_B_HTTP_PORT/_api_/authz/v1/users/$SHARED_BOB_B_ID" >/dev/null
+STATUS=$(shared_session "$SHARED_B_HOST" "$SHARED_B_HTTP_PORT" "$SHARED_BOB_A")
+assert_eq "identity missing on B clears shared session" "$STATUS" "401"
+SHARED_BOB_KEY=$(cookie_header "$SHARED_BOB_A" | sed 's/^authz_session=//')
+REDIS_LEFT=$(docker exec "$SHARED_REDIS_CONTAINER" redis-cli -p "$SHARED_REDIS_PORT" \
+    -a "$SHARED_REDIS_PASS" --no-auth-warning exists "authz-test:session:$SHARED_BOB_KEY")
+assert_eq "cleared shared session removes redis key" "$REDIS_LEFT" "0"
+
+# 5) 密码重置撤销会话时, 其他实例创建的共享会话也一并失效。
+seed_shared_bob "$SHARED_B_HOST:$SHARED_B_HTTP_PORT"
+shared_login "$SHARED_B_HOST" "$SHARED_B_HTTP_PORT" sharedbob bob-secret-1 "$SHARED_BOB_B_COOKIE"
+STATUS=$(shared_session "$SHARED_B_HOST" "$SHARED_B_HTTP_PORT" "$SHARED_BOB_B_COOKIE")
+assert_eq "bob session created on B" "$STATUS" "200"
+SHARED_BOB_A_ID=$(curl -sS --max-time 5 --resolve "$SHARED_A_HOST:$SHARED_HTTP_PORT:127.0.0.1" \
+    -H "Cookie: $(cookie_header "$TMP_DIR/shared-admin-$SHARED_A_HOST.cookie")" \
+    "http://$SHARED_A_HOST:$SHARED_HTTP_PORT/_api_/authz/v1/users" | jq -r '.data.users[] | select(.username == "sharedbob") | .id')
+SHARED_BOB_A_CSRF=$(curl -sS --max-time 5 --resolve "$SHARED_A_HOST:$SHARED_HTTP_PORT:127.0.0.1" \
+    -H "Cookie: $(cookie_header "$TMP_DIR/shared-admin-$SHARED_A_HOST.cookie")" \
+    "http://$SHARED_A_HOST:$SHARED_HTTP_PORT/_api_/authz/v1/session" | jq -r '.data.csrf')
+curl -sS --max-time 5 --resolve "$SHARED_A_HOST:$SHARED_HTTP_PORT:127.0.0.1" \
+    -H "Cookie: $(cookie_header "$TMP_DIR/shared-admin-$SHARED_A_HOST.cookie")" \
+    -H "X-CSRF-Token: $SHARED_BOB_A_CSRF" -H 'Content-Type: application/json' \
+    -X PUT "http://$SHARED_A_HOST:$SHARED_HTTP_PORT/_api_/authz/v1/users/$SHARED_BOB_A_ID/password" \
+    -d '{"password":"bob-secret-2"}' >/dev/null
+STATUS=$(shared_session "$SHARED_B_HOST" "$SHARED_B_HTTP_PORT" "$SHARED_BOB_B_COOKIE")
+assert_eq "password reset revokes sessions across instances" "$STATUS" "401"
+SHARED_BOB_B_KEY=$(cookie_header "$SHARED_BOB_B_COOKIE" | sed 's/^authz_session=//')
+REDIS_LEFT=$(docker exec "$SHARED_REDIS_CONTAINER" redis-cli -p "$SHARED_REDIS_PORT" \
+    -a "$SHARED_REDIS_PASS" --no-auth-warning exists "authz-test:session:$SHARED_BOB_B_KEY")
+assert_eq "cross-instance revoke removes redis key" "$REDIS_LEFT" "0"
 
 printf '\nAll %d authz gateway checks passed.\n' "$PASS"
