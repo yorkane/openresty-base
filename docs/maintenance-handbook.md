@@ -276,6 +276,33 @@ SSO 快捷路径：用户在浏览器中已持有中枢的远程身份会话时�
 真实回归使用双容器覆盖完整链路、断言重放、篡改签名、未知中继客户端、SSO 快捷路径与
 本地账号隔离，位于 `test/test_authz_gateway.sh` 末尾。
 
+### 6.2 共享会话模式（Redis，只共享用户 ID 与来源）
+
+多实例部署时，用户从域名 A 登录后切换到域名 B 会因 Cookie 域不同而丢失会话。共享会话模式把登录会话写入公共 Redis，使各实例认可同一份登录身份。
+
+共享边界（严格遵守）：
+
+- Redis 只保存 `username`、`source` 与纯会话机制字段（`csrf`、`expires_at`）；**角色、Casbin 策略、绑定一律不共享**，仍由各实例本地 SQLite 管理。
+- 会话命中后，实例仍用本地 `users` / `remote_users` 校验该身份存在且启用；本地没有或已禁用即清除登录信息（删 Redis 键、删本地 session、清除 Cookie）。
+- Redis 中确实没有该会话（登出/过期）时，实例立即清除登录信息；仅当 Redis 暂时不可达时才降级读取本地 SQLite。
+- 密码重置、用户禁用等撤销操作会通过 Redis SCAN 删除该身份在**所有实例**创建的会话键，跨实例即时失效。
+
+配置（各实例 `.env`）：
+
+```bash
+AUTHZ_SESSION_SHARED=true
+AUTHZ_SESSION_REDIS_URL=redis://<host>[:<port>]   # 默认端口 6379，当前使用 Redis30 (192.168.1.30)
+AUTHZ_SESSION_REDIS_PASSWORD=<password>
+AUTHZ_SESSION_REDIS_DB=0
+AUTHZ_SESSION_REDIS_PREFIX=authz                  # 多套集群共用时用于隔离，如 authz-test
+```
+
+Redis 键格式：`<prefix>:session:<64位hex token>`，值为 JSON，TTL 与会话有效期（`AUTHZ_SESSION_TTL`）一致。`docker-compose.yml` 已透传上述变量；修改环境变量必须重建容器。
+
+真实回归覆盖：双实例 + 独立带密码 Redis 容器，验证跨实例会话有效、Redis 载荷不含角色、Redis 键删除后清除登录、本地无身份时清除登录、密码重置跨实例撤销，位于 `test/test_authz_gateway.sh` 末尾。
+
+生产拓扑（当前）：中枢 `a-m.ws.example.com:99` 与业务实例 `*-o.ws.example.com:99` 均指向 Redis30，前缀 `authz`；已实测中枢登录的 Cookie 在业务实例直接生效，且返回的角色来自业务实例本地记录。
+
 ## 7. Admin UI 规则
 
 技术栈固定为 Vue 3 Browser Global + Quasar UMD，无用户明确要求时不加入 Node、Vite 或 Vue Router。
