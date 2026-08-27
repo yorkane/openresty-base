@@ -137,11 +137,16 @@ check_status() {
     local url="$3"
     local actual
 
-    if [[ "$#" -gt 3 ]]; then
-        actual="$(curl -sS --connect-timeout 3 --max-time 10 "${@:4}" -o /dev/null -w '%{http_code}' "$url" || true)"
-    else
-        actual="$(curl -sS --connect-timeout 3 --max-time 10 -o /dev/null -w '%{http_code}' "$url" || true)"
-    fi
+    # 容器刚启动时端口绑定可能略晚于 docker up 返回, 重试最多 15 秒。
+    for _ in $(seq 1 15); do
+        if [[ "$#" -gt 3 ]]; then
+            actual="$(curl -sS --connect-timeout 3 --max-time 10 "${@:4}" -o /dev/null -w '%{http_code}' "$url" || true)"
+        else
+            actual="$(curl -sS --connect-timeout 3 --max-time 10 -o /dev/null -w '%{http_code}' "$url" || true)"
+        fi
+        [[ "$actual" == "$expected" ]] && break
+        sleep 1
+    done
     if [[ "$actual" != "$expected" ]]; then
         printf '错误: %s 返回 %s，期望 %s。\n' "$label" "$actual" "$expected" >&2
         exit 1

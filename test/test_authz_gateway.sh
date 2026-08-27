@@ -576,6 +576,17 @@ assert_contains "cookie domain derives from request host" "$LOGIN_COOKIES" "; Do
 assert_contains "login clears legacy host-only session cookie" "$LOGIN_COOKIES" "authz_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"
 assert_contains "login clears deeper legacy domain cookie" "$LOGIN_COOKIES" "; Domain=.admin.test.example"
 
+# IP 访问 (典型: 新部署的 linux 主机直接用内网 IP 打开管理端):
+# 登录响应不得下发 Domain=.<ip> 清理头, 否则浏览器会删除刚写入的 host-only 会话。
+IP_LOGIN_HEADERS=$(curl -sS --max-time 5 --resolve "$ADMIN_HOST:$HTTP_PORT:127.0.0.1" \
+    -D - -o /dev/null -X POST "http://127.0.0.1:$HTTP_PORT/_authz/login" \
+    --data-urlencode 'username=admin' --data-urlencode 'password=admin123')
+assert_not_contains "IP login does not clear the new host-only cookie" "$IP_LOGIN_HEADERS" "Domain=.127.0.0.1"
+IP_LOGIN_TOKEN=$(printf '%s' "$IP_LOGIN_HEADERS" | grep -oE 'authz_session=[a-f0-9]{64}' | head -1 | cut -d= -f2)
+IP_SESSION_STATUS=$(curl -sS --max-time 5 -H "Cookie: authz_session=$IP_LOGIN_TOKEN" \
+    -o /dev/null -w '%{http_code}' "http://127.0.0.1:$HTTP_PORT/_api_/authz/v1/session")
+assert_eq "IP login session survives the redirect" "$IP_SESSION_STATUS" "200"
+
 login "$SECOND_BASE_HOST" admin admin123 "$SECOND_BASE_COOKIE"
 SECOND_BASE_ACTIVE_COOKIE=$(awk 'BEGIN { IGNORECASE=1 } /^Set-Cookie:/ { sub(/\r$/, ""); print; exit }' "$TMP_DIR/login-headers")
 SECOND_BASE_COOKIES=$(cat "$TMP_DIR/login-headers")
@@ -1862,6 +1873,23 @@ assert_json "shared session source" '.data.source' "local"
 STATUS=$(shared_session "$SHARED_B_HOST" "$SHARED_B_HTTP_PORT" "$SHARED_A_COOKIE")
 assert_eq "shared session valid on instance B" "$STATUS" "200"
 assert_json "shared session identity on B" '.data.identity' "user:local:admin"
+
+# 全新实例的空集合必须编码为 JSON 数组 [], 而不是对象 {},
+# 否则前端 (data.remote_users || []).map 直接报 "is not a function"。
+FRESH_USERS=$(curl -sS --max-time 5 --resolve "$SHARED_A_HOST:$SHARED_HTTP_PORT:127.0.0.1" \
+    -H "Cookie: $(cookie_header "$SHARED_A_COOKIE")" \
+    "http://$SHARED_A_HOST:$SHARED_HTTP_PORT/_api_/authz/v1/users")
+assert_eq "fresh instance empty remote_users is JSON array" \
+    "$(jq -r '.data.remote_users | type' <<<"$FRESH_USERS")" "array"
+assert_eq "fresh instance users stays JSON array" \
+    "$(jq -r '.data.users | type' <<<"$FRESH_USERS")" "array"
+FRESH_AUTHZ=$(curl -sS --max-time 5 --resolve "$SHARED_A_HOST:$SHARED_HTTP_PORT:127.0.0.1" \
+    -H "Cookie: $(cookie_header "$SHARED_A_COOKIE")" \
+    "http://$SHARED_A_HOST:$SHARED_HTTP_PORT/_api_/authz/v1/authorization")
+assert_eq "fresh instance empty bindings is JSON array" \
+    "$(jq -r '.data.bindings | type' <<<"$FRESH_AUTHZ")" "array"
+assert_eq "fresh instance empty policies is JSON array" \
+    "$(jq -r '.data.policies | type' <<<"$FRESH_AUTHZ")" "array"
 
 # 2) Redis 只保存用户 ID 与来源 (外加会话机制字段), 不含角色或策略数据。
 REDIS_PAYLOAD=$(docker exec "$SHARED_REDIS_CONTAINER" redis-cli -p "$SHARED_REDIS_PORT" \

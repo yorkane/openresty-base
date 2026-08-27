@@ -82,6 +82,13 @@ local function db_error(message, err)
     return nil, message .. ": " .. tostring(err or "database error"), 500
 end
 
+-- cjson 把空 Lua 表编码为对象 {}; 前端按数组 .map() 会直接报错。
+-- 全新部署时远程身份/绑定/策略均为空, 必须统一输出 [] 空数组。
+local function empty_array(rows)
+    if rows and #rows > 0 then return rows end
+    return cjson.empty_array
+end
+
 local function user_by_id(id)
     local rows = db.query([[SELECT id, username, roles, enabled, created_at, last_login_at, updated_at
         FROM users WHERE id = ?]], id)
@@ -163,7 +170,7 @@ function _M.session_payload(s)
             username = s.username,
             source = s.source,
             identity = s.identity,
-            roles = _M.roles_for(s),
+            roles = empty_array(_M.roles_for(s)),
             admin = _M.is_admin(s),
             created_at = s.created_at,
             last_login_at = cjson.null,
@@ -184,7 +191,7 @@ function _M.session_payload(s)
         username = s.username,
         source = s.source,
         identity = identity_key.key(s.source, s.username),
-        roles = _M.roles_for(s),
+        roles = empty_array(_M.roles_for(s)),
         admin = _M.is_admin(s),
         csrf = s.csrf,
         created_at = timestamps.created_at,
@@ -221,12 +228,12 @@ function _M.list_users(s)
         username = s.username,
         source = s.source,
         identity = principal_for(s),
-        roles = _M.roles_for(s),
+        roles = empty_array(_M.roles_for(s)),
         admin = true,
         csrf = s.csrf,
         available_roles = HUMAN_ROLE_CATALOG,
-        users = users,
-        remote_users = remote_users
+        users = empty_array(users),
+        remote_users = empty_array(remote_users)
     }
 end
 
@@ -262,7 +269,9 @@ function _M.authorization(s)
                 policy.object_kind = object.kind
                 policy.object_port = object.port or cjson.null
                 policy.object_path = object.path
-                policy.binding_matches = object.port and (bindings_by_port[object.port] or {}) or {}
+                -- 先用普通表完成后续逻辑, 最终统一包装为 JSON 数组。
+                policy.binding_matches =
+                    object.port and (bindings_by_port[object.port] or {}) or {}
                 if object.port then
                     if #policy.binding_matches == 1 then
                         policy.object_kind = "binding"
@@ -272,11 +281,12 @@ function _M.authorization(s)
                         policy.object_kind = "unbound"
                     end
                 end
+                policy.binding_matches = empty_array(policy.binding_matches)
             else
                 policy.object_kind = "invalid"
                 policy.object_port = cjson.null
                 policy.object_path = policy.v1
-                policy.binding_matches = {}
+                policy.binding_matches = empty_array({})
             end
         end
     end
@@ -305,12 +315,12 @@ function _M.authorization(s)
         username = s.username,
         source = s.source,
         identity = principal_for(s),
-        roles = _M.roles_for(s),
+        roles = empty_array(_M.roles_for(s)),
         admin = admin,
         csrf = s.csrf,
-        bindings = bindings,
-        policies = policies,
-        policy_users = policy_users,
+        bindings = empty_array(bindings),
+        policies = empty_array(policies),
+        policy_users = empty_array(policy_users),
         policy_roles = POLICY_ROLE_CATALOG,
         http_methods = HTTP_METHODS,
         port_min = authz.config.port_min,

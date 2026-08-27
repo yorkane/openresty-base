@@ -253,6 +253,12 @@ end
 
 local function current_cookie_domain()
     local host = tostring(ngx.var.host or ""):lower():gsub("%.$", "")
+    -- IP 访问 (典型: 新部署的 linux 主机直接用内网 IP 打开管理端):
+    -- Domain 属性对 IP 主机无效, 且 Chromium 会把 Domain=.<ip> 归一到该 IP,
+    -- 清理头会顺手删掉刚下发的 host-only 会话, 造成"登录成功却立刻跳回登录页"。
+    if host == "" or host:match("^%d+%.%d+%.%d+%.%d+$") or host:find(":", 1, true) then
+        return ""
+    end
     local derived = domain_from_host(host)
     local selected, selected_labels = "", 0
     for _, configured in ipairs(_M.cookie_domains or {}) do
@@ -263,7 +269,9 @@ local function current_cookie_domain()
     end
     if selected ~= "" and selected_labels >= label_count(derived) then return selected end
     if derived ~= "" then return derived end
-    return selected ~= "" and selected or normalize_domain(_M.cookie_domain)
+    -- 配置的父域与当前请求 Host 不匹配时不能下发 Domain 属性,
+    -- 否则浏览器直接拒绝该 Cookie, 登录同样不可用; 退回 host-only。
+    return ""
 end
 
 local function secure_flag()
@@ -300,7 +308,10 @@ local function legacy_cookie_domains(desired_domain)
                 cursor = cursor:match("^[^.]+%.(.+)$") or desired
             end
         else
-            add(host)
+            -- desired 为空时, 新下发的会话本身就是该 host 上的 host-only Cookie;
+            -- 此时清理 Domain=.<host> 会在浏览器中把刚写入的会话一并删除,
+            -- 导致 IP 访问时登录成功却立即跳回登录页。
+            if desired ~= "" then add(host) end
         end
     end
 

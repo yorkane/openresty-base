@@ -222,6 +222,8 @@ AUTHZ_OAUTH_RELAY_SECRET=<与中枢相同>
 | 上游是 HTTPS 自签证书 | 在对应域名绑定的高级代理中关闭"验证 SSL 证书" |
 | 忘记 admin 密码 | 见第 6 节 `admin_password_reset` |
 | 容器内访问不到宿主服务 | 确认 `network_mode: host` 且宿主是 Linux；Docker Desktop 下容器 `127.0.0.1` 不是宿主 |
+| 用 IP 访问时登录成功却反复跳回登录页 | 老版本缺陷（已在当前镜像修复）：升级到最新镜像即可；根因是登录响应错误下发了 `Domain=.<ip>` 清理头 |
+| 管理界面报 `map is not a function` | 老版本缺陷（已在当前镜像修复）：空数据表被编码成 JSON 对象 `{}`；升级到最新镜像即可 |
 
 ## 附录 A：`.env` 全量示例（含注释）
 
