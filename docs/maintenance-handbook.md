@@ -458,7 +458,7 @@ bash scripts/restart_gateway.sh --build  # 按当前 Docker 架构重建镜像�
 - 反向代理终止 TLS 时正确传递 `X-Forwarded-Proto`，或设置 `AUTHZ_COOKIE_SECURE=true`。
 - `authz_session` 必须统一使用规范父域；多条同名 Cookie 不能按首条盲选，登录/登出必须同时清理
   host-only、旧子域和旧宽域作用域。当前实例规范域为 `.ws.example.com`。
-- `/_radmin_/` 静态资源默认启用 Brotli/Gzip，Brotli 动态等级 5、Gzip 等级 5；镜像构建为资源生成 Brotli 等级 11 的 `.br` 侧车文件，并通过 `brotli_static on` 优先提供。
+- `/_radmin_/` 静态资源默认启用 Brotli/Gzip，Brotli 动态等级 5、Gzip 等级 5；镜像构建为普通资源生成 Brotli 等级 11 的 `.br` 侧车文件，并通过 `brotli_static on` 优先提供。含 SSI 菜单入口的 `admin/index.html` 必须排除 `.br` 生成，否则 Brotli 请求会绕过 SSI 过滤器，导致登录后左侧菜单消失。
 - Admin 入口启用 SSI；`index.html`、`users.html`、`authorization.html` 在页面内声明 `no-cache/no-store`，HTTP 响应不再添加这两个缓存控制头；普通静态资源通过 `expires max` 输出长期缓存头。
 - Dockerfile 使用 Buildx 多阶段构建，`RESTY_J` 默认 8；源码下载单独缓存，GitHub Actions 使用 GHA cache。不要退回 `DOCKER_BUILDKIT=0`。
 - 发布或部署镜像时优先使用 GitHub Actions 推送到 GHCR 的镜像；只有调试 Dockerfile、验证未发布改动或 CI 不可用时才本地构建。

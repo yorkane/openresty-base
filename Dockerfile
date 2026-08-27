@@ -412,8 +412,10 @@ COPY admin/ /usr/local/openresty/nginx/html/admin/
 
 # Generate Brotli sidecars at image build time. Because this step follows
 # COPY admin, changing a frontend asset invalidates only this small layer.
+# index.html contains the SSI menu include and must be processed by the SSI
+# filter instead of being served directly from a Brotli sidecar.
 RUN apk add --no-cache --virtual .brotli-tools brotli \
-    && find /usr/local/openresty/nginx/html/admin -type f ! -name '*.br' \
+    && find /usr/local/openresty/nginx/html/admin -type f ! -name '*.br' ! -name 'index.html' \
         -exec sh -c 'brotli -f -q 11 "$1" -o "$1.br"' _ {} \; \
     && apk del .brotli-tools
 # 网关 nginx 主模板与 HTTP/HTTPS 共用 server 配置

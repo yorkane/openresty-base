@@ -171,6 +171,10 @@ docker run --rm "$IMAGE" sh -c \
     || fail "image does not contain Brotli static sidecar"
 pass "admin assets have Brotli static sidecars"
 docker run --rm "$IMAGE" sh -c \
+    '! test -e /usr/local/openresty/nginx/html/admin/index.html.br' \
+    || fail "SSI admin entrypoint must not have a Brotli static sidecar"
+pass "SSI admin entrypoint is excluded from Brotli sidecars"
+docker run --rm "$IMAGE" sh -c \
     'test -s /usr/local/openresty/site/lualib/resty/mlcache.lua' \
     || fail "image does not contain vendored lua-resty-mlcache"
 pass "lua-resty-mlcache is vendored in the image"
@@ -615,6 +619,7 @@ request GET "$ADMIN_HOST" /_radmin_/ "$ADMIN_COOKIE"
 assert_eq "authenticated admin UI" "$STATUS" "200"
 assert_contains "admin UI loads shell" "$BODY" "app-frame"
 assert_contains "admin UI assembles menu with SSI" "$BODY" "id=\"admin-menu\""
+assert_not_contains "admin UI does not leak raw SSI include" "$BODY" '<!--# include virtual="/_radmin_/menu.html" -->'
 assert_not_contains "admin SSI menu has no inline style" "$BODY" "<style>"
 assert_not_contains "admin UI does not iframe menu" "$BODY" "menu-frame"
 assert_contains "menu shows application address on hover" "$BODY" '<q-tooltip v-if="item.address"'
