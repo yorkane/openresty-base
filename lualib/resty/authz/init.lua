@@ -125,6 +125,47 @@ function _M.init()
     c.oauth_send_timeout = tonumber(os.getenv("AUTHZ_OAUTH_SEND_TIMEOUT_MS")) or 10000
     c.oauth_read_timeout = tonumber(os.getenv("AUTHZ_OAUTH_READ_TIMEOUT_MS")) or 15000
     c.oauth_max_body_size = tonumber(os.getenv("AUTHZ_OAUTH_MAX_BODY_SIZE")) or 1048576
+    -- 多实例 OAuth 中继: 认证实例(中枢)与身份提供方通信并签发断言, 业务实例验证断言后同步身份。
+    c.oauth_relay_secret = tostring(os.getenv("AUTHZ_OAUTH_RELAY_SECRET") or "")
+    c.oauth_relay_ttl = math.max(60, tonumber(os.getenv("AUTHZ_OAUTH_RELAY_TTL")) or 300)
+    c.oauth_hub_url = tostring(os.getenv("AUTHZ_OAUTH_HUB_URL") or ""):gsub("/+$", "")
+    c.oauth_relay_name = tostring(os.getenv("AUTHZ_OAUTH_RELAY_NAME") or ""):lower()
+    c.oauth_hub_providers = {}
+    for entry in tostring(os.getenv("AUTHZ_OAUTH_HUB_PROVIDERS") or ""):gmatch("[^,]+") do
+        entry = entry:gsub("^%s+", ""):gsub("%s+$", "")
+        if entry ~= "" then
+            local id, title = entry:match("^([a-zA-Z0-9_.-]+):(.+)$")
+            if not id then
+                id, title = entry, ""
+            end
+            id = id:lower()
+            title = title:gsub("^%s+", ""):gsub("%s+$", "")
+            if not id:match("^[a-z0-9_.-]+$") or #id > 64 or #title > 128 then
+                error("invalid AUTHZ_OAUTH_HUB_PROVIDERS entry: " .. entry)
+            end
+            c.oauth_hub_providers[#c.oauth_hub_providers + 1] = { id = id, title = title }
+        end
+    end
+    local relay_clients, relay_clients_err = require("resty.authz.relay")
+        .parse_clients(os.getenv("AUTHZ_OAUTH_RELAY_CLIENTS"))
+    if not relay_clients then error(relay_clients_err) end
+    c.oauth_relay_clients = relay_clients
+    if c.oauth_hub_url ~= "" then
+        local scheme = c.oauth_hub_url:match("^(https?)://")
+        if not scheme or c.oauth_hub_url:find("[?#%s]") then
+            error("AUTHZ_OAUTH_HUB_URL must be a valid absolute URL")
+        end
+        if scheme ~= "https" and not env_bool("AUTHZ_OAUTH_RELAY_ALLOW_HTTP", false) then
+            error("AUTHZ_OAUTH_HUB_URL must use https unless AUTHZ_OAUTH_RELAY_ALLOW_HTTP is enabled")
+        end
+        if c.oauth_relay_secret == "" or c.oauth_relay_name == "" or
+            not c.oauth_relay_name:match("^[a-z0-9_.-]+$") then
+            error("OAuth relay clients require AUTHZ_OAUTH_RELAY_SECRET and a valid AUTHZ_OAUTH_RELAY_NAME")
+        end
+    end
+    if next(c.oauth_relay_clients) and c.oauth_relay_secret == "" then
+        error("AUTHZ_OAUTH_RELAY_CLIENTS requires AUTHZ_OAUTH_RELAY_SECRET")
+    end
     c.oauth_providers = {}
     local oauth_allow_http = env_bool("AUTHZ_OAUTH_ALLOW_HTTP", false)
     if c.noco_oauth_enabled then

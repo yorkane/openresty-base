@@ -194,14 +194,99 @@ local function handle_oauth_start()
     return redirect(location)
 end
 
+-- 认证实例(中枢)接收来自业务实例的 OAuth 中继请求
+local function handle_oauth_relay_start()
+    local args = ngx.req.get_uri_args(10) or {}
+    local relay_name = tostring(args.relay or "")
+    local relay_next = type(args.next) == "string" and safe_next(args.next) or "/_radmin_/"
+    local relay = { name = relay_name, next = relay_next }
+
+    -- SSO 快捷路径: 用户已在认证实例登录过远程身份时, 不再跳转身份提供方,
+    -- 直接基于本机会话签发断言跳回业务实例。本地账号不参与跨实例中继。
+    local existing = current_session()
+    if existing and existing.source ~= "local" and
+        tostring(args.provider or ""):lower() == existing.source then
+        local rows = db.query([[SELECT subject, roles, enabled FROM remote_users
+            WHERE provider = ? AND username = ?]], existing.source, existing.username)
+        local record = rows and rows[1]
+        if record and record.enabled == 1 and tostring(record.subject or "") ~= "" then
+            local roles = {}
+            for role in tostring(record.roles):gmatch("[^,%s]+") do
+                roles[#roles + 1] = role
+            end
+            local identity = {
+                username = existing.username,
+                source = existing.source,
+                roles = roles,
+            }
+            local assertion, sign_err = oauth.sign_relay_assertion(identity, record.subject, relay)
+            if assertion then
+                local relay_url = authz.config.oauth_relay_clients[relay_name]
+                if relay_url then
+                    return redirect(relay_url .. "?assertion=" .. ngx.escape_uri(assertion))
+                end
+            else
+                ngx.log(ngx.WARN, "authz OAuth relay SSO assertion failed: ", tostring(sign_err))
+            end
+        end
+    end
+
+    local location, err = oauth.start(
+        tostring(args.provider or ""), "/_radmin_/", relay)
+    if not location then
+        ngx.log(ngx.WARN, "authz OAuth relay start rejected: ", err)
+        return redirect("/_authz/login?err=" .. ngx.escape_uri("身份登录配置不可用"))
+    end
+    return redirect(location)
+end
+
 local function handle_oauth_callback()
-    local identity, next_or_err = oauth.callback(ngx.req.get_uri_args() or {})
+    local args = ngx.req.get_uri_args() or {}
+    -- 业务实例收到认证实例返回的断言令牌, 完成二级闭环并建立本机会话。
+    if tostring(args.assertion or "") ~= "" then
+        local identity, next_or_err = oauth.relay_return(args)
+        if not identity then
+            ngx.log(ngx.WARN, "authz OAuth relay assertion failed: ", tostring(next_or_err))
+            return redirect("/_authz/login?err=" .. ngx.escape_uri("身份登录失败，请重试"))
+        end
+        local token, err = session.create(identity.username, identity.source)
+        if not token then
+            ngx.log(ngx.ERR, "authz relay session create failed: ", err)
+            return html_response("<h1>会话创建失败</h1>", ngx.HTTP_INTERNAL_SERVER_ERROR)
+        end
+        session.set_cookie(token)
+        return redirect(safe_next(next_or_err))
+    end
+
+    -- 普通 callback: 可能是本地完成或中继完成(若 state 中携带了 relay 信息)。
+    local identity, next_or_err, relay_info, subject = oauth.callback(args)
     if not identity then
         ngx.log(ngx.WARN, "authz OAuth callback failed: ", next_or_err)
         local message = next_or_err == "identity_disabled" and
             "账户未启用，请联系管理员" or "身份登录失败，请重试"
         return redirect("/_authz/login?err=" .. ngx.escape_uri(message))
     end
+
+    -- 认证实例: 若本次回调来自业务实例(携带 relay 信息), 签发断言并跳回业务实例。
+    if relay_info then
+        -- 中枢同时建立自己的会话, 后续业务实例的中继请求可直接复用 (SSO)。
+        local hub_token = session.create(identity.username, identity.source)
+        if hub_token then session.set_cookie(hub_token) end
+        local assertion, sign_err = oauth.sign_relay_assertion(identity, subject, relay_info)
+        if not assertion then
+            ngx.log(ngx.ERR, "authz relay assertion sign failed: ", sign_err)
+            return html_response("<h1>中继签名失败</h1>", ngx.HTTP_INTERNAL_SERVER_ERROR)
+        end
+        local c = authz.config
+        local relay_url = c.oauth_relay_clients[relay_info.name]
+        if not relay_url then
+            ngx.log(ngx.ERR, "authz relay client not configured: ", relay_info.name)
+            return html_response("<h1>中继客户端未配置</h1>", ngx.HTTP_INTERNAL_SERVER_ERROR)
+        end
+        return redirect(relay_url .. "?assertion=" .. ngx.escape_uri(assertion))
+    end
+
+    -- 本地完成: 直接在本机创建会话。
     local token, err = session.create(identity.username, identity.source)
     if not token then
         ngx.log(ngx.ERR, "authz OAuth session create failed: ", err)
@@ -234,11 +319,13 @@ function _M.handle()
     end
 
 
-    if uri == "/_authz/oauth/start" or uri == "/_authz/oauth/callback" then
+    if uri == "/_authz/oauth/start" or uri == "/_authz/oauth/callback" or
+        uri == "/_authz/oauth/relay/start" then
         if method ~= "GET" then
             return html_response("<h1>405 Method Not Allowed</h1>", ngx.HTTP_NOT_ALLOWED)
         end
         if uri == "/_authz/oauth/start" then return handle_oauth_start() end
+        if uri == "/_authz/oauth/relay/start" then return handle_oauth_relay_start() end
         return handle_oauth_callback()
     end
 

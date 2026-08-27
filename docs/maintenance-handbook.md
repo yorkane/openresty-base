@@ -239,7 +239,42 @@ NocoBase OAuth 的 `/api/idpOAuth/me` 只提供标准身份 claim，不使用 Ba
 - DingTalk 使用 `authCode` 回调和专用 token/userinfo 请求头；
 - Google 要求 verified email；
 - 微信使用网站应用 `snsapi_login`，不是公众号或小程序流程；
-- 未完整配置的 Provider 必须继续显示“待配置”，但不能发起残缺授权流程。
+- 未完整配置的 Provider 必须继续显示"待配置"，但不能发起残缺授权流程。
+
+### 6.1 多实例 OAuth 两级中继（认证中枢 + 业务实例）
+
+多个实例共享同一套身份提供方时，只在"认证实例"（中枢）上配置 Google、钉钉、NocoBase 等
+Provider 与回调地址；业务实例无需注册任何 OAuth Client，只要配置了回调入口域名即可作为主入口。
+
+两级闭环：
+
+1. 用户在业务实例点击 OAuth 登录。业务实例发现该 provider 本地未配置，且存在中枢配置，
+   于是 302 到中枢 `/_authz/oauth/relay/start?provider=<id>&relay=<业务实例名>&next=<原路径>`；
+2. 中枢校验中继名称在白名单中，与身份提供方完成标准 Authorization Code + PKCE；
+3. 中枢回调成功后签发 HMAC-SHA256 断言（含 provider、subject、username、roles、next、
+   iat/exp/nonce，默认 300 秒有效），302 到业务实例 `/_authz/oauth/callback?assertion=...`；
+4. 业务实例验证签名、过期时间和一次性 nonce，单向同步远程身份到本地 `remote_users`，
+   创建本机会话并跳回最初的 `next` 路径。
+
+SSO 快捷路径：用户在浏览器中已持有中枢的远程身份会话时，中枢不再跳转身份提供方，直接基于该会话签发断言。只有请求的 provider 与会话来源一致才走快捷路径；本地账号会话不参与跨实例中继。
+
+安全约束：
+
+- 断言为 HMAC 签名，篡改即拒绝；nonce 防重放；过期即拒绝；本地账号不外泄。
+- `AUTHZ_OAUTH_RELAY_SECRET` 两端共享，必须为强随机值；泄露即等同伪造任意远程身份。
+- `AUTHZ_OAUTH_RELAY_CLIENTS` 是白名单，格式 `名称|业务实例 callback 完整地址`，逗号分隔；
+  未知中继名称直接拒绝。
+- `AUTHZ_OAUTH_HUB_URL` 默认要求 https；仅内网测试可用 `AUTHZ_OAUTH_RELAY_ALLOW_HTTP=true`。
+
+配置分工：
+
+- 认证实例（中枢）：正常配置各 Provider 与 `AUTHZ_*_REDIRECT_URI`；追加共享密钥与中继客户端白名单。
+- 业务实例：不配置任何 Provider；配置 `AUTHZ_OAUTH_HUB_URL`、`AUTHZ_OAUTH_RELAY_NAME`
+  （必须出现在中枢白名单）、`AUTHZ_OAUTH_HUB_PROVIDERS`（`id[:显示名称]`，逗号分隔，
+  决定业务实例登录页展示哪些入口）。
+
+真实回归使用双容器覆盖完整链路、断言重放、篡改签名、未知中继客户端、SSO 快捷路径与
+本地账号隔离，位于 `test/test_authz_gateway.sh` 末尾。
 
 ## 7. Admin UI 规则
 

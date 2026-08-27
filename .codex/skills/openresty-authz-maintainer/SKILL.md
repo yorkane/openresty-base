@@ -50,6 +50,9 @@ description: 维护本仓库的 OpenResty Authz Gateway、klib Router、Vue 3 + 
 - NocoBase 2.2 OAuth 以 `docs/thirdparty-oauth-login.md` 为准：公网 Client 通过
   `oidcStates:create` 一次性注册，运行时使用 Code + PKCE、`client_secret_basic` 和严格 `iss` 校验；
   禁止恢复 `app:` 静态 Client、NocoBase 本地插件或 `resource` 参数方案。
+- 多实例部署采用"认证中枢 + 业务实例"两级 OAuth 中继：业务实例不配置 Provider，把认证请求转发到中枢；
+  中枢校验中继白名单后签发 HMAC 断言（带 nonce 防重放），业务实例验证后单向同步远程身份并创建本机会话。
+  断言密钥 `AUTHZ_OAUTH_RELAY_SECRET` 两端共享；不得把本地账号会话参与跨实例中继；新增中继路径必须补充双容器回归。
 
 ## 前端规则
 

@@ -4,6 +4,7 @@ set -euo pipefail
 REPO_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 IMAGE=${OPENRESTY_TEST_IMAGE:-ghcr.io/yorkane/openresty-base:latest}
 CONTAINER_NAME="authz-gateway-test-$$"
+RELAY_CONTAINER_NAME=""
 TMP_DIR=$(mktemp -d)
 PASS=0
 MOCK_PID=""
@@ -28,6 +29,8 @@ UPSTREAM_PORT=$(free_port)
 NOCO_PORT=$(free_port)
 WS_PORT=$(free_port)
 TLS_PORT=$(free_port)
+RELAY_HTTP_PORT=$(free_port)
+RELAY_HTTPS_PORT=$(free_port)
 REMOTE_PORT=$(free_port)
 REMOTE_IP=$(python3 - <<'PY'
 import socket
@@ -46,6 +49,10 @@ POLICY_OBJECT="/${UPSTREAM_PORT}/*"
 cleanup() {
     docker exec "$CONTAINER_NAME" chmod -R a+rwx /data >/dev/null 2>&1 || true
     docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+    if [[ -n "$RELAY_CONTAINER_NAME" ]]; then
+        docker exec "$RELAY_CONTAINER_NAME" chmod -R a+rwx /data >/dev/null 2>&1 || true
+        docker rm -f "$RELAY_CONTAINER_NAME" >/dev/null 2>&1 || true
+    fi
     if [[ -n "$MOCK_PID" ]]; then kill "$MOCK_PID" >/dev/null 2>&1 || true; fi
     if [[ -n "$REMOTE_PID" ]]; then kill "$REMOTE_PID" >/dev/null 2>&1 || true; fi
     if [[ -n "$NOCO_PID" ]]; then kill "$NOCO_PID" >/dev/null 2>&1 || true; fi
@@ -96,6 +103,10 @@ TLS_CERT="$TMP_DIR/mock-upstream-cert.pem"
 TLS_KEY="$TMP_DIR/mock-upstream-key.pem"
 openssl req -x509 -newkey rsa:2048 -nodes -keyout "$TLS_KEY" -out "$TLS_CERT" \
     -days 1 -subj '/CN=127.0.0.1' >/dev/null 2>&1 || fail "unable to create TLS mock certificate"
+RELAY_SECRET=$(openssl rand -hex 32)
+RELAY_BUSINESS_NAME="business1"
+HUB_HOST="hub.test.example"
+RELAY_HOST="relay2.test.example"
 
 python3 "$REPO_DIR/test/mock_http.py" "$UPSTREAM_PORT" >"$TMP_DIR/mock.log" 2>&1 &
 MOCK_PID=$!
@@ -331,6 +342,8 @@ docker run -d \
     -e AUTHZ_WECHAT_AUTHORIZE_URL="http://127.0.0.1:$NOCO_PORT/wechat/authorize" \
     -e AUTHZ_WECHAT_TOKEN_URL="http://127.0.0.1:$NOCO_PORT/wechat/token" \
     -e AUTHZ_WECHAT_USERINFO_URL="http://127.0.0.1:$NOCO_PORT/wechat/userinfo" \
+    -e "AUTHZ_OAUTH_RELAY_SECRET=$RELAY_SECRET" \
+    -e "AUTHZ_OAUTH_RELAY_CLIENTS=$RELAY_BUSINESS_NAME|http://relay2.test.example:$RELAY_HTTP_PORT/_authz/oauth/callback" \
     -e OPENRESTY_TEMPLATE_DIR=/etc/openresty/templates \
     -v "$TMP_DIR/data:/data" \
     -v "$REPO_DIR/admin:/usr/local/openresty/nginx/html/admin:ro" \
@@ -1518,5 +1531,199 @@ STATUS=$(curl -sS --max-time 5 --resolve "$ADMIN_HOST:$HTTP_PORT:127.0.0.1" \
     -o /dev/null -w '%{http_code}' -X POST "http://$ADMIN_HOST:$HTTP_PORT/_authz/login" \
     --data-urlencode 'username=missing' --data-urlencode 'password=incorrect')
 assert_eq "login attempts are rate limited" "$STATUS" "429"
+
+# ── 多实例 OAuth 两级中继: 业务实例 → 认证实例(中枢) → 身份提供方 → 中枢 → 业务实例 ──
+RELAY_CONTAINER_NAME="authz-gateway-relay-test-$$"
+mkdir -p "$TMP_DIR/relay-data/authz"
+docker run -d \
+    --name "$RELAY_CONTAINER_NAME" \
+    --network host \
+    -e NGINX_WORKER_PROCESSES=1 \
+    -e AUTHZ_HTTP_PORT="$RELAY_HTTP_PORT" \
+    -e AUTHZ_HTTPS_PORT="$RELAY_HTTPS_PORT" \
+    -e "AUTHZ_HOST_URL=http://relay2.test.example:$RELAY_HTTP_PORT" \
+    -e AUTHZ_ADMIN_PASSWORD=admin123 \
+    -e AUTHZ_PORT_MIN=1000 \
+    -e AUTHZ_PORT_MAX=65535 \
+    -e "AUTHZ_OAUTH_RELAY_SECRET=$RELAY_SECRET" \
+    -e "AUTHZ_OAUTH_RELAY_NAME=$RELAY_BUSINESS_NAME" \
+    -e "AUTHZ_OAUTH_HUB_URL=http://$HUB_HOST:$HTTP_PORT" \
+    -e "AUTHZ_OAUTH_HUB_PROVIDERS=testid:Test Identity" \
+    -e AUTHZ_OAUTH_RELAY_ALLOW_HTTP=true \
+    -e AUTHZ_OAUTH_ALLOW_HTTP=true \
+    -e OPENRESTY_TEMPLATE_DIR=/etc/openresty/templates \
+    -v "$TMP_DIR/relay-data:/data" \
+    -v "$REPO_DIR/admin:/usr/local/openresty/nginx/html/admin:ro" \
+    -v "$TMP_DIR/templates:/etc/openresty/templates:ro" \
+    -v "$REPO_DIR/docker-entrypoint.sh:/docker-entrypoint.sh:ro" \
+    -v "$REPO_DIR/lualib:/usr/local/openresty/site/lualib:ro" \
+    "$IMAGE" >/dev/null
+for _ in $(seq 1 60); do
+    STATUS=$(curl -sS --max-time 2 --resolve "$RELAY_HOST:$RELAY_HTTP_PORT:127.0.0.1" \
+        -o /dev/null -w '%{http_code}' "http://$RELAY_HOST:$RELAY_HTTP_PORT/_authz/login" 2>/dev/null || true)
+    [[ "$STATUS" == "200" ]] && break
+    sleep 0.5
+done
+[[ "$STATUS" == "200" ]] || fail "relay business instance did not become ready"
+pass "relay business instance is ready"
+
+# 业务实例登录页展示中枢提供的身份提供方(本地未配置任何 provider)
+RELAY_LOGIN_BODY=$(curl -sS --max-time 5 --resolve "$RELAY_HOST:$RELAY_HTTP_PORT:127.0.0.1" \
+    "http://$RELAY_HOST:$RELAY_HTTP_PORT/_authz/login")
+assert_contains "relay login lists hub provider" "$RELAY_LOGIN_BODY" "Test Identity"
+
+# 1) 业务实例发起认证: 跳转认证实例中继入口, 携带 relay 名与 next 路径
+STATUS=$(curl -sS --max-time 5 --resolve "$RELAY_HOST:$RELAY_HTTP_PORT:127.0.0.1" \
+    -D "$TMP_DIR/relay-start-headers" -o /dev/null -w '%{http_code}' \
+    "http://$RELAY_HOST:$RELAY_HTTP_PORT/_authz/oauth/start?provider=testid&next=/app1/dashboard")
+assert_eq "relay start redirects to hub" "$STATUS" "302"
+RELAY_START_URL=$(awk 'BEGIN { IGNORECASE=1 } /^Location:/ { sub(/^[^:]+:[[:space:]]*/, ""); sub(/\r$/, ""); print; exit }' "$TMP_DIR/relay-start-headers")
+assert_contains "relay start targets hub relay endpoint" "$RELAY_START_URL" "/_authz/oauth/relay/start"
+assert_contains "relay start carries relay name" "$RELAY_START_URL" "relay=business1"
+assert_contains "relay start carries next path" "$RELAY_START_URL" "next=%2Fapp1%2Fdashboard"
+
+# 2) 认证实例接收中继请求后跳转真实身份提供方 (authorize), 回调固定为中枢地址
+STATUS=$(curl -sS --max-time 5 --resolve "$HUB_HOST:$HTTP_PORT:127.0.0.1" \
+    -D "$TMP_DIR/hub-headers" -o /dev/null -w '%{http_code}' "$RELAY_START_URL")
+assert_eq "hub relay start redirects to provider" "$STATUS" "302"
+RELAY_AUTHORIZE_URL=$(awk 'BEGIN { IGNORECASE=1 } /^Location:/ { sub(/^[^:]+:[[:space:]]*/, ""); sub(/\r$/, ""); print; exit }' "$TMP_DIR/hub-headers")
+assert_contains "hub relay authorize uses hub callback" "$RELAY_AUTHORIZE_URL" "admin.test.example"
+
+# 3) 身份提供方授权后跳回认证实例的 callback (携带原始 state)
+RELAY_PROVIDER_CALLBACK_URL=$(curl -sS --max-time 5 -D - -o /dev/null "$RELAY_AUTHORIZE_URL" | awk 'BEGIN { IGNORECASE=1 } /^Location:/ { sub(/^[^:]+:[[:space:]]*/, ""); sub(/\r$/, ""); print; exit }')
+RELAY_PROVIDER_CALLBACK_PATH=$(python3 - "$RELAY_PROVIDER_CALLBACK_URL" <<'PY'
+import sys
+from urllib.parse import urlsplit
+value = urlsplit(sys.argv[1])
+print(value.path + ("?" + value.query if value.query else ""))
+PY
+)
+
+# 4) 认证实例完成一级认证, 签发断言并跳回业务实例的 callback
+STATUS=$(curl -sS --max-time 5 --resolve "$HUB_HOST:$HTTP_PORT:127.0.0.1" \
+    -D "$TMP_DIR/hub-callback-headers" -o /dev/null -w '%{http_code}' \
+    "http://$HUB_HOST:$HTTP_PORT$RELAY_PROVIDER_CALLBACK_PATH")
+assert_eq "hub callback issues relay assertion" "$STATUS" "302"
+RELAY_BACK_URL=$(awk 'BEGIN { IGNORECASE=1 } /^Location:/ { sub(/^[^:]+:[[:space:]]*/, ""); sub(/\r$/, ""); print; exit }' "$TMP_DIR/hub-callback-headers")
+assert_contains "relay assertion targets business instance" "$RELAY_BACK_URL" "relay2.test.example:${RELAY_HTTP_PORT}/_authz/oauth/callback"
+assert_contains "relay assertion carries token" "$RELAY_BACK_URL" "assertion="
+
+# 5) 业务实例验证断言、同步远程身份并创建本机会话, 跳回最初 next 路径
+RELAY_BACK_PATH=$(python3 - "$RELAY_BACK_URL" <<'PY'
+import sys
+from urllib.parse import urlsplit
+value = urlsplit(sys.argv[1])
+print(value.path + ("?" + value.query if value.query else ""))
+PY
+)
+STATUS=$(curl -sS --max-time 5 --resolve "$RELAY_HOST:$RELAY_HTTP_PORT:127.0.0.1" \
+    -D "$TMP_DIR/relay-callback-headers" -o /dev/null -w '%{http_code}' \
+    "http://$RELAY_HOST:$RELAY_HTTP_PORT$RELAY_BACK_PATH")
+assert_eq "business callback creates session" "$STATUS" "302"
+RELAY_FINAL_NEXT=$(awk 'BEGIN { IGNORECASE=1 } /^Location:/ { sub(/^[^:]+:[[:space:]]*/, ""); sub(/\r$/, ""); print; exit }' "$TMP_DIR/relay-callback-headers")
+assert_eq "business callback returns to original next path" "$RELAY_FINAL_NEXT" "/app1/dashboard"
+save_session_cookie "$TMP_DIR/relay-callback-headers" "$TMP_DIR/relay.cookie"
+RELAY_SESSION=$(curl -sS --max-time 5 --resolve "$RELAY_HOST:$RELAY_HTTP_PORT:127.0.0.1" \
+    -H "Cookie: $(cat "$TMP_DIR/relay.cookie")" \
+    "http://$RELAY_HOST:$RELAY_HTTP_PORT/_api_/authz/v1/session")
+assert_json_value() {
+    local name=$1 filter=$2 expected=$3 payload=$4 actual
+    actual=$(jq -er "$filter" <<<"$payload") || fail "$name (invalid JSON or filter)"
+    assert_eq "$name" "$actual" "$expected"
+}
+assert_json_value "relay session source" '.data.source' "testid" "$RELAY_SESSION"
+assert_json_value "relay session identity" '.data.identity' "user:testid:oauth.user@example.test" "$RELAY_SESSION"
+assert_json_value "relay session synced roles" '.data.roles | join(",")' "staff" "$RELAY_SESSION"
+
+# 6) 断言令牌不可重放: 二次提交同一断言不创建会话且跳回登录错误页
+STATUS=$(curl -sS --max-time 5 --resolve "$RELAY_HOST:$RELAY_HTTP_PORT:127.0.0.1" \
+    -D "$TMP_DIR/relay-replay-headers" -o /dev/null -w '%{http_code}' \
+    "http://$RELAY_HOST:$RELAY_HTTP_PORT$RELAY_BACK_PATH")
+assert_eq "relay assertion replay is rejected" "$STATUS" "302"
+RELAY_REPLAY_LOCATION=$(awk 'BEGIN { IGNORECASE=1 } /^Location:/ { sub(/^[^:]+:[[:space:]]*/, ""); sub(/\r$/, ""); print; exit }' "$TMP_DIR/relay-replay-headers")
+assert_contains "relay replay redirects to login error" "$RELAY_REPLAY_LOCATION" "/_authz/login?err="
+
+# 7) 断言令牌被篡改后签名校验失败, 且不回退 Cookie 会话
+TAMPERED_PATH=$(python3 - "$RELAY_BACK_URL" <<'PY'
+import sys
+from urllib.parse import urlsplit, parse_qsl, urlencode
+value = urlsplit(sys.argv[1])
+query = dict(parse_qsl(value.query, keep_blank_values=True))
+assertion = query.get("assertion", "")
+query["assertion"] = assertion[:-2] + ("AA" if not assertion.endswith("AA") else "BB")
+print(value.path + "?" + urlencode(query))
+PY
+)
+STATUS=$(curl -sS --max-time 5 --resolve "$RELAY_HOST:$RELAY_HTTP_PORT:127.0.0.1" \
+    -D "$TMP_DIR/relay-tamper-headers" -o /dev/null -w '%{http_code}' \
+    "http://$RELAY_HOST:$RELAY_HTTP_PORT$TAMPERED_PATH")
+assert_eq "tampered relay assertion is rejected" "$STATUS" "302"
+TAMPERED_LOCATION=$(awk 'BEGIN { IGNORECASE=1 } /^Location:/ { sub(/^[^:]+:[[:space:]]*/, ""); sub(/\r$/, ""); print; exit }' "$TMP_DIR/relay-tamper-headers")
+assert_contains "tampered assertion redirects to login error" "$TAMPERED_LOCATION" "/_authz/login?err="
+
+# 8) 未在白名单中的中继名称被认证实例拒绝 (不回退本机会话创建)
+STATUS=$(curl -sS --max-time 5 --resolve "$HUB_HOST:$HTTP_PORT:127.0.0.1" \
+    -D "$TMP_DIR/relay-unknown-headers" -o /dev/null -w '%{http_code}' \
+    "http://$HUB_HOST:$HTTP_PORT/_authz/oauth/relay/start?provider=testid&relay=intruder&next=/_radmin_/")
+assert_eq "unknown relay client rejected" "$STATUS" "302"
+UNKNOWN_RELAY_LOCATION=$(awk 'BEGIN { IGNORECASE=1 } /^Location:/ { sub(/^[^:]+:[[:space:]]*/, ""); sub(/\r$/, ""); print; exit }' "$TMP_DIR/relay-unknown-headers")
+assert_contains "unknown relay client redirects to login error" "$UNKNOWN_RELAY_LOCATION" "/_authz/login?err="
+
+# 9) 业务实例已同步远程身份快照 (单向记录, 不依赖中枢数据库)
+RELAY_REMOTE_COUNT=$(python3 - "$TMP_DIR/relay-data/authz/authz.db" <<'PY'
+import sqlite3
+import sys
+connection = sqlite3.connect(sys.argv[1])
+count = connection.execute(
+    "SELECT COUNT(*) FROM remote_users WHERE provider = 'testid'").fetchone()[0]
+print(count)
+connection.close()
+PY
+)
+assert_eq "business instance records remote identity" "$RELAY_REMOTE_COUNT" "1"
+
+# 10) SSO 快捷路径: 认证实例已有远程会话时不再跳转身份提供方, 直接签发断言跳回业务实例
+HUB_SESSION_COOKIE="$TMP_DIR/hub-session.cookie"
+save_session_cookie "$TMP_DIR/hub-callback-headers" "$HUB_SESSION_COOKIE"
+STATUS=$(curl -sS --max-time 5 --resolve "$HUB_HOST:$HTTP_PORT:127.0.0.1" \
+    -H "Cookie: $(cookie_header "$HUB_SESSION_COOKIE")" \
+    -D "$TMP_DIR/hub-sso-headers" -o /dev/null -w '%{http_code}' \
+    "http://$HUB_HOST:$HTTP_PORT/_authz/oauth/relay/start?provider=testid&relay=$RELAY_BUSINESS_NAME&next=%2Fapp2%2Fhome")
+assert_eq "hub SSO skips provider" "$STATUS" "302"
+HUB_SSO_URL=$(awk 'BEGIN { IGNORECASE=1 } /^Location:/ { sub(/^[^:]+:[[:space:]]*/, ""); sub(/\r$/, ""); print; exit }' "$TMP_DIR/hub-sso-headers")
+assert_contains "hub SSO targets business callback" "$HUB_SSO_URL" "relay2.test.example:${RELAY_HTTP_PORT}/_authz/oauth/callback"
+assert_contains "hub SSO carries assertion" "$HUB_SSO_URL" "assertion="
+
+HUB_SSO_PATH=$(python3 - "$HUB_SSO_URL" <<'PY'
+import sys
+from urllib.parse import urlsplit
+value = urlsplit(sys.argv[1])
+print(value.path + ("?" + value.query if value.query else ""))
+PY
+)
+STATUS=$(curl -sS --max-time 5 --resolve "$RELAY_HOST:$RELAY_HTTP_PORT:127.0.0.1" \
+    -D "$TMP_DIR/relay-sso-headers" -o /dev/null -w '%{http_code}' \
+    "http://$RELAY_HOST:$RELAY_HTTP_PORT$HUB_SSO_PATH")
+assert_eq "hub SSO assertion creates business session" "$STATUS" "302"
+HUB_SSO_NEXT=$(awk 'BEGIN { IGNORECASE=1 } /^Location:/ { sub(/^[^:]+:[[:space:]]*/, ""); sub(/\r$/, ""); print; exit }' "$TMP_DIR/relay-sso-headers")
+assert_eq "hub SSO returns to requested next path" "$HUB_SSO_NEXT" "/app2/home"
+
+# 11) 认证实例的本地账号会话不参与跨实例中继, 仍走正常提供方流程
+STATUS=$(curl -sS --max-time 5 --resolve "$HUB_HOST:$HTTP_PORT:127.0.0.1" \
+    -H "Cookie: $(cookie_header "$ADMIN_COOKIE")" \
+    -D "$TMP_DIR/hub-local-headers" -o /dev/null -w '%{http_code}' \
+    "http://$HUB_HOST:$HTTP_PORT/_authz/oauth/relay/start?provider=testid&relay=$RELAY_BUSINESS_NAME&next=/_radmin_/")
+assert_eq "hub local session still uses provider flow" "$STATUS" "302"
+HUB_LOCAL_LOCATION=$(awk 'BEGIN { IGNORECASE=1 } /^Location:/ { sub(/^[^:]+:[[:space:]]*/, ""); sub(/\r$/, ""); print; exit }' "$TMP_DIR/hub-local-headers")
+assert_contains "hub local session redirects to provider authorize" "$HUB_LOCAL_LOCATION" "/oauth/authorize"
+
+# 12) 会话来源与请求 provider 不一致时不走 SSO 快捷路径, 进入正常授权流程
+STATUS=$(curl -sS --max-time 5 --resolve "$HUB_HOST:$HTTP_PORT:127.0.0.1" \
+    -H "Cookie: $(cookie_header "$HUB_SESSION_COOKIE")" \
+    -D "$TMP_DIR/hub-mismatch-headers" -o /dev/null -w '%{http_code}' \
+    "http://$HUB_HOST:$HTTP_PORT/_authz/oauth/relay/start?provider=dingtalk&relay=$RELAY_BUSINESS_NAME&next=/_radmin_/")
+assert_eq "hub provider mismatch uses provider flow" "$STATUS" "302"
+HUB_MISMATCH_LOCATION=$(awk 'BEGIN { IGNORECASE=1 } /^Location:/ { sub(/^[^:]+:[[:space:]]*/, ""); sub(/\r$/, ""); print; exit }' "$TMP_DIR/hub-mismatch-headers")
+assert_contains "hub mismatch redirects to dingtalk authorize" "$HUB_MISMATCH_LOCATION" "dingtalk/authorize"
 
 printf '\nAll %d authz gateway checks passed.\n' "$PASS"

@@ -2,6 +2,7 @@ local cjson = require "cjson.safe"
 local remote = require "resty.authz.remote"
 local sha256 = require "resty.sha256"
 local util = require "resty.authz.util"
+local relay_mod = require "resty.authz.relay"
 
 local _M = {}
 
@@ -224,12 +225,47 @@ local function user_claims(provider, token, access_token)
     })
 end
 
+local relay_provider_titles = {
+    nocobase = "NocoBase",
+    google = "Google",
+    dingtalk = "钉钉",
+    wechat = "微信",
+}
+
+local function hub_provider_set()
+    local set = {}
+    for _, entry in ipairs(config().oauth_hub_providers or {}) do
+        set[entry.id] = true
+    end
+    return set
+end
+
+function _M.hub_start_url(provider_name, next_url)
+    local c = config()
+    return query_url(c.oauth_hub_url .. "/_authz/oauth/relay/start", {
+        provider = provider_name,
+        relay = c.oauth_relay_name,
+        next = next_url,
+    }, { "provider", "relay", "next" })
+end
+
 function _M.public_providers()
     local providers = {}
     local configured = {}
     for _, provider in ipairs(config().oauth_providers or {}) do
         providers[#providers + 1] = { id = provider.id, title = provider.title, enabled = true }
         configured[provider.id] = true
+    end
+    for _, entry in ipairs(config().oauth_hub_providers or {}) do
+        if not configured[entry.id] then
+            configured[entry.id] = true
+            providers[#providers + 1] = {
+                id = entry.id,
+                title = entry.title ~= "" and entry.title or
+                    (relay_provider_titles[entry.id] or entry.id),
+                enabled = true,
+            }
+        end
     end
     for _, provider in ipairs({
         { id = "nocobase", title = "NocoBase" },
@@ -248,10 +284,22 @@ function _M.public_providers()
     return providers
 end
 
-function _M.start(provider_name, next_url)
+function _M.start(provider_name, next_url, relay)
+    local c = config()
     local provider = provider_by_name(provider_name)
-    if not provider then return nil, "provider_not_found" end
-    local state_dict = ngx.shared[config().oauth_state_dict]
+    if not provider then
+        -- 业务实例: 本地没有该身份提供方, 转发给认证实例(中枢)完成一级认证。
+        if relay == nil and c.oauth_hub_url ~= "" and hub_provider_set()[provider_name] then
+            return _M.hub_start_url(provider_name, next_url)
+        end
+        return nil, "provider_not_found"
+    end
+    if relay ~= nil then
+        if c.oauth_relay_secret == "" or not c.oauth_relay_clients[relay.name] then
+            return nil, "relay_not_configured"
+        end
+    end
+    local state_dict = ngx.shared[c.oauth_state_dict]
     if not state_dict then return nil, "state_store_unavailable" end
 
     local state = util.random_token(24)
@@ -261,8 +309,9 @@ function _M.start(provider_name, next_url)
         next = next_url,
         verifier = verifier,
         redirect_uri = provider.redirect_uri,
+        relay = relay,
     })
-    local ok, err = state_dict:set(state, stored, config().oauth_state_ttl)
+    local ok, err = state_dict:set(state, stored, c.oauth_state_ttl)
     if not ok then return nil, "state_store_failed:" .. tostring(err) end
 
     return authorization_url(provider, state, verifier)
@@ -312,7 +361,53 @@ function _M.callback(args)
     local identity, identity_err = remote.save(
         provider.id, subject, username, mapped_roles(provider, claims))
     if not identity then return nil, identity_err end
-    return identity, stored.next
+    return identity, stored.next, stored.relay, subject
+end
+
+function _M.sign_relay_assertion(identity, subject, relay_info)
+    local c = config()
+    if c.oauth_relay_secret == "" then return nil, "relay_not_configured" end
+    local now = os.time()
+    local payload = {
+        client = relay_info.name,
+        provider = identity.source,
+        subject = subject,
+        username = identity.username,
+        roles = identity.roles,
+        next = relay_info.next,
+        iat = now,
+        exp = now + c.oauth_relay_ttl,
+        nonce = util.random_token(16),
+    }
+    return relay_mod.encode_token(payload, c.oauth_relay_secret)
+end
+
+function _M.relay_return(args)
+    local c = config()
+    if c.oauth_relay_secret == "" then return nil, "relay_not_configured" end
+    local payload, err = relay_mod.decode_token(
+        tostring(args.assertion or ""), c.oauth_relay_secret)
+    if not payload then return nil, err end
+    if tostring(payload.client) ~= c.oauth_relay_name then return nil, "relay_name_mismatch" end
+    local now = os.time()
+    if type(payload.exp) ~= "number" or payload.exp < now then return nil, "relay_expired" end
+    if type(payload.iat) ~= "number" or payload.iat > now + 300 then
+        return nil, "relay_clock_skew"
+    end
+    local nonce = tostring(payload.nonce or "")
+    if nonce == "" or #nonce > 128 then return nil, "relay_invalid" end
+    local state_dict = ngx.shared[c.oauth_state_dict]
+    if state_dict then
+        if state_dict:get("relay:" .. nonce) then return nil, "relay_replayed" end
+        state_dict:set("relay:" .. nonce, "1", c.oauth_relay_ttl + 60)
+    end
+    local provider = tostring(payload.provider or ""):lower()
+    if not provider:match("^[a-z0-9_.-]+$") then return nil, "relay_invalid" end
+    local identity, identity_err = remote.save(
+        provider, tostring(payload.subject or ""), tostring(payload.username or ""),
+        payload.roles)
+    if not identity then return nil, identity_err end
+    return identity, payload.next
 end
 
 return _M
